@@ -1,0 +1,52 @@
+/**:
+  ros__parameters:
+    # Frame IDs
+    frame_id: "base_footprint"
+    map_frame_id: "map"
+    odom_frame_id: "odom"
+    publish_tf: true             # Publishes map -> odom
+
+    # Sensor Subscriptions (NO LiDAR, Pure RGB-D + IMU + Wheel Odom)
+    subscribe_depth: true
+    subscribe_rgb: true
+    subscribe_scan: false        # LiDAR completely disabled
+    subscribe_scan_cloud: false
+    approx_sync: true
+    sync_queue_size: 30
+    topic_queue_size: 30
+    wait_imu_to_init: false
+    wait_for_transform: 0.5
+    qos_image: 0                 # 0=RELIABLE / System Default
+    qos_camera_info: 0           # 0=RELIABLE
+    qos_odom: 0                  # 0=RELIABLE
+    qos_imu: 0                   # 0=RELIABLE
+    gen_scan: true               # Generate 2D LaserScan from Depth image
+    gen_scan_max_depth: 3.5
+    gen_scan_min_depth: 0.4
+
+    # RTAB-Map Core Parameters (Passed as strings in ROS 2)
+    Rtabmap/DetectionRate: "1.0"   # Keyframe mapping rate (1 Hz for stable graph updates)
+    Mem/IncrementalMemory: "true"  # SLAM mapping mode
+    Mem/UseOdomGravity: "true"     # Use IMU gravity to align horizontal ground plane
+    Mem/DepthCompressionFormat: ".png"
+    Mem/RehearsalSimilarity: "0.45"
+
+    # RGB-D Odometry & Registration (ORB + ICP Refinement)
+    Reg/Strategy: "0"              # 0=Visual Features, 1=ICP, 2=Visual+ICP
+    Reg/Force3DoF: "true"          # Enforce 2D planar SLAM (prevents roll/pitch drift & map warping)
+    Vis/FeatureType: "2"           # 2=ORB
+    Kp/DetectorStrategy: "2"       # 2=ORB (align loop closure detector with visual feature type)
+    Vis/MaxFeatures: "1200"
+    Vis/MinInliers: "20"           # Strict inlier threshold to avoid false repetitive brick matches
+    RGBD/NeighborLinkRefining: "false" # Rely on EKF (Wheel+IMU) for odometry, use vision for loop closure
+    RGBD/AngularUpdate: "0.15"     # ~8.6 degrees rotation before adding new keyframe
+    RGBD/LinearUpdate: "0.15"      # 15 cm translation before adding new keyframe
+
+    # 2D Occupancy Grid Map Generation for Nav2
+    Grid/FromDepth: "true"         # Project 3D depth image into 2D /map grid
+    Grid/RangeMax: "2.5"           # Max sensor range for mapping (matches OS30A 2.5m)
+    Grid/RayTracing: "true"        # Clear free space along optical rays
+    Grid/CellSize: "0.05"          # 5cm grid resolution (matches standard Nav2)
+    Grid/MaxObstacleHeight: "1.0"  # Max height for obstacles
+    Grid/MaxGroundHeight: "0.08"   # Floor threshold (meters)
+    Grid/MinGroundHeight: "-0.05"

@@ -1,0 +1,359 @@
+<?xml version="1.0" ?>
+<sdf version="1.8">
+  <world name="redbox_sim_world">
+    <physics name="1ms" type="ignored">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <plugin
+      filename="gz-sim-physics-system"
+      name="gz::sim::systems::Physics">
+    </plugin>
+    <plugin
+      filename="gz-sim-user-commands-system"
+      name="gz::sim::systems::UserCommands">
+    </plugin>
+    <plugin
+      filename="gz-sim-scene-broadcaster-system"
+      name="gz::sim::systems::SceneBroadcaster">
+    </plugin>
+    <plugin
+      filename="gz-sim-sensors-system"
+      name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin
+      filename="gz-sim-imu-system"
+      name="gz::sim::systems::Imu">
+    </plugin>
+
+    <!-- Sun Light -->
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.9 0.9 0.9 1</diffuse>
+      <specular>0.3 0.3 0.3 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <!-- Ground Plane with Wood Texture -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>100 100</size>
+            </plane>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>100 100</size>
+            </plane>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.9 0.9 0.9 1</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/jjj/Documents/Dapier/Project/robot_ws/install/turtlebot3_visual_slam/share/turtlebot3_visual_slam/materials/textures/wood.png</albedo_map>
+              </metal>
+            </pbr>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Room Walls (6m x 6m room) with Brick Texture -->
+    <model name="room_walls">
+      <static>true</static>
+      <!-- North Wall -->
+      <link name="wall_north">
+        <pose>0 3 0.5 0 0 0</pose>
+        <collision name="c">
+          <geometry><box><size>6 0.15 1.0</size></box></geometry>
+        </collision>
+        <visual name="v">
+          <geometry><box><size>6 0.15 1.0</size></box></geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.9 0.9 0.9 1</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/jjj/Documents/Dapier/Project/robot_ws/install/turtlebot3_visual_slam/share/turtlebot3_visual_slam/materials/textures/bricks.png</albedo_map>
+              </metal>
+            </pbr>
+          </material>
+        </visual>
+      </link>
+      <!-- South Wall -->
+      <link name="wall_south">
+        <pose>0 -3 0.5 0 0 0</pose>
+        <collision name="c">
+          <geometry><box><size>6 0.15 1.0</size></box></geometry>
+        </collision>
+        <visual name="v">
+          <geometry><box><size>6 0.15 1.0</size></box></geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.9 0.9 0.9 1</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/jjj/Documents/Dapier/Project/robot_ws/install/turtlebot3_visual_slam/share/turtlebot3_visual_slam/materials/textures/bricks.png</albedo_map>
+              </metal>
+            </pbr>
+          </material>
+        </visual>
+      </link>
+      <!-- East Wall -->
+      <link name="wall_east">
+        <pose>3 0 0.5 0 0 0</pose>
+        <collision name="c">
+          <geometry><box><size>0.15 6 1.0</size></box></geometry>
+        </collision>
+        <visual name="v">
+          <geometry><box><size>0.15 6 1.0</size></box></geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.9 0.9 0.9 1</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/jjj/Documents/Dapier/Project/robot_ws/install/turtlebot3_visual_slam/share/turtlebot3_visual_slam/materials/textures/bricks.png</albedo_map>
+              </metal>
+            </pbr>
+          </material>
+        </visual>
+      </link>
+      <!-- West Wall -->
+      <link name="wall_west">
+        <pose>-3 0 0.5 0 0 0</pose>
+        <collision name="c">
+          <geometry><box><size>0.15 6 1.0</size></box></geometry>
+        </collision>
+        <visual name="v">
+          <geometry><box><size>0.15 6 1.0</size></box></geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.9 0.9 0.9 1</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/jjj/Documents/Dapier/Project/robot_ws/install/turtlebot3_visual_slam/share/turtlebot3_visual_slam/materials/textures/bricks.png</albedo_map>
+              </metal>
+            </pbr>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Wall Landmark Poster: North Wall (Unique Blue-Yellow Diamond) -->
+    <model name="poster_north">
+      <static>true</static>
+      <pose>0 2.92 0.55 0 0 0</pose>
+      <link name="link">
+        <visual name="v">
+          <geometry><box><size>1.0 0.01 0.7</size></box></geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.9 0.9 0.9 1</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/jjj/Documents/Dapier/Project/robot_ws/install/turtlebot3_visual_slam/share/turtlebot3_visual_slam/materials/textures/landmark_north.png</albedo_map>
+              </metal>
+            </pbr>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Wall Landmark Poster: South Wall (Unique Yellow-Black Hazard & Target) -->
+    <model name="poster_south">
+      <static>true</static>
+      <pose>0 -2.92 0.55 0 0 0</pose>
+      <link name="link">
+        <visual name="v">
+          <geometry><box><size>1.0 0.01 0.7</size></box></geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.9 0.9 0.9 1</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/jjj/Documents/Dapier/Project/robot_ws/install/turtlebot3_visual_slam/share/turtlebot3_visual_slam/materials/textures/landmark_south.png</albedo_map>
+              </metal>
+            </pbr>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Wall Landmark Poster: East Wall (Unique Purple-Orange Cross) -->
+    <model name="poster_east">
+      <static>true</static>
+      <pose>2.92 0 0.55 0 0 0</pose>
+      <link name="link">
+        <visual name="v">
+          <geometry><box><size>0.01 1.0 0.7</size></box></geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.9 0.9 0.9 1</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/jjj/Documents/Dapier/Project/robot_ws/install/turtlebot3_visual_slam/share/turtlebot3_visual_slam/materials/textures/landmark_east.png</albedo_map>
+              </metal>
+            </pbr>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Wall Landmark Poster: West Wall (Unique Green-Zebra Triangle) -->
+    <model name="poster_west">
+      <static>true</static>
+      <pose>-2.92 0 0.55 0 0 0</pose>
+      <link name="link">
+        <visual name="v">
+          <geometry><box><size>0.01 1.0 0.7</size></box></geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.9 0.9 0.9 1</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/jjj/Documents/Dapier/Project/robot_ws/install/turtlebot3_visual_slam/share/turtlebot3_visual_slam/materials/textures/landmark_west.png</albedo_map>
+              </metal>
+            </pbr>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- STRUCTURE 1: Checkerboard Landmark Pillar (NW quadrant) -->
+    <model name="pillar_checkerboard_nw">
+      <static>true</static>
+      <pose>-1.2 1.2 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="c">
+          <geometry><box><size>0.4 0.4 0.8</size></box></geometry>
+        </collision>
+        <visual name="v">
+          <geometry><box><size>0.4 0.4 0.8</size></box></geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.9 0.9 0.9 1</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/jjj/Documents/Dapier/Project/robot_ws/install/turtlebot3_visual_slam/share/turtlebot3_visual_slam/materials/textures/checkerboard.png</albedo_map>
+              </metal>
+            </pbr>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- STRUCTURE 2: Brick Pillar Divider (SW quadrant) -->
+    <model name="pillar_brick_sw">
+      <static>true</static>
+      <pose>-1.2 -1.2 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="c">
+          <geometry><box><size>0.4 0.4 0.8</size></box></geometry>
+        </collision>
+        <visual name="v">
+          <geometry><box><size>0.4 0.4 0.8</size></box></geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.9 0.9 0.9 1</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/jjj/Documents/Dapier/Project/robot_ws/install/turtlebot3_visual_slam/share/turtlebot3_visual_slam/materials/textures/bricks.png</albedo_map>
+              </metal>
+            </pbr>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- STRUCTURE 3: Textured Wooden Box (SE quadrant) -->
+    <model name="box_wood_se">
+      <static>true</static>
+      <pose>1.2 -1.2 0.3 0 0 0</pose>
+      <link name="link">
+        <collision name="c">
+          <geometry><box><size>0.5 0.5 0.6</size></box></geometry>
+        </collision>
+        <visual name="v">
+          <geometry><box><size>0.5 0.5 0.6</size></box></geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.9 0.9 0.9 1</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/jjj/Documents/Dapier/Project/robot_ws/install/turtlebot3_visual_slam/share/turtlebot3_visual_slam/materials/textures/wood.png</albedo_map>
+              </metal>
+            </pbr>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- STRUCTURE 4: Checkerboard Box (Center-North) -->
+    <model name="box_checkerboard_cn">
+      <static>true</static>
+      <pose>0.0 1.5 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="c">
+          <geometry><box><size>0.5 0.5 0.5</size></box></geometry>
+        </collision>
+        <visual name="v">
+          <geometry><box><size>0.5 0.5 0.5</size></box></geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.9 0.9 0.9 1</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/jjj/Documents/Dapier/Project/robot_ws/install/turtlebot3_visual_slam/share/turtlebot3_visual_slam/materials/textures/checkerboard.png</albedo_map>
+              </metal>
+            </pbr>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- TARGET OBJECT: Bright RED BOX (0.3m x 0.3m x 0.3m) -->
+    <model name="red_box_target">
+      <static>true</static>
+      <pose>1.8 0.4 0.15 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.3</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.3</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.8 0.0 0.0 1.0</ambient>
+            <diffuse>1.0 0.0 0.0 1.0</diffuse>
+            <specular>0.4 0.1 0.1 1.0</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+  </world>
+</sdf>

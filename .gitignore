@@ -1,0 +1,42 @@
+# ROS 2 Build & Workspace Artifacts
+build/
+install/
+log/
+.colcon/
+
+# Python Cache & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.directory
+
+# Temporary / Log files
+*.log
+/tmp/
+.tempmediaStorage/
+
+# Test / Dump media files
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.gv
+
+# Keep assets in package directories even if they match extensions
+!robot_ws/src/**/materials/**/*
+!robot_ws/src/**/models/**/*
+!robot_ws/src/**/config/**/*
+!robot_ws/src/**/worlds/**/*
+
+# Local agent artifacts
+.agents/
