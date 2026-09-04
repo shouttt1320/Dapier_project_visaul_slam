@@ -44,9 +44,8 @@
 
     # 2D Occupancy Grid Map Generation for Nav2
     Grid/FromDepth: "true"         # Project 3D depth image into 2D /map grid
+    Grid/RangeMin: "0.4"           # Ignore blind zone noise under 40cm
     Grid/RangeMax: "2.5"           # Max sensor range for mapping (matches OS30A 2.5m)
     Grid/RayTracing: "true"        # Clear free space along optical rays
     Grid/CellSize: "0.05"          # 5cm grid resolution (matches standard Nav2)
-    Grid/MaxObstacleHeight: "1.0"  # Max height for obstacles
-    Grid/MaxGroundHeight: "0.08"   # Floor threshold (meters)
-    Grid/MinGroundHeight: "-0.05"
+    Grid/MaxObstacleHeight: "1.2"  # Max height for obstacles

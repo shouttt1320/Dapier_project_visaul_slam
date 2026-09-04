@@ -74,8 +74,8 @@ def generate_launch_description():
             ('imu', '/imu'),
             ('odom', odom_topic),
             ('grid_map', '/map')
-        ],
-        arguments=['-d']  # Delete previous temporary database on startup
+        ]
+        # Note: '-d' omitted by default to preserve saved maps and databases
     )
 
     # Optional RTAB-Map 3D Visualizer GUI

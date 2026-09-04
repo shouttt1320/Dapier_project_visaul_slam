@@ -109,8 +109,8 @@ class CompressedBridgeNode(Node):
         img_rgb, color_header = self.latest_color
         img_depth, _ = self.latest_depth
 
-        # Use the original camera timestamp from the sensor to match robot TF exactly
-        stamp = color_header.stamp
+        # Stamp with live local time to guarantee alignment with local transform cache
+        stamp = self.get_clock().now().to_msg()
         frame_id = 'camera_color_optical_frame'
 
         # 1. Color Image
