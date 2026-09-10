@@ -1,0 +1,45 @@
+# ==============================================================================
+# Gazebo Astra S Bridge: Active during Nav2 Navigation & Visual SLAM Phase
+# ==============================================================================
+
+# Camera RGB Image
+- ros_topic_name: "camera/color/image_raw"
+  gz_topic_name: "camera/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+# Camera RGB Image (RViz / Compatibility)
+- ros_topic_name: "camera/color/image_decompressed"
+  gz_topic_name: "camera/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+# Camera Depth Image
+- ros_topic_name: "camera/depth/image_raw"
+  gz_topic_name: "camera/depth_image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+# Camera Depth Image (Compatibility)
+- ros_topic_name: "camera/depth/image_decompressed"
+  gz_topic_name: "camera/depth_image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+# Camera Info
+- ros_topic_name: "camera/color/camera_info"
+  gz_topic_name: "camera/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+
+# Camera Info (Compatibility)
+- ros_topic_name: "camera/color/decompressed/camera_info"
+  gz_topic_name: "camera/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS

@@ -176,11 +176,11 @@
       </collision>
     </link>
 
-    <!-- OS30A RGB-D Camera Link & Sensor -->
+    <!-- Orbbec Astra S RGB-D Camera Link & Sensor (Flush on front deck) -->
     <link name="camera_link"/>
 
-    <link name="camera_rgb_optical_frame">
-      <pose>0.08 0.0 0.15 0 0 0</pose>
+    <link name="camera_color_optical_frame">
+      <pose>0.08 0.0 0.134 0 0 0</pose>
       <inertial>
         <mass>0.05</mass>
         <inertia>
@@ -190,11 +190,11 @@
         </inertia>
       </inertial>
 
-      <!-- OS30A Camera Housing Visual -->
-      <visual name="os30a_visual">
+      <!-- Astra S Camera Housing Visual -->
+      <visual name="astra_visual">
         <pose>0 0 0 0 0 0</pose>
         <geometry>
-          <box><size>0.03 0.12 0.03</size></box>
+          <box><size>0.04 0.165 0.03</size></box>
         </geometry>
         <material>
           <ambient>0.1 0.1 0.1 1.0</ambient>
@@ -202,18 +202,138 @@
         </material>
       </visual>
 
-      <sensor name="os30a_camera" type="rgbd_camera">
-        <always_on>true</always_on>
+      <sensor name="astra_camera" type="rgbd_camera">
+        <always_on>false</always_on>
         <visualize>true</visualize>
-        <update_rate>30</update_rate>
+        <update_rate>15</update_rate>
         <topic>camera</topic>
-        <gz_frame_id>camera_rgb_optical_frame</gz_frame_id>
+        <gz_frame_id>camera_color_optical_frame</gz_frame_id>
+        <camera name="astra">
+          <!-- Astra S HFOV 60 deg = 1.0472 rad -->
+          <horizontal_fov>1.0472</horizontal_fov>
+          <image>
+            <width>640</width>
+            <height>480</height>
+            <format>R8G8B8</format>
+          </image>
+          <!-- Astra S range: 0.4m to 2.5m -->
+          <clip>
+            <near>0.4</near>
+            <far>2.5</far>
+          </clip>
+          <!-- Depth Noise Model -->
+          <noise>
+            <type>gaussian</type>
+            <mean>0.0</mean>
+            <stddev>0.005</stddev>
+          </noise>
+          <depth_camera>
+            <output>depths</output>
+            <clip>
+              <near>0.4</near>
+              <far>2.5</far>
+            </clip>
+          </depth_camera>
+        </camera>
+      </sensor>
+    </link>
+
+    <!-- Single Central Camera Mount Structure (Bottom Clamp + 400mm 20x20 Pillar + Top Clamp) -->
+    <link name="cam_mount_link">
+      <pose>-0.05 0.0 0.1015 0 0 0</pose>
+      <inertial>
+        <mass>0.20</mass>
+        <inertia>
+          <ixx>0.003</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>0.003</iyy><iyz>0</iyz>
+          <izz>0.001</izz>
+        </inertia>
+      </inertial>
+
+      <!-- Bottom Chassis Clamp in Center -->
+      <visual name="mount_bottom_visual">
+        <pose>0 0 0 0 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>model://turtlebot3_waffle_pi_os30a/meshes/cam_mount_bottom.stl</uri>
+            <scale>0.001 0.001 0.001</scale>
+          </mesh>
+        </geometry>
+        <material>
+          <ambient>0.15 0.25 0.45 1.0</ambient>
+          <diffuse>0.20 0.40 0.70 1.0</diffuse>
+        </material>
+      </visual>
+
+      <!-- Single Central Aluminum 20x20 Extrusion Pillar (Height 400mm) -->
+      <visual name="mount_frame_visual">
+        <pose>0 0 0 0 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>model://turtlebot3_waffle_pi_os30a/meshes/al_profile_frame.stl</uri>
+            <scale>0.001 0.001 0.001</scale>
+          </mesh>
+        </geometry>
+        <material>
+          <ambient>0.6 0.6 0.6 1.0</ambient>
+          <diffuse>0.8 0.8 0.8 1.0</diffuse>
+        </material>
+      </visual>
+
+      <!-- Top Clamp Bracket in Center (At Z = 400mm) -->
+      <visual name="mount_top_visual">
+        <pose>0 0 0.400 0 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>model://turtlebot3_waffle_pi_os30a/meshes/cam_mount_top.stl</uri>
+            <scale>0.001 0.001 0.001</scale>
+          </mesh>
+        </geometry>
+        <material>
+          <ambient>0.10 0.35 0.25 1.0</ambient>
+          <diffuse>0.15 0.55 0.35 1.0</diffuse>
+        </material>
+      </visual>
+    </link>
+
+    <!-- Upper Manipulation Camera: YDLIDAR OS30A (Dimensions: 90 x 25.5 x 25 mm) -->
+    <link name="os30a_camera_link"/>
+
+    <link name="os30a_camera_color_optical_frame">
+      <pose>0.0 0.0 0.52 0 1.047 0</pose>
+      <inertial>
+        <mass>0.05</mass>
+        <inertia>
+          <ixx>0.001</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>0.001</iyy><iyz>0</iyz>
+          <izz>0.001</izz>
+        </inertia>
+      </inertial>
+
+      <!-- OS30A Camera Housing Visual: 25.5mm depth(X) x 90.0mm width(Y) x 25.0mm height(Z) -->
+      <visual name="os30a_visual">
+        <pose>0 0 0 0 0 0</pose>
+        <geometry>
+          <box><size>0.0255 0.090 0.025</size></box>
+        </geometry>
+        <material>
+          <ambient>0.15 0.15 0.15 1.0</ambient>
+          <diffuse>0.25 0.25 0.25 1.0</diffuse>
+        </material>
+      </visual>
+
+      <sensor name="os30a_camera" type="rgbd_camera">
+        <always_on>false</always_on>
+        <visualize>true</visualize>
+        <update_rate>15</update_rate>
+        <topic>os30a/camera</topic>
+        <gz_frame_id>os30a_camera_color_optical_frame</gz_frame_id>
         <camera name="os30a">
           <!-- OS30A HFOV 78 deg = 1.36136 rad -->
           <horizontal_fov>1.36136</horizontal_fov>
           <image>
-            <width>640</width>
-            <height>480</height>
+            <width>320</width>
+            <height>240</height>
             <format>R8G8B8</format>
           </image>
           <!-- OS30A range: 0.2m to 2.5m -->
@@ -221,11 +341,10 @@
             <near>0.2</near>
             <far>2.5</far>
           </clip>
-          <!-- Depth Noise Model -->
           <noise>
             <type>gaussian</type>
             <mean>0.0</mean>
-            <stddev>0.007</stddev>
+            <stddev>0.005</stddev>
           </noise>
           <depth_camera>
             <output>depths</output>
@@ -235,6 +354,56 @@
             </clip>
           </depth_camera>
         </camera>
+      </sensor>
+    </link>
+
+    <!-- Single Precision Docking Contact Bumper (Contact surface tip at X = +0.150m, Z = 0.140m) -->
+    <!-- Ensures exactly 50mm clearance between Astra S camera tip (X = 0.100m) and Desk (X = 1.500m) -->
+    <link name="contact_bumper_link">
+      <pose>0.148 0.0 0.140 0 0 0</pose>
+      <inertial>
+        <mass>0.01</mass>
+        <inertia>
+          <ixx>0.0001</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>0.0001</iyy><iyz>0</iyz>
+          <izz>0.0001</izz>
+        </inertia>
+      </inertial>
+      <!-- Stopper Head (Gold/Amber finish) -->
+      <visual name="bumper_head_visual">
+        <pose>0 0 0 0 0 0</pose>
+        <geometry>
+          <box><size>0.005 0.060 0.015</size></box>
+        </geometry>
+        <material>
+          <ambient>0.8 0.6 0.1 1.0</ambient>
+          <diffuse>0.9 0.7 0.2 1.0</diffuse>
+        </material>
+      </visual>
+      <!-- Arm Bracket Connecting to front chassis -->
+      <visual name="bumper_arm_visual">
+        <pose>-0.035 0 0 0 0 0</pose>
+        <geometry>
+          <box><size>0.065 0.012 0.008</size></box>
+        </geometry>
+        <material>
+          <ambient>0.2 0.2 0.2 1.0</ambient>
+          <diffuse>0.3 0.3 0.3 1.0</diffuse>
+        </material>
+      </visual>
+      <!-- Front Collision Contact Surface (Tip at X = +0.1505m) -->
+      <collision name="bumper_collision">
+        <pose>0 0 0 0 0 0</pose>
+        <geometry>
+          <box><size>0.005 0.060 0.015</size></box>
+        </geometry>
+      </collision>
+      <sensor name="contact_bumper_sensor" type="contact">
+        <contact>
+          <collision>bumper_collision</collision>
+        </contact>
+        <always_on>true</always_on>
+        <update_rate>100</update_rate>
       </sensor>
     </link>
 
@@ -278,14 +447,49 @@
     <joint name="camera_joint" type="fixed">
       <parent>base_link</parent>
       <child>camera_link</child>
-      <pose>0.08 0 0.15 0 0 0</pose>
+      <pose>0.08 0 0.134 0 0 0</pose>
     </joint>
 
     <joint name="camera_optical_joint" type="fixed">
       <parent>camera_link</parent>
-      <child>camera_rgb_optical_frame</child>
+      <child>camera_color_optical_frame</child>
       <pose>0 0 0 0 0 0</pose>
     </joint>
+
+    <joint name="cam_mount_joint" type="fixed">
+      <parent>base_link</parent>
+      <child>cam_mount_link</child>
+      <pose>-0.05 0 0.1015 0 0 0</pose>
+    </joint>
+
+    <joint name="os30a_camera_joint" type="fixed">
+      <parent>base_link</parent>
+      <child>os30a_camera_link</child>
+      <pose>0.0 0 0.52 0 1.047 0</pose>
+    </joint>
+
+    <joint name="os30a_camera_optical_joint" type="fixed">
+      <parent>os30a_camera_link</parent>
+      <child>os30a_camera_color_optical_frame</child>
+      <pose>0 0 0 0 0 0</pose>
+    </joint>
+
+    <joint name="contact_bumper_joint" type="fixed">
+      <parent>base_link</parent>
+      <child>contact_bumper_link</child>
+      <pose>0 0 0 0 0 0</pose>
+    </joint>
+
+    <!-- Single Contact Bumper Touch Plugin (Emits true on /bumper/contact when touching brown_desk) -->
+    <plugin
+      filename="gz-sim-touchplugin-system"
+      name="gz::sim::systems::TouchPlugin">
+      <target>brown_desk</target>
+      <time>0.05</time>
+      <namespace>bumper</namespace>
+      <topic>touched</topic>
+      <enabled>true</enabled>
+    </plugin>
 
     <!-- Differential Drive Plugin (50Hz Wheel Odom) -->
     <plugin filename="gz-sim-diff-drive-system" name="gz::sim::systems::DiffDrive">

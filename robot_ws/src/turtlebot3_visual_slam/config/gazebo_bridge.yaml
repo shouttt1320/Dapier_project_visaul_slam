@@ -5,7 +5,7 @@
   gz_type_name: "gz.msgs.Clock"
   direction: GZ_TO_ROS
 
-# Command Velocity
+# Command Velocity (Twist)
 - ros_topic_name: "cmd_vel"
   gz_topic_name: "cmd_vel"
   ros_type_name: "geometry_msgs/msg/Twist"
@@ -47,8 +47,22 @@
   gz_type_name: "gz.msgs.Image"
   direction: GZ_TO_ROS
 
+# Camera RGB Image (RViz / Compatibility)
+- ros_topic_name: "camera/color/image_decompressed"
+  gz_topic_name: "camera/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
 # Camera Depth Image
 - ros_topic_name: "camera/depth/image_raw"
+  gz_topic_name: "camera/depth_image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+# Camera Depth Image (Compatibility)
+- ros_topic_name: "camera/depth/image_decompressed"
   gz_topic_name: "camera/depth_image"
   ros_type_name: "sensor_msgs/msg/Image"
   gz_type_name: "gz.msgs.Image"
@@ -61,9 +75,64 @@
   gz_type_name: "gz.msgs.CameraInfo"
   direction: GZ_TO_ROS
 
-# Camera 3D PointCloud
-- ros_topic_name: "camera/depth/points"
-  gz_topic_name: "camera/points"
-  ros_type_name: "sensor_msgs/msg/PointCloud2"
-  gz_type_name: "gz.msgs.PointCloudPacked"
+# Camera Info (Compatibility)
+- ros_topic_name: "camera/color/decompressed/camera_info"
+  gz_topic_name: "camera/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
   direction: GZ_TO_ROS
+
+# ==============================================================================
+# OS30A RGB-D Camera (Manipulation Camera on Mount)
+# ==============================================================================
+# OS30A RGB Image
+- ros_topic_name: "os30a/camera/color/image_raw"
+  gz_topic_name: "os30a/camera/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+# OS30A RGB Image (Decompressed / RViz)
+- ros_topic_name: "os30a/camera/color/image_decompressed"
+  gz_topic_name: "os30a/camera/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+# OS30A Depth Image
+- ros_topic_name: "os30a/camera/depth/image_raw"
+  gz_topic_name: "os30a/camera/depth_image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+# OS30A Depth Image (RViz compatibility)
+- ros_topic_name: "os30a/camera/depth/image_decompressed"
+  gz_topic_name: "os30a/camera/depth_image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+# OS30A Color Camera Info
+- ros_topic_name: "os30a/camera/color/camera_info"
+  gz_topic_name: "os30a/camera/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+
+# OS30A Depth Camera Info
+- ros_topic_name: "os30a/camera/depth/camera_info"
+  gz_topic_name: "os30a/camera/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+
+# ==============================================================================
+# Single Precision Docking Contact Bumper
+# ==============================================================================
+- ros_topic_name: "robot/bumper/contact"
+  gz_topic_name: "bumper/touched"
+  ros_type_name: "std_msgs/msg/Bool"
+  gz_type_name: "gz.msgs.Boolean"
+  direction: GZ_TO_ROS
+

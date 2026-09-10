@@ -27,6 +27,18 @@
       filename="gz-sim-imu-system"
       name="gz::sim::systems::Imu">
     </plugin>
+    <plugin
+      filename="gz-sim-contact-system"
+      name="gz::sim::systems::Contact">
+    </plugin>
+
+    <!-- Default GUI Camera View (Elevated Isometric View of Robot & Desk) -->
+    <gui fullscreen="0">
+      <camera name="user_camera">
+        <pose>-0.2 -1.2 1.6 0 0.55 0.85</pose>
+        <view_controller>orbit</view_controller>
+      </camera>
+    </gui>
 
     <!-- Sun Light -->
     <light type="directional" name="sun">
@@ -328,28 +340,106 @@
       </link>
     </model>
 
-    <!-- TARGET OBJECT: Bright RED BOX (0.3m x 0.3m x 0.3m) -->
-    <model name="red_box_target">
+    <!-- WORKSPACE DESK: Brown Desk (TurtleBot3 height ~0.15m) -->
+    <model name="brown_desk">
       <static>true</static>
-      <pose>1.8 0.4 0.15 0 0 0</pose>
+      <pose>1.8 0.4 0.0 0 0 0</pose>
+      <link name="table_link">
+        <!-- Table Top (Surface at Z = 0.15m) -->
+        <collision name="top_collision">
+          <pose>0 0 0.14 0 0 0</pose>
+          <geometry><box><size>0.6 0.5 0.02</size></box></geometry>
+        </collision>
+        <visual name="top_visual">
+          <pose>0 0 0.14 0 0 0</pose>
+          <geometry><box><size>0.6 0.5 0.02</size></box></geometry>
+          <material>
+            <ambient>0.42 0.26 0.15 1.0</ambient>
+            <diffuse>0.55 0.35 0.20 1.0</diffuse>
+            <specular>0.2 0.12 0.08 1.0</specular>
+          </material>
+        </visual>
+
+        <!-- Leg 1: Front-Left -->
+        <collision name="leg_fl_collision">
+          <pose>0.26 0.21 0.065 0 0 0</pose>
+          <geometry><box><size>0.04 0.04 0.13</size></box></geometry>
+        </collision>
+        <visual name="leg_fl_visual">
+          <pose>0.26 0.21 0.065 0 0 0</pose>
+          <geometry><box><size>0.04 0.04 0.13</size></box></geometry>
+          <material>
+            <ambient>0.35 0.22 0.12 1.0</ambient>
+            <diffuse>0.45 0.28 0.15 1.0</diffuse>
+          </material>
+        </visual>
+
+        <!-- Leg 2: Front-Right -->
+        <collision name="leg_fr_collision">
+          <pose>0.26 -0.21 0.065 0 0 0</pose>
+          <geometry><box><size>0.04 0.04 0.13</size></box></geometry>
+        </collision>
+        <visual name="leg_fr_visual">
+          <pose>0.26 -0.21 0.065 0 0 0</pose>
+          <geometry><box><size>0.04 0.04 0.13</size></box></geometry>
+          <material>
+            <ambient>0.35 0.22 0.12 1.0</ambient>
+            <diffuse>0.45 0.28 0.15 1.0</diffuse>
+          </material>
+        </visual>
+
+        <!-- Leg 3: Back-Left -->
+        <collision name="leg_bl_collision">
+          <pose>-0.26 0.21 0.065 0 0 0</pose>
+          <geometry><box><size>0.04 0.04 0.13</size></box></geometry>
+        </collision>
+        <visual name="leg_bl_visual">
+          <pose>-0.26 0.21 0.065 0 0 0</pose>
+          <geometry><box><size>0.04 0.04 0.13</size></box></geometry>
+          <material>
+            <ambient>0.35 0.22 0.12 1.0</ambient>
+            <diffuse>0.45 0.28 0.15 1.0</diffuse>
+          </material>
+        </visual>
+
+        <!-- Leg 4: Back-Right -->
+        <collision name="leg_br_collision">
+          <pose>-0.26 -0.21 0.065 0 0 0</pose>
+          <geometry><box><size>0.04 0.04 0.13</size></box></geometry>
+        </collision>
+        <visual name="leg_br_visual">
+          <pose>-0.26 -0.21 0.065 0 0 0</pose>
+          <geometry><box><size>0.04 0.04 0.13</size></box></geometry>
+          <material>
+            <ambient>0.35 0.22 0.12 1.0</ambient>
+            <diffuse>0.45 0.28 0.15 1.0</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- TARGET OBJECT: Small Red Block (50mm x 50mm x 50mm) on Brown Desk -->
+    <model name="small_red_block">
+      <static>true</static>
+      <pose>1.75 0.4 0.175 0 0 0</pose>
       <link name="link">
         <collision name="collision">
           <geometry>
             <box>
-              <size>0.3 0.3 0.3</size>
+              <size>0.05 0.05 0.05</size>
             </box>
           </geometry>
         </collision>
         <visual name="visual">
           <geometry>
             <box>
-              <size>0.3 0.3 0.3</size>
+              <size>0.05 0.05 0.05</size>
             </box>
           </geometry>
           <material>
-            <ambient>0.8 0.0 0.0 1.0</ambient>
-            <diffuse>1.0 0.0 0.0 1.0</diffuse>
-            <specular>0.4 0.1 0.1 1.0</specular>
+            <ambient>0.85 0.0 0.0 1.0</ambient>
+            <diffuse>1.0 0.05 0.05 1.0</diffuse>
+            <specular>0.5 0.2 0.2 1.0</specular>
           </material>
         </visual>
       </link>

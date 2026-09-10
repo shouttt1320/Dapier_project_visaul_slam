@@ -40,3 +40,4 @@ venv/
 
 # Local agent artifacts
 .agents/
+*.db

@@ -1,0 +1,45 @@
+# ==============================================================================
+# Gazebo OS30A Bridge: Active during Close Precision Docking Phase
+# ==============================================================================
+
+# OS30A RGB Image
+- ros_topic_name: "/os30a/camera/color/image_raw"
+  gz_topic_name: "os30a/camera/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+# OS30A RGB Image (Decompressed / RViz)
+- ros_topic_name: "/os30a/camera/color/image_decompressed"
+  gz_topic_name: "os30a/camera/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+# OS30A Depth Image
+- ros_topic_name: "/os30a/camera/depth/image_raw"
+  gz_topic_name: "os30a/camera/depth_image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+# OS30A Depth Image (RViz compatibility)
+- ros_topic_name: "/os30a/camera/depth/image_decompressed"
+  gz_topic_name: "os30a/camera/depth_image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+# OS30A Color Camera Info
+- ros_topic_name: "/os30a/camera/color/camera_info"
+  gz_topic_name: "os30a/camera/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+
+# OS30A Depth Camera Info
+- ros_topic_name: "/os30a/camera/depth/camera_info"
+  gz_topic_name: "os30a/camera/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS

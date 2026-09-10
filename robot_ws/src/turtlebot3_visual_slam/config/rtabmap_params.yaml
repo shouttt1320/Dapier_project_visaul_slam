@@ -20,32 +20,35 @@
     qos_camera_info: 0           # 0=RELIABLE
     qos_odom: 0                  # 0=RELIABLE
     qos_imu: 0                   # 0=RELIABLE
-    gen_scan: true               # Generate 2D LaserScan from Depth image
-    gen_scan_max_depth: 3.5
-    gen_scan_min_depth: 0.4
+    gen_scan: false              # No 2D scan generation needed
 
     # RTAB-Map Core Parameters (Passed as strings in ROS 2)
     Rtabmap/DetectionRate: "1.0"   # Keyframe mapping rate (1 Hz for stable graph updates)
-    Mem/IncrementalMemory: "true"  # SLAM mapping mode
+    Mem/IncrementalMemory: "true"  # SLAM mapping mode (overridden in localization launch)
     Mem/UseOdomGravity: "true"     # Use IMU gravity to align horizontal ground plane
     Mem/DepthCompressionFormat: ".png"
     Mem/RehearsalSimilarity: "0.45"
+    Mem/InitWMWithAllNodes: "false"
 
     # RGB-D Odometry & Registration (ORB + ICP Refinement)
-    Reg/Strategy: "0"              # 0=Visual Features, 1=ICP, 2=Visual+ICP
+    Reg/Strategy: "0"              # 0=Visual Features
     Reg/Force3DoF: "true"          # Enforce 2D planar SLAM (prevents roll/pitch drift & map warping)
+    RGBD/ForceOdom3DoF: "true"     # Enforce 3DoF for odometry constraints
     Vis/FeatureType: "2"           # 2=ORB
     Kp/DetectorStrategy: "2"       # 2=ORB (align loop closure detector with visual feature type)
-    Vis/MaxFeatures: "1200"
+    Vis/MaxFeatures: "1500"        # 1500 ORB features for high descriptive power in sparse office scenes
     Vis/MinInliers: "20"           # Strict inlier threshold to avoid false repetitive brick matches
     RGBD/NeighborLinkRefining: "false" # Rely on EKF (Wheel+IMU) for odometry, use vision for loop closure
     RGBD/AngularUpdate: "0.15"     # ~8.6 degrees rotation before adding new keyframe
     RGBD/LinearUpdate: "0.15"      # 15 cm translation before adding new keyframe
 
-    # 2D Occupancy Grid Map Generation for Nav2
+    # 2D Occupancy Grid Map Generation directly from 3D Depth Projection
+    Grid/Sensor: "1"               # 1=Depth Image/Point Cloud (0=LaserScan, 2=Both)
     Grid/FromDepth: "true"         # Project 3D depth image into 2D /map grid
     Grid/RangeMin: "0.4"           # Ignore blind zone noise under 40cm
-    Grid/RangeMax: "2.5"           # Max sensor range for mapping (matches OS30A 2.5m)
+    Grid/RangeMax: "2.5"           # Max sensor range for mapping (matches Astra S 2.5m)
     Grid/RayTracing: "true"        # Clear free space along optical rays
     Grid/CellSize: "0.05"          # 5cm grid resolution (matches standard Nav2)
     Grid/MaxObstacleHeight: "1.2"  # Max height for obstacles
+    Grid/MinGroundHeight: "0.05"   # Filter floor plane noise
+    Grid/MaxGroundHeight: "0.15"

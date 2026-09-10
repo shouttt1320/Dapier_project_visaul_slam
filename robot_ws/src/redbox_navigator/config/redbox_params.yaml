@@ -15,7 +15,7 @@
     # Coordinate & TF Parameters
     target_frame: "map"
     base_frame: "base_footprint"
-    camera_optical_frame: "camera_rgb_optical_frame"
+    camera_optical_frame: "camera_color_optical_frame"
     depth_roi_radius: 10
     min_depth: 0.20
     max_depth: 2.50

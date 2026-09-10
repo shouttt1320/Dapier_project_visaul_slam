@@ -28,6 +28,9 @@ setup(
             'target_coordinate = redbox_navigator.target_coordinate_node:main',
             'target_depth_coordinate = redbox_navigator.target_depth_coordinate_node:main',
             'mission_controller = redbox_navigator.redbox_mission_controller:main',
+            'precision_approacher = redbox_navigator.precision_approacher_node:main',
+            'camera_mode_manager = redbox_navigator.camera_mode_manager_node:main',
+            'docking_gui = redbox_navigator.docking_gui_node:main',
         ],
     },
 )
