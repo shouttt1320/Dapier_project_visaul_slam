@@ -154,7 +154,7 @@ def launch_setup(context, *args, **kwargs):
     nodes.append(rviz_node)
     # 7. RedBox Mission Control GUI (Mode Switcher + Real-Time Video Viewport)
     gui_node = Node(
-        package='redbox_navigator',
+        package='precision_docker',
         executable='docking_gui',
         name='docking_gui_node',
         condition=IfCondition(launch_gui),
@@ -164,7 +164,7 @@ def launch_setup(context, *args, **kwargs):
 
     # 8. Precision Close-Docking Node (High-Performance ArUco Visual Servoing on PC)
     precision_node = Node(
-        package='redbox_navigator',
+        package='precision_docker',
         executable='precision_approacher',
         name='precision_approacher_node',
         parameters=[{

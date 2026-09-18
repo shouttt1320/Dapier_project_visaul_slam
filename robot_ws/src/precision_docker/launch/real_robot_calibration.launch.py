@@ -56,7 +56,7 @@ def generate_launch_description():
 
     # 2. Micro-switch Contact Bumper Node
     bumper_node = Node(
-        package='redbox_navigator',
+        package='precision_docker',
         executable='bumper_sensor',
         name='bumper_sensor_node',
         output='screen',
@@ -70,7 +70,7 @@ def generate_launch_description():
 
     # 3. Precision Approacher Node in Static Calibration Mode (Passive, zero motor cmd_vel)
     approacher_node = Node(
-        package='redbox_navigator',
+        package='precision_docker',
         executable='precision_approacher',
         name='precision_approacher_node',
         output='screen',

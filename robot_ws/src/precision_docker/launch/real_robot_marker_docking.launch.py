@@ -56,7 +56,7 @@ def generate_launch_description():
 
     # 1. Micro-switch Contact Bumper Node (Runs on Raspberry Pi 4 GPIO Pin 16 / BCM 23)
     bumper_node = Node(
-        package='redbox_navigator',
+        package='precision_docker',
         executable='bumper_sensor',
         name='bumper_sensor_node',
         output='screen',
@@ -70,7 +70,7 @@ def generate_launch_description():
 
     # 2. Precision Marker Approacher Node
     approacher_node = Node(
-        package='redbox_navigator',
+        package='precision_docker',
         executable='precision_approacher',
         name='precision_approacher_node',
         output='screen',

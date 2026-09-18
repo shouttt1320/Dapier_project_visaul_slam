@@ -27,6 +27,6 @@ sleep 3
 
 # 4. Start Micro-switch Contact Bumper Sensor (GPIO Pin 16 / BCM 23)
 echo '[3/3] Starting Contact Bumper Sensor...'
-ros2 run redbox_navigator bumper_sensor --ros-args -p pin:=23 -p poll_rate_hz:=50.0 -p debounce_ms:=15.0 -p active_low:=true > /tmp/bumper.log 2>&1 &
+ros2 run precision_docker bumper_sensor --ros-args -p pin:=23 -p poll_rate_hz:=50.0 -p debounce_ms:=15.0 -p active_low:=true > /tmp/bumper.log 2>&1 &
 
 echo 'All robot nodes started! (Logs: /tmp/turtlebot3.log, /tmp/astra.log, /tmp/bumper.log)'

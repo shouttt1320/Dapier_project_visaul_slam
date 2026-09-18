@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>redbox_navigator</name>
+  <name>precision_docker</name>
   <version>1.0.0</version>
-  <description>TurtleBot3 Red Box Recognition and Autonomous Target Stopping Navigation Package</description>
+  <description>High-precision Autonomous Marker and Depth Docking Package for TurtleBot3</description>
   <maintainer email="jjj@todo.todo">jjj</maintainer>
   <license>Apache-2.0</license>
 
