@@ -24,7 +24,10 @@ def launch_setup(context, *args, **kwargs):
     db_raw = context.perform_substitution(database_path)
     if not db_raw or db_raw in ['auto', '']:
         if is_sim:
-            resolved_db_path = os.path.join(os.path.expanduser('~'), 'Documents', 'Dapier', 'Project', 'simulation_3d.db')
+            sim_db = os.path.join(os.path.expanduser('~'), 'Documents', 'Dapier', 'Project', 'simulation', 'simulation_3d.db')
+            if not os.path.exists(sim_db):
+                sim_db = os.path.join(os.path.expanduser('~'), 'Documents', 'Dapier', 'Project', 'simulation_3d.db')
+            resolved_db_path = sim_db
         else:
             resolved_db_path = os.path.join(os.path.expanduser('~'), 'Documents', 'Dapier', 'Project', 'my_office_3d.db')
     else:

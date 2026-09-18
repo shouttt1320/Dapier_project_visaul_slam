@@ -31,6 +31,7 @@ setup(
             'precision_approacher = redbox_navigator.precision_approacher_node:main',
             'camera_mode_manager = redbox_navigator.camera_mode_manager_node:main',
             'docking_gui = redbox_navigator.docking_gui_node:main',
+            'bumper_sensor = redbox_navigator.bumper_sensor_node:main',
         ],
     },
 )

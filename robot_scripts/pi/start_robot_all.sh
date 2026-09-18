@@ -19,8 +19,14 @@ ros2 launch ~/tb3_base_only.launch.py > /tmp/turtlebot3.log 2>&1 &
 
 sleep 3
 
-# 3. Start Astra Camera Stream (Raw sensor acquisition & lightweight compression only, NO Point Cloud)
-echo '[2/2] Starting Astra S stream...'
+# 3. Start Astra Camera Stream
+echo '[2/3] Starting Astra S stream...'
 ~/run_astra.sh > /tmp/astra.log 2>&1 &
 
-echo 'All robot nodes started! (Logs: /tmp/turtlebot3.log, /tmp/astra.log)'
+sleep 3
+
+# 4. Start Micro-switch Contact Bumper Sensor (GPIO Pin 16 / BCM 23)
+echo '[3/3] Starting Contact Bumper Sensor...'
+ros2 run redbox_navigator bumper_sensor --ros-args -p pin:=23 -p poll_rate_hz:=50.0 -p debounce_ms:=15.0 -p active_low:=true > /tmp/bumper.log 2>&1 &
+
+echo 'All robot nodes started! (Logs: /tmp/turtlebot3.log, /tmp/astra.log, /tmp/bumper.log)'

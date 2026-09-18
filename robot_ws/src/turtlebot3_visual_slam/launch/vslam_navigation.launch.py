@@ -19,13 +19,17 @@ def launch_setup(context, *args, **kwargs):
     use_sim_time = LaunchConfiguration('use_sim_time')
     open_rviz = LaunchConfiguration('open_rviz')
     odom_topic = LaunchConfiguration('odom_topic')
+    launch_gui = LaunchConfiguration('launch_gui')
 
     is_sim = context.perform_substitution(use_sim_time).lower() in ['true', '1']
 
     db_raw = context.perform_substitution(database_path)
     if not db_raw or db_raw in ['auto', '']:
         if is_sim:
-            resolved_db_path = os.path.join(os.path.expanduser('~'), 'Documents', 'Dapier', 'Project', 'simulation_3d.db')
+            sim_db = os.path.join(os.path.expanduser('~'), 'Documents', 'Dapier', 'Project', 'simulation', 'simulation_3d.db')
+            if not os.path.exists(sim_db):
+                sim_db = os.path.join(os.path.expanduser('~'), 'Documents', 'Dapier', 'Project', 'simulation_3d.db')
+            resolved_db_path = sim_db
         else:
             resolved_db_path = os.path.join(os.path.expanduser('~'), 'Documents', 'Dapier', 'Project', 'my_office_3d.db')
     else:
@@ -41,6 +45,16 @@ def launch_setup(context, *args, **kwargs):
         camera_info_topic = '/camera/color/decompressed/camera_info'
 
     nodes = []
+
+    # 0. Local Robot State Publisher (Full URDF & TF tree for RViz & Costmaps)
+    tb3_bringup_pkg = get_package_share_directory('turtlebot3_bringup')
+    state_pub_cmd = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(tb3_bringup_pkg, 'launch', 'turtlebot3_state_publisher.launch.py')
+        ),
+        launch_arguments={'use_sim_time': use_sim_time, 'namespace': ''}.items()
+    )
+    nodes.append(state_pub_cmd)
 
     # 1. PC-Side Zero-Lag Decompression & Sync Bridge (Real robot only)
     if not is_sim:
@@ -138,6 +152,34 @@ def launch_setup(context, *args, **kwargs):
         output='screen'
     )
     nodes.append(rviz_node)
+    # 7. RedBox Mission Control GUI (Mode Switcher + Real-Time Video Viewport)
+    gui_node = Node(
+        package='redbox_navigator',
+        executable='docking_gui',
+        name='docking_gui_node',
+        condition=IfCondition(launch_gui),
+        output='screen'
+    )
+    nodes.append(gui_node)
+
+    # 8. Precision Close-Docking Node (High-Performance ArUco Visual Servoing on PC)
+    precision_node = Node(
+        package='redbox_navigator',
+        executable='precision_approacher',
+        name='precision_approacher_node',
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'color_topic': rgb_topic,
+            'depth_topic': depth_topic,
+            'cam_info_topic': camera_info_topic,
+            'docking_mode': 'marker',
+            'enable_stamped_cmd_vel': True,
+            'docking_timeout_sec': 75.0,
+            'min_crawl_speed': 0.060
+        }],
+        output='screen'
+    )
+    nodes.append(precision_node)
 
     return nodes
 
@@ -148,5 +190,6 @@ def generate_launch_description():
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('open_rviz', default_value='true', description='Open Unified RViz'),
         DeclareLaunchArgument('odom_topic', default_value='/odom', description='Odometry topic (/odom or /odometry/filtered)'),
+        DeclareLaunchArgument('launch_gui', default_value='true', description='Open Mission Control GUI Dashboard'),
         OpaqueFunction(function=launch_setup)
     ])

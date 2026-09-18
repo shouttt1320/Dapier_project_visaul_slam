@@ -3,6 +3,9 @@ build/
 install/
 log/
 .colcon/
+robot_ws/build/
+robot_ws/install/
+robot_ws/log/
 
 # Python Cache & Virtual Environments
 __pycache__/
@@ -24,6 +27,25 @@ venv/
 *.log
 /tmp/
 .tempmediaStorage/
+diagnostics/
+
+# Large SLAM DB files (RTAB-Map)
+*.db
+*.db-shm
+*.db-wal
+*.bag
+
+# Temporary Test Scripts & Hardware Checks
+test_cmd_vel.py
+test_dual_marker.py
+test_marker_accuracy.py
+run_pi_hardware_test.sh
+docking_algorithm_notion_guide_.md
+
+# Unused Drivers, Simulation & Legacy Code
+unused_drivers/
+simulation/
+robot_ws/src/redbox_navigator/legacy/
 
 # Test / Dump media files
 *.png
@@ -37,7 +59,7 @@ venv/
 !robot_ws/src/**/models/**/*
 !robot_ws/src/**/config/**/*
 !robot_ws/src/**/worlds/**/*
+!markers/**/*
 
 # Local agent artifacts
 .agents/
-*.db

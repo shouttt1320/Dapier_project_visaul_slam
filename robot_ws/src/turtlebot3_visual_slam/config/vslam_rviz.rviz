@@ -150,7 +150,7 @@ Visualization Manager:
       Style: Points
       Topic:
         Depth: 5
-        Durability Policy: Volatile
+        Durability Policy: Transient Local
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /cloud_map
@@ -310,34 +310,6 @@ Visualization Manager:
       Max Value: 1
       Median window: 5
       Min Value: 0
-      Name: OS30A Camera RGB
-      Normalize Range: false
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /os30a/camera/color/image_raw
-      Value: true
-    - Class: rviz_default_plugins/Image
-      Enabled: true
-      Max Value: 1
-      Median window: 5
-      Min Value: 0
-      Name: OS30A Camera Depth
-      Normalize Range: false
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /os30a/camera/depth/image_raw
-      Value: true
-    - Class: rviz_default_plugins/Image
-      Enabled: true
-      Max Value: 1
-      Median window: 5
-      Min Value: 0
       Name: Docking Edge & HUD View
       Normalize Range: false
       Topic:
@@ -345,7 +317,7 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /docking/debug_image
+        Value: /docking/debug_image_decompressed
       Value: true
   Enabled: true
   Global Options:

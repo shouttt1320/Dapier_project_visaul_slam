@@ -11,6 +11,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
+from std_msgs.msg import String
 from sensor_msgs.msg import Image, CompressedImage
 from cv_bridge import CvBridge
 import cv2
@@ -50,20 +51,32 @@ class ZeroLagCompressor(Node):
             Image, '/camera/depth/image_raw', self.depth_cb, qos_sub, callback_group=self.cb_group
         )
 
+        # Listen to camera mode switcher (NAV2 vs DOCKING)
+        self.sub_mode = self.create_subscription(
+            String, '/current_camera_mode', self.mode_cb, 10
+        )
+        self.current_mode = 'NAV2'
+
         self.last_col_time = 0.0
         self.last_dep_time = 0.0
 
         self.get_logger().info('Multi-threaded ZeroLagCompressor active (Lightweight Wi-Fi streaming).')
 
+    def mode_cb(self, msg: String):
+        mode_val = msg.data.strip().upper()
+        if mode_val in ('NAV2', 'DOCKING') and mode_val != self.current_mode:
+            self.get_logger().info(f'Compressor mode switch: {self.current_mode} -> {mode_val}')
+            self.current_mode = mode_val
+
     def color_cb(self, msg: Image):
         now = time.time()
-        if now - self.last_col_time < 0.045:  # ~22 FPS max
+        if now - self.last_col_time < 0.080:  # ~12.5 FPS (Smooth & low bandwidth)
             return
         self.last_col_time = now
 
         try:
             cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-            success, encoded = cv2.imencode('.jpg', cv_img, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            success, encoded = cv2.imencode('.jpg', cv_img, [cv2.IMWRITE_JPEG_QUALITY, 55])
             if success:
                 comp_msg = CompressedImage()
                 comp_msg.header = msg.header
@@ -75,7 +88,10 @@ class ZeroLagCompressor(Node):
 
     def depth_cb(self, msg: Image):
         now = time.time()
-        if now - self.last_dep_time < 0.045:  # ~22 FPS max
+        # In DOCKING mode: throttle to ~4 FPS (0.250s) for 3D box plane fitting while keeping Pi CPU < 20%
+        # In NAV2 mode: throttle to ~6 FPS (0.166s) for RTAB-Map 3D SLAM while cutting CPU load by 40%
+        throttle_interval = 0.250 if self.current_mode == 'DOCKING' else 0.166
+        if now - self.last_dep_time < throttle_interval:
             return
         self.last_dep_time = now
 
@@ -95,7 +111,7 @@ class ZeroLagCompressor(Node):
 def main():
     rclpy.init()
     node = ZeroLagCompressor()
-    executor = MultiThreadedExecutor(num_threads=4)
+    executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
     try:
         executor.spin()

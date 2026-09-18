@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 # ==============================================================================
-# Precision Close-Docking Node for TurtleBot3 (5cm Parallel Docking)
-# - Stage 1: Nav2 Staging Navigation & Tri-Factor Verification
-# - Stage 2: OS30A 3D Depth Visual Servoing (Desk Edge & Parallelism Tracking)
-# - Stage 3: Single Contact Bumper Stop (Physical 5cm Clearance Assurance)
+# Precision Autonomous Docking Node for TurtleBot3
+# Supports:
+#   1. Visual Marker Docking ('marker'):
+#      - Front-facing Astra S RGB camera + ArUco marker pose estimation (solvePnP)
+#      - Carrot Pursuit along marker normal axis (simultaneous heading + lateral convergence)
+#      - In-place 90° lateral step maneuver for close proximity / large offset
+#      - Micro-switch contact bumper + motor stall terminal stop (5cm physical assurance)
+#      - Automatic RTAB-Map SLAM pause/resume management (frees Pi 4 CPU & stops map drift)
+#   2. 3D Depth Edge Docking ('depth_edge'):
+#      - OS30A 3D Depth Visual Servoing & RANSAC edge extraction (legacy/simulation mode)
 # ==============================================================================
 
 import time
@@ -14,17 +20,24 @@ import cv2
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, qos_profile_sensor_data
+from rclpy.qos import qos_profile_sensor_data
 
-from geometry_msgs.msg import Twist, PoseStamped
-from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import Twist, TwistStamped, PoseStamped, Point
+from sensor_msgs.msg import Image, CameraInfo, CompressedImage
 from std_msgs.msg import Bool, String
-from std_srvs.srv import Empty, Trigger
+from std_srvs.srv import Empty, Trigger, SetBool
 from visualization_msgs.msg import Marker
-from nav2_msgs.action import NavigateToPose
-from action_msgs.msg import GoalStatus
-from dataclasses import dataclass
 
+try:
+    from nav2_msgs.action import NavigateToPose
+    from action_msgs.msg import GoalStatus
+    NAV2_ACTION_AVAILABLE = True
+except ImportError:
+    NavigateToPose = None
+    GoalStatus = None
+    NAV2_ACTION_AVAILABLE = False
+
+from dataclasses import dataclass
 import tf2_ros
 from cv_bridge import CvBridge
 
@@ -36,13 +49,12 @@ class TargetObject:
     approach_normal: float = 0.0       # rad
     docking_distance: float = 0.05     # 5cm target
     valid: bool = False
+    last_seen_time: float = 0.0
+
 
 DOCKING_ACTIVE_STATES = (
-    'CHECK_STAGING', 'BACKUP_STANDOFF', 'BACKUP_PREPARE', 'BACKUP_ALIGN_PREPARE',
-    'TURN_LATERAL', 'LATERAL_CRUISE', 'TURN_FACE_DESK',
-    'CARROT_ALIGN', 'ALIGN_PARALLEL', 'CARROT_PURSUIT_ALIGN', 'VERIFY_DUAL_ALIGN',
-    'COARSE_APPROACH', 'FINE_APPROACH', 'FINAL_APPROACH', 'CRAWL_CONTACT',
-    'BACKUP_RETRY'
+    'SEARCH_MARKER', 'CHECK_STAGING', 'STAGING_SETTLE', 'STAGING_AIM',
+    'CARROT_ALIGN', 'STANDOFF_SETTLE', 'CRAWL_CONTACT', 'BACKUP_STANDOFF', 'BACKUP_RETRY'
 )
 
 
@@ -51,121 +63,236 @@ class PrecisionApproacherNode(Node):
         super().__init__('precision_approacher_node')
 
         # ----------------------------------------------------------------------
-        # Parameters
+        # Parameters: General & Navigation
         # ----------------------------------------------------------------------
-        self.declare_parameter('staging_x', 1.10)         # 1.10m gives ~30-35cm clearance to desk front
+        self.declare_parameter('docking_mode', 'marker')    # 'marker' (Astra S ArUco)
+        self.declare_parameter('staging_x', 1.10)
         self.declare_parameter('staging_y', 0.40)
         self.declare_parameter('staging_yaw', 0.0)
-        self.declare_parameter('target_clearance', 0.05)  # 50mm (5cm)
-        self.declare_parameter('reference_x', 0.100)      # Astra S front tip
+        self.declare_parameter('target_clearance', 0.05)   # 50mm (5cm) target clearance
+        self.declare_parameter('reference_x', 0.100)       # Astra S / front bumper tip offset from base_footprint (m)
         self.declare_parameter('max_linear_speed', 0.04)   # 4cm/s max
-        self.declare_parameter('crawl_linear_speed', 0.008) # 8mm/s
-        self.declare_parameter('max_angular_speed', 0.20)  # 0.20 rad/s (~11.5 deg/s)
+        self.declare_parameter('crawl_linear_speed', 0.025) # 2.5cm/s crawl
+        self.declare_parameter('max_angular_speed', 0.22)  # 0.22 rad/s (~12.6 deg/s)
         self.declare_parameter('skip_nav2_if_close', True)
-        self.declare_parameter('show_window', True)        # Live visual window
-        self.declare_parameter('docking_timeout_sec', 35.0) # Abort and retreat if docking exceeds this timeout
-        self.declare_parameter('autostart', False)         # If False, start in NAV2_READY idle state
+        self.declare_parameter('show_window', False)        # Local GUI window
+        self.declare_parameter('docking_timeout_sec', 40.0) # Global timeout before aborting
+        self.declare_parameter('autostart', False)
+        self.declare_parameter('calibration_mode', False)  # Passive mode: zero motor cmds, active perception
+        self.declare_parameter('publish_debug_img', True)
+        self.declare_parameter('debug_img_stride', 3)      # Publish every N frames over Wi-Fi
+        self.declare_parameter('bumper_topic', '/robot/bumper/contact')
+        self.declare_parameter('depth_topic', '/camera/depth/image_raw')
+        self.declare_parameter('min_crawl_speed', 0.040)
 
-        self.staging_x = self.get_parameter('staging_x').value
-        self.staging_y = self.get_parameter('staging_y').value
-        self.staging_yaw = self.get_parameter('staging_yaw').value
-        self.target_clearance = self.get_parameter('target_clearance').value
-        self.reference_x = self.get_parameter('reference_x').value
-        self.max_linear_speed = self.get_parameter('max_linear_speed').value
-        self.crawl_linear_speed = self.get_parameter('crawl_linear_speed').value
-        self.max_angular_speed = self.get_parameter('max_angular_speed').value
-        self.skip_nav2_if_close = self.get_parameter('skip_nav2_if_close').value
-        self.show_window = self.get_parameter('show_window').value
-        self.docking_timeout_sec = self.get_parameter('docking_timeout_sec').value
-        self.autostart = self.get_parameter('autostart').value
+        # ----------------------------------------------------------------------
+        # Parameters: ArUco Marker Docking (Astra S Front Camera)
+        # ----------------------------------------------------------------------
+        self.declare_parameter('marker_id', 1)
+        self.declare_parameter('enable_stamped_cmd_vel', True)
+        self.declare_parameter('marker_size', 0.060)       # 60mm (0.06m)
+        self.declare_parameter('color_topic', '/camera/color/image_raw')
+        self.declare_parameter('marker_yaw_bias_deg', 0.0) # Physical camera mount yaw bias in degrees
+        self.declare_parameter('cam_info_topic', '/camera/color/camera_info')
+        self.declare_parameter('carrot_lookahead', 0.22)   # 22cm nominal lookahead
+        self.declare_parameter('max_retries', 3)
+        self.declare_parameter('backup_retry_distance', 0.25) # 25cm reverse upon retry
+
+        # Astra S Extrinsic relative to base_footprint (horizontal forward Z=0.134m, X=0.08m)
+        self.declare_parameter('astra_x_base', 0.080)
+        self.declare_parameter('astra_y_base', 0.015)   # Lateral mounting offset along base Y-axis (+1.5cm)
+        self.declare_parameter('astra_z_base', 0.134)
+        self.declare_parameter('astra_pitch', 0.0)
+
+        # Retrieve parameters
+        self.docking_mode = str(self.get_parameter('docking_mode').value).lower()
+        self.staging_x = float(self.get_parameter('staging_x').value)
+        self.staging_y = float(self.get_parameter('staging_y').value)
+        self.staging_yaw = float(self.get_parameter('staging_yaw').value)
+        self.target_clearance = float(self.get_parameter('target_clearance').value)
+        self.reference_x = float(self.get_parameter('reference_x').value)
+        self.max_linear_speed = float(self.get_parameter('max_linear_speed').value)
+        self.crawl_linear_speed = float(self.get_parameter('crawl_linear_speed').value)
+        self.max_angular_speed = float(self.get_parameter('max_angular_speed').value)
+        self.skip_nav2_if_close = bool(self.get_parameter('skip_nav2_if_close').value)
+        self.show_window = bool(self.get_parameter('show_window').value)
+        self.docking_timeout_sec = 75.0  # Generous timeout to allow complete docking routine
+        self.autostart = bool(self.get_parameter('autostart').value)
+        self.calibration_mode = bool(self.get_parameter('calibration_mode').value)
+        self.publish_debug_img = bool(self.get_parameter('publish_debug_img').value)
+        self.debug_img_stride = int(self.get_parameter('debug_img_stride').value)
+        self.bumper_topic = str(self.get_parameter('bumper_topic').value)
+
+        self.marker_id = int(self.get_parameter('marker_id').value)
+        self.enable_stamped_cmd_vel = bool(self.get_parameter('enable_stamped_cmd_vel').value)
+        self.marker_size = float(self.get_parameter('marker_size').value)
+        self.color_topic = str(self.get_parameter('color_topic').value)
+        self.marker_yaw_bias_rad = math.radians(float(self.get_parameter('marker_yaw_bias_deg').value))
+        self.cam_info_topic = str(self.get_parameter('cam_info_topic').value)
+        self.carrot_lookahead = float(self.get_parameter('carrot_lookahead').value)
+        self.max_retries = int(self.get_parameter('max_retries').value)
+        self.backup_retry_distance = float(self.get_parameter('backup_retry_distance').value)
+
+        self.astra_x_base = float(self.get_parameter('astra_x_base').value)
+        self.astra_y_base = float(self.get_parameter('astra_y_base').value)
+        self.astra_z_base = float(self.get_parameter('astra_z_base').value)
+        self.astra_pitch = float(self.get_parameter('astra_pitch').value)
+
+        self.depth_topic = str(self.get_parameter('depth_topic').value)
+        self.min_crawl_speed = float(self.get_parameter('min_crawl_speed').value)
+
+        self._debug_img_counter = 0
         self.docking_routine_start_time = None
 
-        # OS30A Extrinsic Configuration (from model.sdf)
-        self.cam_pitch = 1.0472  # 60 degrees downward (radians)
-        self.cam_x_base = 0.000  # Camera mounted at robot center X=0.0
-        self.cam_z_base = 0.520  # Camera height Z=0.520m
-
-        # Intrinsic Camera Parameters (default fallback for 320x240, updated via CameraInfo)
-        self.fx = 190.7
-        self.fy = 190.7
-        self.cx = 160.0
-        self.cy = 120.0
+        # ----------------------------------------------------------------------
+        # Camera Intrinsics
+        # ----------------------------------------------------------------------
+        self.camera_matrix = np.array([
+            [500.0, 0.0, 320.0],
+            [0.0, 500.0, 240.0],
+            [0.0, 0.0, 1.0]
+        ], dtype=np.float64)
+        self.dist_coeffs = np.zeros((5, 1), dtype=np.float64)
+        self.fx = 500.0
+        self.fy = 500.0
+        self.cx = 320.0
+        self.cy = 240.0
         self.camera_info_received = False
 
+        # ----------------------------------------------------------------------
+        # ArUco Configuration (OpenCV 4.6.0 Compatible)
+        # ----------------------------------------------------------------------
+        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+        self.aruco_params = cv2.aruco.DetectorParameters_create()
+        self.aruco_params.adaptiveThreshWinSizeMin = 3
+        self.aruco_params.adaptiveThreshWinSizeMax = 23
+        self.aruco_params.adaptiveThreshWinSizeStep = 4
+        self.aruco_params.adaptiveThreshConstant = 7
+        self.aruco_params.minMarkerPerimeterRate = 0.04           # Reject small noise specks
+        self.aruco_params.maxErroneousBitsInBorderRate = 0.25      # Strict black border required (no false positives!)
+        self.aruco_params.errorCorrectionRate = 0.60               # Prevent random textures from hallucinating IDs
+        self.aruco_params.polygonalApproxAccuracyRate = 0.03       # Strict quad shape validation
+        self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        self.aruco_params.cornerRefinementWinSize = 5
+        self.aruco_params.cornerRefinementMaxIterations = 30
+        self.aruco_params.cornerRefinementMinAccuracy = 0.05
+        # 3D Marker Corners in marker coordinate frame: Z=0, centered
+        s = self.marker_size
+        self.marker_3d_corners = np.array([
+            [-s / 2.0,  s / 2.0, 0.0],
+            [ s / 2.0,  s / 2.0, 0.0],
+            [ s / 2.0, -s / 2.0, 0.0],
+            [-s / 2.0, -s / 2.0, 0.0]
+        ], dtype=np.float32)
+
+        # Marker tracking state
+        self.marker_detected = False
+        self.marker_last_seen = 0.0
+        self.marker_timeout_sec = 1.2
+        self.marker_pos_base = None    # [x, y, z] in base_footprint (m)
+        self.marker_normal_base = None # [dx, dy, dz] pointing into desk in base_footprint
+        self.marker_corners_img = None
+        self.marker_rvec = None
+        self.marker_tvec = None
+
+        # Dual-Marker Geometric Pose & Anti-Chatter Filter State
+        self.tracked_markers = {}       # mid -> {'corners': ndarray, 'rvec': rvec, 'tvec': tvec, 'last_seen': float}
+        self.marker_history_sec = 0.80  # Persistent memory window for brief occlusion / packet drops
+        self.docking_alignment_mode = 'NONE' # 'DUAL:XXcm' or 'SINGLE:ID' or 'NONE'
+        self.yaw_history = []           # Rolling history for median filter
+        self.yaw_history_len = 5
+        self.filtered_yaw = None
+
+        # Centerline (Lateral Error e_y) Anti-Chatter & Outlier Rejection Filter State
+        self.ey_history = []            # Rolling history for e_y median filter
+        self.ey_history_len = 5
+        self.filtered_ey = None
+        self.marker_offsets_to_center = {}  # Learned 3D offset from marker to box center: mid -> np.ndarray([dx, dy, dz])
+
+        # Slew-Rate Acceleration Limiter & Motor Anti-Chatter
+        self.current_cmd_vx = 0.0
+        self.current_cmd_wz = 0.0
+        self._last_cmd_vel_time = time.time()
+        self.max_wz_accel = 0.45        # rad/s^2 (smooth steering, prevents Dynamixel backlash)
+        self.max_vx_accel = 0.20        # m/s^2 (smooth forward acceleration)
+        self.align_yaw_deadband = math.radians(1.5)  # ±1.5° deadband in ALIGN_PARALLEL
+
+        # ----------------------------------------------------------------------
         # RTAB-Map Pause/Resume Clients (Freeze SLAM during docking to save CPU)
+        # ----------------------------------------------------------------------
         self.rtabmap_pause_client = self.create_client(Empty, '/rtabmap/pause')
         self.rtabmap_resume_client = self.create_client(Empty, '/rtabmap/resume')
 
-        # Camera Mode Switch Clients & Services (Time-division Single Camera Control)
+        # Camera Mode Switch Clients & Services
         self.set_mode_docking_cli = self.create_client(Trigger, '/set_mode_docking')
         self.set_mode_nav2_cli = self.create_client(Trigger, '/set_mode_nav2')
         self.undock_srv = self.create_service(Trigger, '/undock_to_nav2', self.handle_undock_to_nav2)
         self.dock_srv = self.create_service(Trigger, '/start_docking', self.handle_start_docking)
         self.abort_srv = self.create_service(Trigger, '/abort_docking', self.handle_abort_docking)
-        self.mode_sub = self.create_subscription(String, '/current_camera_mode', self.camera_mode_callback, 10)
-
-        # Mode switch echo guard to prevent race conditions during dynamic camera switching
-        self._internal_mode_request = None
-        self._mode_request_time = 0.0
-
-        # Forward stall detection in FINAL_APPROACH
-        self._stall_check_dist = None
-        self._stall_start_time = None
+        self.estop_srv = self.create_service(Trigger, '/emergency_stop', self.handle_emergency_stop)
+        self.motor_power_cli = self.create_client(SetBool, '/motor_power')
+        self._motor_init_timer = self.create_timer(1.5, self._init_motor_power_callback)
 
         # ----------------------------------------------------------------------
-        # FSM States
+        # FSM State & Variables
         # ----------------------------------------------------------------------
-        # States: INIT, WAIT_NAV2, VERIFY_STAGING, ALIGN_PARALLEL,
-        #         COARSE_APPROACH, FINE_APPROACH, CRAWL_CONTACT, DOCKED, NAV2_READY, FAILSAFE
-        self.state = 'INIT' if self.autostart else 'NAV2_READY'
+        if self.calibration_mode:
+            self.state = 'CALIBRATION'
+            self.get_logger().info(">>> Initialized in CALIBRATION mode. Motors halted, passive perception active.")
+        elif self.autostart:
+            self.state = 'INIT'
+        else:
+            self.state = 'NAV2_READY'
+            self.get_logger().info(">>> Initialized in NAV2_READY mode. Waiting for Nav2 navigation or [/start_docking] trigger.")
+
         self.state_start_time = self.get_clock().now()
-        if not self.autostart:
-            self.get_logger().info(">>> Initialized in NAV2_READY mode. Ready for Nav2 navigation or GUI [/start_docking] trigger.")
 
-        # Contact Sensor State
+        # Contact Bumper State (Micro-switch)
         self.contact_detected = False
+        self.contact_latched = False
         self.contact_duration_start = None
         self.contact_debounce_sec = 0.05  # 50ms debounce
 
-        # 3D Desk Edge Estimate
-        self.desk_distance = None      # Distance from reference plane (m)
-        self.desk_yaw_error = None     # Parallelism error (rad, positive = tilted left)
-        self.last_depth_time = None
-        self.depth_timeout_sec = 2.00  # 2.0s depth timeout (prevents stuttering during simulation render)
+        # Forward Stall Detection (Secondary Stop Guard)
+        self._stall_check_dist = None
+        self._stall_start_time = None
 
-        # Final Approach & Docking Safeguards
-        self.final_approach_start_pose = None
-        self.final_approach_start_dist = None
-
-        # Staging & Pre-docking Alignment Parameters
-        self.align_stable_count = 0
-        self.align_stable_required = 4   # 4 ticks * 0.05s = 0.20s continuous stability
-        self.retry_count = 0
-        self.max_retries = 3
-
-        # Target Object & Virtual Docking Pose Parameters
+        # Desk & Target Distance/Angles
+        self.desk_distance = None      # Distance from reference tip to target/desk (m)
+        self.desk_yaw_error = None     # Heading error relative to normal (rad, positive = tilted left)
+        self.locked_docking_yaw = None # Locked heading angle for blind crawl approach
+        self.last_sensor_time = None
         self.target_obj = TargetObject()
-        self.target_u_c = None
-        self.target_v_c = None
-        self.target_bbox = None
-        self.min_staging_distance = 0.32    # Minimum distance required for turn-in (m)
-        self.k_clearance = 1.5              # Clearance multiplier on lateral offset
-        self.base_clearance = 0.18          # Minimum vehicle sweep clearance (m)
-        self.backup_target_distance = 0.40  # Standby distance to reverse to (m)
-        self.dual_align_stable_count = 0
-        self.dual_align_stable_required = 4 # 4 ticks * 0.05s = 0.20s continuous stability
         self.carrot_x_b = None
         self.carrot_y_b = None
 
-        # S-Curve In-place Turn & Lateral Cruise Variables
-        self.target_lateral_offset = 0.0     # Target lateral displacement (m)
-        self.turn_start_yaw = 0.0            # Heading before in-place turn
-        self.target_turn_angle = 0.0         # Target rotation angle (+-pi/2)
-        self.lateral_start_pose = None       # (x, y) start pose for lateral cruise
-        self.lateral_traveled = 0.0          # Integrated lateral distance traveled (m)
-        self.stable_yaw_count = 0            # Stable heading count for in-place turns
-        self.in_place_turn_dir = 1.0         # +1.0 for CCW, -1.0 for CW
+        # Odom-Anchored Visual Memory & Blind Pursuit
+        self.odom_target_center = None        # [x, y, z] in odom frame
+        self.odom_target_normal = None        # Unit vector pointing outward from box in odom frame
+        self.odom_target_latched = False      # True when dual markers validly latched
+        self.odom_target_last_seen = 0.0      # Timestamp of last direct optical update
+        self.odom_blind_start_time = None     # Timestamp when optical view was lost
+        self.odom_tracking_active = False     # True when navigating blindly using odom memory
+        self.dual_markers_visible = False     # True only when both markers are currently in camera FOV
+        self.initial_ey = None                # Initial lateral error recorded at start of CARROT_ALIGN
+        self.backup_reason = "NONE"           # Reason string explaining why robot entered BACKUP state
+        self.backup_substate = 'BACK_AIM'     # Substate within BACKUP_STANDOFF: 'BACK_AIM' -> 'BACK_REVERSE' -> 'BACK_REALIGN'
+        self.reverse_latched_origin_yaw = None  # Reference yaw before backup (facing marker normal axis)
+        self.reverse_latched_aim_yaw = None     # Target yaw angled towards reverse virtual carrot
+        self.reverse_start_odom_pose = None     # (x, y, yaw) in odom at start of BACK_REVERSE
+        self.reverse_target_distance = 0.14     # Target straight reverse distance in meters
+        self.settle_substate = 'FINE_ROTATE'  # Substate within STANDOFF_SETTLE: 'FINE_ROTATE' -> 'STATIC_WAIT'
+        self.settle_stop_start_time = None    # Timestamp when robot completely halted in STANDOFF_SETTLE
+        self.latched_aim_delta_yaw = 0.0      # Relative angle (rad) to forward carrot point latched in STAGING_SETTLE
+        self.latched_aim_target_yaw = None   # Absolute target yaw in odom/map latched in STAGING_SETTLE
 
+        # Docking Convergence & Verification
+        self.target_lateral_offset = 0.0
+        self.dual_align_stable_count = 0
+        self.dual_align_stable_required = 3
+
+        # Retry & Failure Recovery
+        self.retry_count = 0
         self.bridge = CvBridge()
 
         # ----------------------------------------------------------------------
@@ -177,43 +304,67 @@ class PrecisionApproacherNode(Node):
         # ----------------------------------------------------------------------
         # Publishers & Subscribers
         # ----------------------------------------------------------------------
-        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        if self.enable_stamped_cmd_vel:
+            self.cmd_vel_pub = self.create_publisher(TwistStamped, '/cmd_vel', 10)
+        else:
+            self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.status_pub = self.create_publisher(String, '/docking/status', 10)
         self.marker_pub = self.create_publisher(Marker, '/docking/marker', 10)
         self.vis_pub = self.create_publisher(Image, '/docking/debug_image', 10)
-        self.last_color_img = None
+        self.vis_comp_pub = self.create_publisher(CompressedImage, '/docking/debug_image/compressed', 10)
 
-        # OS30A Depth, Color Image & CameraInfo Subscribers (SENSOR_DATA QoS matching ros_gz_bridge)
-        self.depth_sub = self.create_subscription(
-            Image, '/os30a/camera/depth/image_raw', self.depth_callback, qos_profile_sensor_data
-        )
+        self.last_color_img = None
+        self.last_color_stamp = None
+        self.last_color_frame_id = 'camera_color_optical_frame'
+        self.last_depth_img = None
+        self.last_depth_raw = None
+        self.last_depth_is_raw16 = True
+        self.last_depth_time = 0.0
+        self.plane_fit_source = 'NONE'
+        self.plane_fit_points = 0
+        self.plane_roi_rect = None
+
+        # Color & CameraInfo Subscribers (Reliable QoS depth 10 matching Astra driver)
         self.color_sub = self.create_subscription(
-            Image, '/os30a/camera/color/image_raw', self.color_callback, qos_profile_sensor_data
+            Image, self.color_topic, self.color_callback, 10
         )
         self.cam_info_sub = self.create_subscription(
-            CameraInfo, '/os30a/camera/depth/camera_info', self.cam_info_callback, qos_profile_sensor_data
+            CameraInfo, self.cam_info_topic, self.cam_info_callback, 10
         )
 
-        # Single Contact Bumper Subscriber
+        # Depth Subscriber (Used if docking_mode == 'depth_edge')
+        self.depth_sub = self.create_subscription(
+            Image, self.depth_topic, self.depth_callback, qos_profile_sensor_data
+        )
+
+        # Bumper Switch Subscriber
         self.bumper_sub = self.create_subscription(
-            Bool, '/robot/bumper/contact', self.bumper_callback, 10
+            Bool, self.bumper_topic, self.bumper_callback, 10
         )
 
         # Nav2 NavigateToPose Action Client
-        self.nav2_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        if NAV2_ACTION_AVAILABLE:
+            self.nav2_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        else:
+            self.nav2_client = None
         self.nav2_goal_handle = None
         self.nav2_finished = False
         self.nav2_success = False
 
-        # Main FSM Control Loop (20Hz)
+        # Main Control Loop Timer (20Hz)
         self.timer = self.create_timer(0.05, self.control_loop)
 
         self.get_logger().info("========================================================")
-        self.get_logger().info(" Precision Close-Docking Node Initialized               ")
-        self.get_logger().info(f" - Staging Pose:   ({self.staging_x:.2f}, {self.staging_y:.2f}, {self.staging_yaw:.2f})")
-        self.get_logger().info(f" - Target Gap:     {self.target_clearance*100:.1f} cm from Reference Plane")
-        self.get_logger().info(" - Alignment:      OS30A 3D PointCloud RANSAC Line Fit ")
-        self.get_logger().info(" - Contact Stop:   Single Bumper Probe (/robot/bumper/contact)")
+        self.get_logger().info(" Precision Autonomous Docking Node Initialized          ")
+        self.get_logger().info(f" - Docking Mode:   {self.docking_mode.upper()}")
+        if self.docking_mode == 'marker':
+            self.get_logger().info(f" - Marker ID:      {self.marker_id} ({self.marker_size*1000:.0f}mm ArUco DICT_4X4_50)")
+            self.get_logger().info(f" - Color Stream:   {self.color_topic}")
+            self.get_logger().info(f" - Info Stream:    {self.cam_info_topic}")
+        else:
+            self.get_logger().info(f" - Depth Stream:   {self.depth_topic}")
+        self.get_logger().info(f" - Target Gap:     {self.target_clearance*100:.1f} cm from Reference Tip")
+        self.get_logger().info(f" - Terminal Stop:  Micro-switch Bumper ({self.bumper_topic}) + Stall")
         self.get_logger().info("========================================================")
 
     # ==========================================================================
@@ -225,628 +376,808 @@ class PrecisionApproacherNode(Node):
             self.fy = msg.k[4] if msg.k[4] > 0 else self.fy
             self.cx = msg.k[2] if msg.k[2] > 0 else self.cx
             self.cy = msg.k[5] if msg.k[5] > 0 else self.cy
+            self.camera_matrix = np.array([
+                [self.fx, 0.0, self.cx],
+                [0.0, self.fy, self.cy],
+                [0.0, 0.0, 1.0]
+            ], dtype=np.float64)
+            if len(msg.d) >= 4:
+                self.dist_coeffs = np.array(msg.d, dtype=np.float64).reshape(-1, 1)
             self.camera_info_received = True
 
-    def color_callback(self, msg: Image):
-        # Time-division: skip only during far-away Nav2 or standby
-        if self.state in ('INIT', 'WAIT_NAV2', 'NAV2_READY'):
-            return
-        try:
-            self.last_color_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        except Exception:
-            pass
-
     def bumper_callback(self, msg: Bool):
-        now = time.time()
         if msg.data:
-            if self.contact_duration_start is None:
-                self.contact_duration_start = now
-            elif (now - self.contact_duration_start) >= self.contact_debounce_sec:
-                self.contact_detected = True
+            self.contact_detected = True
+            self.contact_latched = True
+            # Global Emergency Contact Interlock: halt immediately if in any docking approach
+            if self.state in DOCKING_ACTIVE_STATES:
+                self.get_logger().info("========================================================")
+                self.get_logger().info(" ★ INSTANT BUMPER CONTACT CONFIRMED! Full Motor Lock!   ")
+                self.get_logger().info(" ★ Robot docked firmly against desk. Entering DOCKED.   ")
+                self.get_logger().info("========================================================")
+                self.stop_robot(hard_brake=True)
+                self.transition_to('DOCKED')
         else:
-            self.contact_duration_start = None
             self.contact_detected = False
 
+    def color_callback(self, msg: Image):
+        # Throttle to max ~15 FPS to eliminate Pi 4 CPU bottleneck and live stream delay
+        now_time = time.time()
+        if hasattr(self, '_last_img_time') and (now_time - self._last_img_time) < 0.065:
+            return
+        self._last_img_time = now_time
+
+        try:
+            self.last_color_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            self.last_color_stamp = msg.header.stamp
+            self.last_color_frame_id = msg.header.frame_id or 'camera_color_optical_frame'
+            self.last_sensor_time = self.get_clock().now()
+
+            # If in marker docking mode, process ArUco detection immediately on new frame
+            if self.docking_mode == 'marker':
+                self.process_marker_detection(self.last_color_img, self.last_color_frame_id)
+        except Exception as e:
+            self.get_logger().warn(f"Color callback error: {e}", throttle_duration_sec=2.0)
+
     def depth_callback(self, msg: Image):
-        # 1. Time-division sensor management: skip during Nav2 or idle standby
-        if self.state in ('INIT', 'WAIT_NAV2', 'NAV2_READY'):
-            return
-
         try:
-            # Keep sensor watchdog updated so timeout never false-triggers!
-            self.last_depth_time = self.get_clock().now()
-
-            # Convert depth image (support 16UC1 in mm, or 32FC1 in meters)
-            if msg.encoding == '16UC1':
-                depth_raw = self.bridge.imgmsg_to_cv2(msg, desired_encoding='16UC1')
-                depth_m = depth_raw.astype(np.float32) / 1000.0
-            else:
+            if msg.encoding in ('16UC1', 'mono16'):
+                depth_raw = self.bridge.imgmsg_to_cv2(msg, desired_encoding=msg.encoding)
+                self.last_depth_raw = depth_raw
+                self.last_depth_img = None
+                self.last_depth_is_raw16 = True
+            elif msg.encoding == '32FC1':
                 depth_m = self.bridge.imgmsg_to_cv2(msg, desired_encoding='32FC1')
-
-            # 2. Blind Odometry Maneuver Handling:
-            # While turning lateral or cruising, robot is facing away from desk.
-            # Keep live video HUD rendering so user sees continuous video feed,
-            # but mask desk/target estimates so FSM relies purely on odometry dead-reckoning!
-            if self.state in ('TURN_LATERAL', 'LATERAL_CRUISE', 'TURN_FACE_DESK'):
-                self.desk_distance = None
-                self.desk_yaw_error = None
-                self.target_obj = TargetObject()
-                self.render_and_publish_visualization(depth_m, None, None, None)
+                self.last_depth_raw = depth_m
+                self.last_depth_img = depth_m
+                self.last_depth_is_raw16 = False
+            else:
                 return
 
-            self.detect_target_object(depth_m)
-            self.process_depth_for_desk_edge(depth_m)
-
+            self.last_depth_time = time.time()
         except Exception as e:
-            self.get_logger().warn(f"Depth processing error: {e}")
+            self.get_logger().warn(f"Depth callback error: {e}", throttle_duration_sec=2.0)
 
-    # ==========================================================================
-    # Target Object Detection (Red Box HSV + 11x11 Median Depth)
-    # ==========================================================================
-    def detect_target_object(self, depth_m: np.ndarray):
-        """Detects the Red Box in color image using dual-range HSV masking,
-        extracts an 11x11 patch median depth, and deprojects to 3D base_footprint coordinates.
+    def query_marker_center_depth(self, marker_corners):
+        """Ultra-lightweight pinpoint sampling of depth at the marker center.
+        Queries a 5x5 pixel window around the 2D center and returns the median depth in meters.
+        Execution time < 0.01ms (CPU ~0%).
         """
-        if self.last_color_img is None:
-            return
+        if self.last_depth_raw is None or (time.time() - self.last_depth_time) > 1.2:
+            return None
 
-        try:
-            h, w = depth_m.shape
-            color = self.last_color_img
-            if color.shape[:2] != (h, w):
-                color = cv2.resize(color, (w, h))
+        H, W = self.last_depth_raw.shape[:2]
+        u_c = int(round(float(np.mean(marker_corners[:, 0]))))
+        v_c = int(round(float(np.mean(marker_corners[:, 1]))))
 
-            hsv = cv2.cvtColor(color, cv2.COLOR_BGR2HSV)
+        u_min = max(0, u_c - 2)
+        u_max = min(W, u_c + 3)
+        v_min = max(0, v_c - 2)
+        v_max = min(H, v_c + 3)
 
-            # Red color wraps around 0 and 180 in HSV
-            mask1 = cv2.inRange(hsv, np.array([0, 90, 60]), np.array([12, 255, 255]))
-            mask2 = cv2.inRange(hsv, np.array([160, 90, 60]), np.array([180, 255, 255]))
-            red_mask = cv2.bitwise_or(mask1, mask2)
+        if (u_max - u_min) < 3 or (v_max - v_min) < 3:
+            return None
 
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-            red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel, iterations=1)
-            red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-            contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            best_cnt = None
-            max_area = 0.0
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                if area > max_area and area >= 35.0:  # Minimum 35 pixels
-                    max_area = area
-                    best_cnt = cnt
-
-            if best_cnt is not None:
-                x_b, y_b, w_b, h_b = cv2.boundingRect(best_cnt)
-                u_c = int(x_b + w_b / 2.0)
-                v_c = int(y_b + h_b / 2.0)
-
-                # 11x11 median depth window (robust against specular / NaN / dropout)
-                r = 5
-                u_min, u_max = max(0, u_c - r), min(w, u_c + r + 1)
-                v_min, v_max = max(0, v_c - r), min(h, v_c + r + 1)
-                patch = depth_m[v_min:v_max, u_min:u_max]
-                valid_patch = patch[(patch > 0.05) & (patch < 1.6) & np.isfinite(patch)]
-
-                if len(valid_patch) >= 3:
-                    z_val = float(np.median(valid_patch))
-                elif np.isfinite(depth_m[v_c, u_c]) and depth_m[v_c, u_c] > 0.05:
-                    z_val = float(depth_m[v_c, u_c])
-                else:
-                    z_val = None
-
-                if z_val is not None:
-                    x_c = (u_c - self.cx) * z_val / self.fx
-                    y_c = (v_c - self.cy) * z_val / self.fy
-
-                    sin_p = math.sin(self.cam_pitch)
-                    cos_p = math.cos(self.cam_pitch)
-                    x_obj = self.cam_x_base + cos_p * z_val - sin_p * y_c
-                    y_obj = -x_c
-                    z_obj = self.cam_z_base - sin_p * z_val - cos_p * y_c
-
-                    self.target_obj.center = np.array([x_obj, y_obj, z_obj])
-                    self.target_obj.docking_point = np.array([x_obj, y_obj, z_obj])
-                    self.target_obj.valid = True
-                    self.target_obj.last_seen_time = time.time()
-                    self.target_u_c = u_c
-                    self.target_v_c = v_c
-                    self.target_bbox = (x_b, y_b, w_b, h_b)
-                    return
-
-            # If not detected this frame, hold for 0.8s
-            if time.time() - self.target_obj.last_seen_time > 0.8:
-                self.target_obj.valid = False
-                self.target_u_c = None
-                self.target_v_c = None
-                self.target_bbox = None
-
-        except Exception as e:
-            self.get_logger().warn(f"Target detection error: {e}", throttle_duration_sec=2.0)
-
-    def compute_docking_errors(self):
-        """Computes unified 3-DOF error vector [e_x, e_y, e_theta] relative to Virtual Docking Pose.
-        - e_x: Longitudinal error to target 5cm clearance (m)
-        - e_y: Lateral error between robot centerline and target object (m, +e_y = target to left)
-        - e_theta: Heading error between robot heading and desk normal (rad, positive = tilted left)
-        """
-        if self.desk_distance is None:
-            return None, None, None
-
-        # 1. Longitudinal error e_x: distance remaining to 5cm clearance
-        e_x = self.desk_distance - self.target_clearance
-
-        # 2. Heading error e_theta: angle relative to desk normal
-        e_theta = self.desk_yaw_error if self.desk_yaw_error is not None else 0.0
-
-        # 3. Lateral error e_y: offset from robot center line to target object center
-        # In base_footprint, Y is positive to the left.
-        # If target is at Y_obj > 0 (to the left), robot needs to steer left (positive omega).
-        if self.target_obj.valid and self.target_obj.center is not None:
-            e_y = float(self.target_obj.center[1])
+        patch = self.last_depth_raw[v_min:v_max, u_min:u_max]
+        if self.last_depth_is_raw16:
+            valid = patch[(patch > 200) & (patch < 2500)]  # 200mm ~ 2500mm
+            if len(valid) >= 5:
+                return float(np.median(valid)) / 1000.0
         else:
-            e_y = 0.0
+            valid = patch[(patch > 0.20) & (patch < 2.50) & np.isfinite(patch)]
+            if len(valid) >= 5:
+                return float(np.median(valid))
+        return None
 
-        return e_x, e_y, e_theta
+    def fit_depth_plane(self, marker_corners, z_marker, n_pnp):
+        """
+        Fits a 3D plane using SVD on dense depth points on the box surface
+        surrounding the ArUco marker.
+        Returns:
+            n_cam: np.ndarray (3,) unit normal vector in camera optical frame, or None if failed
+            point_count: int, number of valid inlier 3D points used
+        """
+        if (time.time() - self.last_depth_time) > 1.5:
+            self.plane_roi_rect = None
+            return None, 0
 
-    # ==========================================================================
-    # 3D Desk Edge & Parallelism Extraction
-    # ==========================================================================
-    def process_depth_for_desk_edge(self, depth_m: np.ndarray):
-        h, w = depth_m.shape
-        # Downsample: step 2 for 320x240 (160x120), step 4 for 640x480
-        step = 2 if w <= 320 else 4
+        if self.last_depth_img is None:
+            if self.last_depth_raw is not None and self.last_depth_is_raw16:
+                self.last_depth_img = self.last_depth_raw.astype(np.float32) / 1000.0
+            else:
+                self.plane_roi_rect = None
+                return None, 0
+
+        H, W = self.last_depth_img.shape[:2]
+
+        # Calculate bounding box of marker in pixels
+        u_coords = marker_corners[:, 0]
+        v_coords = marker_corners[:, 1]
+        u_c = float(np.mean(u_coords))
+        v_c = float(np.mean(v_coords))
+        w_m = float(np.max(u_coords) - np.min(u_coords))
+        h_m = float(np.max(v_coords) - np.min(v_coords))
+
+        # Expand ROI to cover box face surrounding the marker (box is ~30cm wide)
+        roi_half_w = max(int(w_m * 1.8), 35)
+        roi_half_h = max(int(h_m * 1.2), 25)
+
+        u_min = max(0, int(u_c - roi_half_w))
+        u_max = min(W, int(u_c + roi_half_w))
+        v_min = max(0, int(v_c - roi_half_h))
+        v_max = min(H, int(v_c + roi_half_h))
+
+        if (u_max - u_min) < 15 or (v_max - v_min) < 15:
+            self.plane_roi_rect = None
+            return None, 0
+
+        self.plane_roi_rect = (u_min, v_min, u_max, v_max)
+
+        # Extract depth patch
+        depth_patch = self.last_depth_img[v_min:v_max, u_min:u_max]
+
+        # Create coordinate grids for patch
         u_grid, v_grid = np.meshgrid(
-            np.arange(0, w, step),
-            np.arange(0, h, step)
+            np.arange(u_min, u_max, dtype=np.float32),
+            np.arange(v_min, v_max, dtype=np.float32)
         )
-        z_c = depth_m[v_grid, u_grid]
 
-        # Valid depth mask (0.15m to 1.8m)
-        valid_mask = (z_c > 0.15) & (z_c < 1.8) & np.isfinite(z_c)
-        min_valid = 20 if w <= 320 else 50
-        if np.count_nonzero(valid_mask) < min_valid:
-            self.get_logger().info(f"[EDGE] Valid points too low: {np.count_nonzero(valid_mask)}", throttle_duration_sec=2.0)
-            return
+        # Depth gate: points on box surface must be close to marker depth z_marker (+/- 9cm)
+        valid_mask = (depth_patch > 0.15) & (depth_patch < 2.50) & (np.abs(depth_patch - z_marker) < 0.09) & np.isfinite(depth_patch)
 
-        u_val = u_grid[valid_mask]
-        v_val = v_grid[valid_mask]
-        z_val = z_c[valid_mask]
+        if np.count_nonzero(valid_mask) < 35:
+            return None, 0
 
-        # 3D Optical Coordinates (X: Right, Y: Down, Z: Forward)
-        x_c = (u_val - self.cx) * z_val / self.fx
-        y_c = (v_val - self.cy) * z_val / self.fy
+        valid_z = depth_patch[valid_mask]
+        valid_u = u_grid[valid_mask]
+        valid_v = v_grid[valid_mask]
 
-        # Transform to robot base_footprint coordinates
-        # Camera optical axis is pitched 60 deg down (1.047 rad)
-        sin_p = math.sin(self.cam_pitch)
-        cos_p = math.cos(self.cam_pitch)
+        # Downsample if too dense for ultra-fast SVD
+        if len(valid_z) > 600:
+            valid_z = valid_z[::2]
+            valid_u = valid_u[::2]
+            valid_v = valid_v[::2]
 
-        x_b = self.cam_x_base + cos_p * z_val - sin_p * y_c
-        y_b = -x_c
-        z_b = self.cam_z_base - sin_p * z_val - cos_p * y_c
+        # Project pixels to 3D camera optical coordinates
+        X = (valid_u - self.cx) * valid_z / self.fx
+        Y = (valid_v - self.cy) * valid_z / self.fy
+        Z = valid_z
+        pts = np.column_stack((X, Y, Z))
 
-        # Filter for desk surface height:
-        # Table top is precisely at Z=0.14~0.15m in base_footprint (ground = 0.0m).
-        # We enforce a tight slice Z in [0.11, 0.17]m to strictly isolate the elevated desk surface.
-        table_mask = (z_b >= 0.11) & (z_b <= 0.17) & (x_b >= 0.145) & (x_b < 1.40) & (np.abs(y_b) <= 0.40)
-        table_cnt = np.count_nonzero(table_mask)
-        min_table = 10 if w <= 320 else 20
-        if table_cnt < min_table:
-            self.get_logger().info(f"[EDGE] Table points too low: {table_cnt}, zb min={np.min(z_b):.2f}, max={np.max(z_b):.2f}", throttle_duration_sec=2.0)
-            self.render_and_publish_visualization(depth_m, None, None, None)
-            return
-
-        x_table = x_b[table_mask]
-        y_table = y_b[table_mask]
-        z_table = z_b[table_mask]
-
-        # Planar Slope Verification (Ground-Parallel Test):
-        # A true desk surface is strictly horizontal to ground (slope_x ~ 0, slope_y ~ 0).
-        # Floor points projected through tilted camera produce an inclined pseudo-plane (|slope_x| > 0.40).
         try:
-            A_mat = np.column_stack([x_table, y_table, np.ones_like(x_table)])
-            coeffs, _, _, _ = np.linalg.lstsq(A_mat, z_table, rcond=None)
-            slope_x, slope_y = float(coeffs[0]), float(coeffs[1])
-            # If surface is tilted forward/backward by more than 14 deg (|slope_x| > 0.25), reject as floor projection
-            if abs(slope_x) > 0.25:
-                self.get_logger().info(f"[EDGE] Rejected non-horizontal surface (slope_x={slope_x:+.2f} > 0.25). Likely floor.", throttle_duration_sec=2.0)
-                self.render_and_publish_visualization(depth_m, None, None, None)
-                return
+            # Stage 1: Initial SVD plane fit
+            centroid1 = np.mean(pts, axis=0)
+            _, _, vh1 = np.linalg.svd(pts - centroid1, full_matrices=False)
+            n_init = vh1[-1, :]
+            norm_len1 = np.linalg.norm(n_init)
+            if norm_len1 < 1e-6:
+                return None, 0
+            n_init /= norm_len1
+
+            # Stage 2: Outlier rejection (residual < 2.0 cm)
+            residuals = np.abs(np.dot(pts - centroid1, n_init))
+            inlier_mask = residuals < 0.020
+            pts_inliers = pts[inlier_mask]
+
+            if len(pts_inliers) >= 30:
+                centroid2 = np.mean(pts_inliers, axis=0)
+                _, _, vh2 = np.linalg.svd(pts_inliers - centroid2, full_matrices=False)
+                normal = vh2[-1, :]
+                norm_len2 = np.linalg.norm(normal)
+                if norm_len2 < 1e-6:
+                    return None, 0
+                normal /= norm_len2
+                n_used = len(pts_inliers)
+            else:
+                normal = n_init
+                n_used = len(pts)
+
+            # Enforce consistent orientation pointing OUT towards the camera
+            if np.dot(normal, n_pnp) < 0:
+                normal = -normal
+            if normal[2] > 0:
+                normal = -normal
+
+            return normal, n_used
+        except Exception:
+            return None, 0
+
+    # ==========================================================================
+    # Visual Marker Perception & Pose Estimation (Dual-Marker & Single Fallback)
+    # ==========================================================================
+    def process_marker_detection(self, color_img: np.ndarray, frame_id: str):
+        gray = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY)
+
+        # 1. Detect ArUco markers using universal OpenCV 4.x API
+        corners, ids, rejected = cv2.aruco.detectMarkers(
+            gray, self.aruco_dict, parameters=self.aruco_params
+        )
+
+        now_t = time.time()
+        detected = False
+
+        if ids is not None and len(ids) > 0:
+            for idx in range(len(ids)):
+                m_id = int(ids.flatten()[idx])
+                m_corners = corners[idx][0]  # Shape: (4, 2)
+
+                # SolvePnP for each detected marker
+                succ, rvec, tvec = cv2.solvePnP(
+                    self.marker_3d_corners,
+                    m_corners,
+                    self.camera_matrix,
+                    self.dist_coeffs,
+                    flags=cv2.SOLVEPNP_ITERATIVE
+                )
+                if succ:
+                    self.tracked_markers[m_id] = {
+                        'corners': m_corners,
+                        'rvec': rvec,
+                        'tvec': tvec,
+                        'last_seen': now_t
+                    }
+
+        # Prune expired markers from temporal memory
+        expired_ids = [mid for mid, data in self.tracked_markers.items() if (now_t - data['last_seen']) > self.marker_history_sec]
+        for mid in expired_ids:
+            del self.tracked_markers[mid]
+
+        active_ids = list(self.tracked_markers.keys())
+
+        # 2. Geometric Pose Estimation: Dual-Marker vs Single Fallback
+        if len(active_ids) >= 2:
+            # Sort active markers left to right along camera X-axis
+            active_ids.sort(key=lambda mid: self.tracked_markers[mid]['tvec'][0][0])
+            left_id = active_ids[0]
+            right_id = active_ids[-1]
+
+            p_left = self.tracked_markers[left_id]['tvec'].flatten()
+            p_right = self.tracked_markers[right_id]['tvec'].flatten()
+
+            span = float(np.linalg.norm(p_right - p_left))
+
+            # Validate physical span (Accommodates perspective distance variation: 6cm ~ 35cm)
+            if 0.06 <= span <= 0.35:
+                # Optical midpoint distance approximation
+                opt_dist = float((p_left[2] + p_right[2]) / 2.0)
+                curr_dist = self.desk_distance if self.desk_distance is not None else opt_dist
+
+                use_depth_hybrid = False
+                # Hybrid Switching: Use lightweight pinpoint Depth sampling when distance > 45cm (0.45m)
+                # to extinguish optical PnP normal distortion at long range
+                if curr_dist > 0.45 or opt_dist > 0.45:
+                    z_depth_left = self.query_marker_center_depth(self.tracked_markers[left_id]['corners'])
+                    z_depth_right = self.query_marker_center_depth(self.tracked_markers[right_id]['corners'])
+
+                    if (z_depth_left is not None and z_depth_right is not None and
+                            0.30 <= z_depth_left <= 1.50 and 0.30 <= z_depth_right <= 1.50 and
+                            abs(z_depth_right - z_depth_left) < 0.20):
+                        # Reconstruct high-precision 3D positions using physical depth sensor values
+                        u_L = float(np.mean(self.tracked_markers[left_id]['corners'][:, 0]))
+                        v_L = float(np.mean(self.tracked_markers[left_id]['corners'][:, 1]))
+                        u_R = float(np.mean(self.tracked_markers[right_id]['corners'][:, 0]))
+                        v_R = float(np.mean(self.tracked_markers[right_id]['corners'][:, 1]))
+
+                        x_L = (u_L - self.cx) * z_depth_left / self.fx
+                        y_L = (v_L - self.cy) * z_depth_left / self.fy
+                        x_R = (u_R - self.cx) * z_depth_right / self.fx
+                        y_R = (v_R - self.cy) * z_depth_right / self.fy
+
+                        p_left_d = np.array([x_L, y_L, z_depth_left], dtype=np.float64)
+                        p_right_d = np.array([x_R, y_R, z_depth_right], dtype=np.float64)
+
+                        t_cam_mid = (p_left_d + p_right_d) / 2.0
+                        dx = float(p_right_d[0] - p_left_d[0])
+                        dy = float(p_right_d[1] - p_left_d[1])
+                        dz = float(p_right_d[2] - p_left_d[2])
+                        use_depth_hybrid = True
+                        mode_str = f"DUAL:DEPTH({span*100:.0f}cm)"
+                        source_str = "DUAL:DEP"
+
+                if not use_depth_hybrid:
+                    # Within 45cm or depth fallback: Use high-precision Close-Range RGB Optical solvePnP
+                    t_cam_mid = (p_left + p_right) / 2.0
+                    dx = float(p_right[0] - p_left[0])
+                    dy = float(p_right[1] - p_left[1])
+                    dz = float(p_right[2] - p_left[2])
+                    mode_str = f"DUAL:RGB({span*100:.0f}cm)"
+                    source_str = "DUAL:RGB"
+
+                # Learn relative 3D vector from each marker to box center to prevent jump if one drops
+                self.marker_offsets_to_center[left_id] = (t_cam_mid - p_left).copy()
+                self.marker_offsets_to_center[right_id] = (t_cam_mid - p_right).copy()
+
+                # Normal vector pointing from box face outward toward camera (-Z direction)
+                norm_len = math.hypot(dz, dx)
+                if norm_len > 1e-4:
+                    n_cam = np.array([dz / norm_len, 0.0, -dx / norm_len], dtype=np.float64)
+                else:
+                    n_cam = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+
+                p_base, n_base = self.transform_optical_to_base(t_cam_mid, n_cam, frame_id)
+
+                if p_base is not None and n_base is not None:
+                    desk_normal = -n_base
+                    raw_heading_err = math.atan2(desk_normal[1], desk_normal[0]) - self.marker_yaw_bias_rad
+
+                    self.docking_alignment_mode = mode_str
+                    self.plane_fit_source = source_str
+                    self.plane_fit_points = 2
+                    self.marker_corners_img = self.tracked_markers[left_id]['corners']
+                    self.marker_rvec = self.tracked_markers[left_id]['rvec']
+                    self.marker_tvec = t_cam_mid.reshape(3, 1)
+
+                    detected = True
+                    self.dual_markers_visible = True
+
+                    # Transform & Latch Target Pose into ODOM frame ONLY when DUAL markers are recognized
+                    try:
+                        t_odom = self.tf_buffer.lookup_transform('odom', 'base_footprint', rclpy.time.Time())
+                        trans = t_odom.transform.translation
+                        rot = t_odom.transform.rotation
+                        R_odom = self.quaternion_to_matrix([rot.x, rot.y, rot.z, rot.w])
+                        t_vec = np.array([trans.x, trans.y, trans.z], dtype=np.float64)
+
+                        p_odom = R_odom @ p_base + t_vec
+                        n_odom = R_odom @ desk_normal
+                        n_len = np.linalg.norm(n_odom)
+                        if n_len > 1e-6:
+                            n_odom /= n_len
+
+                        if self.odom_target_center is None:
+                            self.odom_target_center = p_odom
+                            self.odom_target_normal = n_odom
+                        else:
+                            self.odom_target_center = 0.80 * self.odom_target_center + 0.20 * p_odom
+                            self.odom_target_normal = 0.80 * self.odom_target_normal + 0.20 * n_odom
+                            norm_l = np.linalg.norm(self.odom_target_normal)
+                            if norm_l > 1e-6:
+                                self.odom_target_normal /= norm_l
+
+                        self.odom_target_latched = True
+                        self.odom_target_last_seen = time.time()
+                        self.odom_blind_start_time = None
+                    except Exception:
+                        pass
+
+        if not detected and len(active_ids) >= 1:
+            self.dual_markers_visible = False
+            # Single-marker fallback mode
+            mid = self.marker_id if self.marker_id in active_ids else active_ids[0]
+            m_corners = self.tracked_markers[mid]['corners']
+            rvec = self.tracked_markers[mid]['rvec']
+            tvec = self.tracked_markers[mid]['tvec']
+            t_cam = tvec.flatten()
+
+            # Seamless box center compensation: apply learned offset from dual tracking to prevent lateral jump
+            offset_to_center = self.marker_offsets_to_center.get(mid, np.zeros(3, dtype=np.float64))
+            t_cam_box = t_cam + offset_to_center
+
+            R_cam, _ = cv2.Rodrigues(rvec)
+            n_local = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            n_cam_pnp = R_cam @ n_local
+
+            # Depth plane fitting fusion if available
+            n_cam_depth, n_pts = self.fit_depth_plane(m_corners, t_cam[2], n_cam_pnp)
+            if n_cam_depth is not None:
+                n_cam = n_cam_depth
+                self.plane_fit_source = f"DEP:{n_pts}"
+                self.plane_fit_points = n_pts
+            else:
+                n_cam = n_cam_pnp
+                self.plane_fit_source = "PNP"
+                self.plane_fit_points = 0
+
+            p_base, n_base = self.transform_optical_to_base(t_cam_box, n_cam, frame_id)
+
+            if p_base is not None and n_base is not None:
+                desk_normal = -n_base
+                raw_heading_err = math.atan2(desk_normal[1], desk_normal[0]) - self.marker_yaw_bias_rad
+
+                self.docking_alignment_mode = f"SINGLE:ID{mid}"
+                self.marker_corners_img = m_corners
+                self.marker_rvec = rvec
+                self.marker_tvec = tvec
+
+                detected = True
+
+        # 3. Filtering Pipeline (Median + Adaptive EMA) & Target State Update
+        if detected:
+            # Stage 1: 5-frame rolling median (spike & glitch rejection)
+            self.yaw_history.append(raw_heading_err)
+            if len(self.yaw_history) > self.yaw_history_len:
+                self.yaw_history.pop(0)
+            median_yaw = float(np.median(self.yaw_history))
+
+            # Stage 2: Adaptive low-pass EMA filter (smooth jitter down to <= 0.2 deg)
+            if self.filtered_yaw is None:
+                self.filtered_yaw = median_yaw
+            else:
+                step_diff = math.atan2(math.sin(median_yaw - self.filtered_yaw), math.cos(median_yaw - self.filtered_yaw))
+                if self.docking_alignment_mode.startswith("DUAL"):
+                    alpha = 0.50 if abs(step_diff) > math.radians(4.0) else 0.20
+                    self.filtered_yaw = float(self.filtered_yaw + alpha * step_diff)
+                elif self.plane_fit_source.startswith("DEP"):
+                    alpha = 0.60 if abs(step_diff) > math.radians(8.0) else 0.35
+                    self.filtered_yaw = float(self.filtered_yaw + alpha * step_diff)
+                else:
+                    if abs(step_diff) > math.radians(6.0):
+                        step_diff = math.copysign(math.radians(2.5), step_diff)
+                    self.filtered_yaw = float(self.filtered_yaw + 0.25 * step_diff)
+
+            self.desk_yaw_error = self.filtered_yaw
+
+            dist_m = float(p_base[0]) - self.reference_x
+            self.desk_distance = dist_m
+            self.marker_pos_base = p_base
+            self.marker_normal_base = desk_normal
+            self.marker_detected = True
+            self.marker_last_seen = time.time()
+
+            self.target_obj.center = p_base
+            self.target_obj.docking_point = p_base
+            self.target_obj.valid = True
+            self.target_obj.last_seen_time = time.time()
+
+            self.publish_aruco_rviz_marker(p_base, desk_normal)
+
+        else:
+            self.dual_markers_visible = False
+            if time.time() - self.marker_last_seen > self.marker_timeout_sec:
+                self.marker_detected = False
+                self.marker_corners_img = None
+                self.marker_rvec = None
+                self.marker_tvec = None
+                if not self.odom_target_latched:
+                    self.desk_distance = None
+                    self.desk_yaw_error = None
+                    self.filtered_yaw = None
+                    self.yaw_history.clear()
+                    self.filtered_ey = None
+                    self.ey_history.clear()
+                    self.marker_offsets_to_center.clear()
+                    self.marker_pos_base = None
+                    self.marker_normal_base = None
+                    self.target_obj.valid = False
+                    self.docking_alignment_mode = 'NONE'
+                else:
+                    self.docking_alignment_mode = 'ODOM_TRACK'
+
+        # Render and publish visual HUD overlay
+        self.render_and_publish_visualization(color_img, self.marker_corners_img, self.marker_rvec, self.marker_tvec)
+
+    def transform_optical_to_base(self, t_cam, n_cam, frame_id):
+        """Transforms 3D position and normal vector from camera optical frame to base_footprint frame."""
+        # Method A: Use active TF lookup if available
+        try:
+            t = self.tf_buffer.lookup_transform(
+                'base_footprint', frame_id, rclpy.time.Time()
+            )
+            trans = t.transform.translation
+            rot = t.transform.rotation
+            q = [rot.x, rot.y, rot.z, rot.w]
+
+            # Quaternion to rotation matrix
+            R_tf = self.quaternion_to_matrix(q)
+            t_tf = np.array([trans.x, trans.y, trans.z], dtype=np.float64)
+
+            p_base = R_tf @ t_cam + t_tf
+            p_base[1] += self.astra_y_base
+            n_base = R_tf @ n_cam
+            return p_base, n_base
         except Exception:
             pass
 
-        # Extract front edge: For each Y bin (lateral position), find minimum X (front-most surface point)
-        y_min_robust = np.percentile(y_table, 5)
-        y_max_robust = np.percentile(y_table, 95)
-        if y_max_robust <= y_min_robust:
-            self.render_and_publish_visualization(depth_m, None, None, None)
-            return
+        # Method B: Fallback Analytical Extrinsic (Astra S mounted at Z=0.134m, X=0.08m, horizontal)
+        # Camera optical frame: X: Right, Y: Down, Z: Forward
+        # Robot base_footprint: X: Forward, Y: Left, Z: Up
+        sin_p = math.sin(self.astra_pitch)
+        cos_p = math.cos(self.astra_pitch)
 
-        y_bins = np.linspace(y_min_robust, y_max_robust, 15)
-        edge_x = []
-        edge_y = []
+        x_b = self.astra_x_base + cos_p * t_cam[2] - sin_p * t_cam[1]
+        y_b = self.astra_y_base - t_cam[0]
+        z_b = self.astra_z_base - sin_p * t_cam[2] - cos_p * t_cam[1]
+        p_base = np.array([x_b, y_b, z_b], dtype=np.float64)
 
-        for i in range(len(y_bins) - 1):
-            bin_lateral = (y_b >= y_bins[i]) & (y_b < y_bins[i + 1]) & (x_b >= 0.145) & (x_b < 1.40)
-            bin_table = bin_lateral & (z_b >= 0.11) & (z_b <= 0.17)
-            if np.count_nonzero(bin_table) >= 2:
-                # 10th percentile as candidate front edge point
-                front_x = float(np.percentile(x_b[bin_table], 10))
-                mid_y = 0.5 * (y_bins[i] + y_bins[i + 1])
+        nx_b = cos_p * n_cam[2] - sin_p * n_cam[1]
+        ny_b = -n_cam[0]
+        nz_b = -sin_p * n_cam[2] - cos_p * n_cam[1]
+        n_base = np.array([nx_b, ny_b, nz_b], dtype=np.float64)
+        norm_len = np.linalg.norm(n_base)
+        if norm_len > 1e-6:
+            n_base /= norm_len
 
-                # Step-height (Cliff) Discontinuity Check:
-                # When desk is at moderate distance, floor is visible in front (z_b < 0.06m).
-                # When robot is docked very close (<= 25cm), ground leaves FOV and only table is seen.
-                floor_in_front = bin_lateral & (z_b < 0.06) & (x_b < front_x + 0.05)
-                front_region_mask = bin_lateral & (x_b < front_x + 0.02) & (x_b > front_x - 0.20)
+        return p_base, n_base
 
-                mean_table_z = float(np.mean(z_b[bin_table]))
-                is_step_edge = False
+    @staticmethod
+    def quaternion_to_matrix(q):
+        x, y, z, w = q
+        return np.array([
+            [1 - 2 * (y**2 + z**2), 2 * (x * y - z * w),     2 * (x * z + y * w)],
+            [2 * (x * y + z * w),     1 - 2 * (x**2 + z**2), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w),     2 * (y * z + x * w),     1 - 2 * (x**2 + y**2)]
+        ], dtype=np.float64)
 
-                # Case 1: Ground visible in front, verify clear vertical drop (>= 0.06m)
-                if np.count_nonzero(floor_in_front) >= 2:
-                    mean_floor_z = float(np.mean(z_b[floor_in_front]))
-                    if (mean_table_z - mean_floor_z) >= 0.06:
-                        is_step_edge = True
-                # Case 2: Robot in close approach (<= 25cm) where ground is below camera frame
-                elif self.desk_distance is not None and self.desk_distance <= 0.25:
-                    is_step_edge = True
-                # Case 3: Front points exist, verify drop
-                elif np.count_nonzero(front_region_mask) > 0:
-                    min_front_z = float(np.min(z_b[front_region_mask]))
-                    if (mean_table_z - min_front_z) >= 0.06:
-                        is_step_edge = True
+    def publish_aruco_rviz_marker(self, p_base=None, desk_normal=None):
+        if p_base is not None and desk_normal is not None:
+            marker = Marker()
+            marker.header.frame_id = 'base_footprint'
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.ns = 'aruco_docking'
+            marker.id = 0
+            marker.type = Marker.ARROW
+            marker.action = Marker.ADD
+            marker.scale.x = 0.015  # Shaft diameter
+            marker.scale.y = 0.030  # Head diameter
+            marker.scale.z = 0.040  # Head length
+            marker.color.r = 0.0
+            marker.color.g = 1.0
+            marker.color.b = 0.2
+            marker.color.a = 1.0
 
-                if is_step_edge:
-                    edge_x.append(front_x)
-                    edge_y.append(mid_y)
+            start_pt = Point(x=float(p_base[0]), y=float(p_base[1]), z=float(p_base[2]))
+            end_pt = Point(
+                x=float(p_base[0] + 0.15 * desk_normal[0]),
+                y=float(p_base[1] + 0.15 * desk_normal[1]),
+                z=float(p_base[2] + 0.15 * desk_normal[2])
+            )
+            marker.points = [start_pt, end_pt]
+            self.marker_pub.publish(marker)
 
-        if len(edge_x) >= 5:
-            edge_x = np.array(edge_x)
-            edge_y = np.array(edge_y)
+        # Also publish latched target in odom frame if active (Cyan Arrow)
+        if self.odom_target_latched and self.odom_target_center is not None:
+            m_odom = Marker()
+            m_odom.header.frame_id = 'odom'
+            m_odom.header.stamp = self.get_clock().now().to_msg()
+            m_odom.ns = 'odom_visual_memory'
+            m_odom.id = 1
+            m_odom.type = Marker.ARROW
+            m_odom.action = Marker.ADD
+            m_odom.scale.x = 0.015
+            m_odom.scale.y = 0.030
+            m_odom.scale.z = 0.040
+            m_odom.color.r = 0.1
+            m_odom.color.g = 0.8
+            m_odom.color.b = 1.0  # Cyan for odom visual memory
+            m_odom.color.a = 0.9
 
-            # RANSAC Robust Line Fit to reject side edges & corner outliers when approaching skewed
-            best_inliers = []
-            best_p = None
-            n_pts = len(edge_x)
-            for _ in range(35):
-                sample_idx = np.random.choice(n_pts, 2, replace=False)
-                dy = edge_y[sample_idx[1]] - edge_y[sample_idx[0]]
-                if abs(dy) < 0.04:
-                    continue
-                cand_p = np.polyfit(edge_y[sample_idx], edge_x[sample_idx], 1)
-                # Perpendicular distance: |m*y - x + c| / sqrt(m^2 + 1)
-                perp_dists = np.abs(cand_p[0] * edge_y - edge_x + cand_p[1]) / math.sqrt(cand_p[0]**2 + 1)
-                inliers = np.where(perp_dists < 0.022)[0]  # 22mm threshold
-                if len(inliers) > len(best_inliers):
-                    best_inliers = inliers
-                    best_p = cand_p
+            p_o = self.odom_target_center
+            n_o = self.odom_target_normal
+            s_pt = Point(x=float(p_o[0]), y=float(p_o[1]), z=float(p_o[2]))
+            e_pt = Point(
+                x=float(p_o[0] + 0.15 * n_o[0]),
+                y=float(p_o[1] + 0.15 * n_o[1]),
+                z=float(p_o[2] + 0.15 * n_o[2])
+            )
+            m_odom.points = [s_pt, e_pt]
+            self.marker_pub.publish(m_odom)
 
-            if len(best_inliers) >= 4:
-                p = np.polyfit(edge_y[best_inliers], edge_x[best_inliers], 1)
-                inlier_x = edge_x[best_inliers]
-                inlier_y = edge_y[best_inliers]
-            else:
-                p = np.polyfit(edge_y, edge_x, 1)
-                inlier_x = edge_x
-                inlier_y = edge_y
-
-            slope_m, intercept_c = p[0], p[1]
-            yaw_err = math.atan(slope_m)
-            # Robust physical distance to front edge (immune to angle extrapolation errors)
-            dist_from_ref = float(np.median(inlier_x)) - self.reference_x
-
-            self.desk_distance = dist_from_ref
-            self.desk_yaw_error = yaw_err
-            self.get_logger().info(f"[EDGE FOUND (RANSAC)] dist={dist_from_ref*100:.1f}cm, yaw_err={math.degrees(yaw_err):.2f}° ({len(inlier_x)}/{n_pts} inliers)", throttle_duration_sec=1.0)
-            self.publish_edge_marker(intercept_c, slope_m)
-
-            edge_pts_3d = list(zip(inlier_x, inlier_y))
-            self.render_and_publish_visualization(depth_m, edge_pts_3d, slope_m, intercept_c)
+        # Publish Virtual Carrot Point in base_footprint (Orange Sphere)
+        if self.carrot_x_b is not None and self.carrot_y_b is not None:
+            m_carrot = Marker()
+            m_carrot.header.frame_id = 'base_footprint'
+            m_carrot.header.stamp = self.get_clock().now().to_msg()
+            m_carrot.ns = 'carrot_waypoint'
+            m_carrot.id = 2
+            m_carrot.type = Marker.SPHERE
+            m_carrot.action = Marker.ADD
+            m_carrot.pose.position.x = float(self.carrot_x_b)
+            m_carrot.pose.position.y = float(self.carrot_y_b)
+            m_carrot.pose.position.z = 0.0
+            m_carrot.pose.orientation.w = 1.0
+            m_carrot.scale.x = 0.05
+            m_carrot.scale.y = 0.05
+            m_carrot.scale.z = 0.05
+            m_carrot.color.r = 1.0
+            m_carrot.color.g = 0.55
+            m_carrot.color.b = 0.0
+            m_carrot.color.a = 0.95
+            self.marker_pub.publish(m_carrot)
         else:
-            self.get_logger().info(f"[EDGE] edge_x count too small: {len(edge_x)}", throttle_duration_sec=2.0)
-            self.render_and_publish_visualization(depth_m, None, None, None)
+            m_del = Marker()
+            m_del.header.frame_id = 'base_footprint'
+            m_del.ns = 'carrot_waypoint'
+            m_del.id = 2
+            m_del.action = Marker.DELETE
+            self.marker_pub.publish(m_del)
 
-    def project_point_to_image(self, x_b, y_b, z_b=0.14):
-        """Projects a 3D point in robot base_footprint frame to camera image (u, v)."""
-        sin_p = math.sin(self.cam_pitch)
-        cos_p = math.cos(self.cam_pitch)
-        dx = x_b - self.cam_x_base
-        dz = z_b - self.cam_z_base
-        z_c = cos_p * dx - sin_p * dz
-        if z_c <= 0.05:
-            return None
-        y_c = -sin_p * dx - cos_p * dz
-        x_c = -y_b
-        u = int(self.fx * (x_c / z_c) + self.cx)
-        v = int(self.fy * (y_c / z_c) + self.cy)
-        return (u, v)
+    def get_carrot_point_in_base(self, L_carrot=0.28):
+        """Calculates 3D coordinates of the Virtual Carrot Waypoint in base_footprint frame.
+        Carrot point is located on the docking corridor at distance L_carrot in front of the desk:
+        P_carrot = P_box - L_carrot * desk_normal
+        """
+        if self.marker_pos_base is not None and self.marker_normal_base is not None:
+            c_x = float(self.marker_pos_base[0]) - L_carrot * float(self.marker_normal_base[0])
+            c_y = float(self.marker_pos_base[1]) - L_carrot * float(self.marker_normal_base[1])
+            c_z = float(self.marker_pos_base[2]) - L_carrot * float(self.marker_normal_base[2])
+            return np.array([c_x, c_y, c_z], dtype=np.float64)
+        return None
 
-    def render_and_publish_visualization(self, depth_m, edge_pts_3d=None, slope_m=None, intercept_c=None):
-        """Renders live visual overlay: RGB background, fitted edge line, 5cm target line, depth thumbnail, and HUD."""
-        try:
-            h, w = depth_m.shape
-            # Base image: use real color RGB if available, otherwise colormap depth
-            if self.last_color_img is not None:
-                canvas = self.last_color_img.copy()
-            else:
-                d_vis = np.nan_to_num(depth_m, nan=0.0, posinf=0.0, neginf=0.0)
-                d_norm = cv2.normalize(d_vis, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-                canvas = cv2.applyColorMap(d_norm, cv2.COLORMAP_TURBO)
+    # ==========================================================================
+    # Unified Error Computation & Control Loop
+    # ==========================================================================
+    def compute_docking_errors(self):
+        """Returns [e_x, e_y, e_theta] relative to Target Docking Pose with consistent normal and 2-stage filtering."""
+        # 1. Direct Optical Perception
+        if self.marker_detected and self.desk_distance is not None:
+            self.odom_tracking_active = False
+            self.odom_blind_start_time = None
 
-            # Upscale canvas 2x to 640x480 for crisp typography and UI overlay
-            vis_w, vis_h = 640, 480
-            vis = cv2.resize(canvas, (vis_w, vis_h), interpolation=cv2.INTER_LINEAR)
-            sx = vis_w / float(w)
-            sy = vis_h / float(h)
-
-            # 1. Draw Target Docking Reference Line (Clearance = 5cm -> x_b = 0.150m)
-            # Astra front tip is at x=0.100m, target gap=0.050m -> front edge must align at x_b = 0.150m
-            target_pts = []
-            for y_samp in np.linspace(-0.25, 0.25, 20):
-                pt = self.project_point_to_image(0.150, y_samp, z_b=0.14)
-                if pt is not None:
-                    u_s = int(pt[0] * sx)
-                    v_s = int(pt[1] * sy)
-                    if 0 <= u_s < vis_w and 0 <= v_s < vis_h:
-                        target_pts.append((u_s, v_s))
-
-            for i in range(len(target_pts) - 1):
-                if i % 2 == 0:
-                    cv2.line(vis, target_pts[i], target_pts[i + 1], (255, 255, 0), 2, cv2.LINE_AA)
-
-            if target_pts:
-                mid_tgt = target_pts[len(target_pts) // 2]
-                cv2.putText(vis, "TARGET 5CM GOAL LINE", (max(10, mid_tgt[0] - 85), min(vis_h - 20, mid_tgt[1] + 18)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 0), 1, cv2.LINE_AA)
-
-            # 2. Draw Detected Desk Edge Points & Fitted Line
-            if slope_m is not None and intercept_c is not None:
-                edge_line_pts = []
-                for y_samp in np.linspace(-0.35, 0.35, 25):
-                    x_val = slope_m * y_samp + intercept_c
-                    pt = self.project_point_to_image(x_val, y_samp, z_b=0.14)
-                    if pt is not None:
-                        u_s = int(pt[0] * sx)
-                        v_s = int(pt[1] * sy)
-                        if 0 <= u_s < vis_w and 0 <= v_s < vis_h:
-                            edge_line_pts.append((u_s, v_s))
-
-                # Outer glow + bright green line
-                for i in range(len(edge_line_pts) - 1):
-                    cv2.line(vis, edge_line_pts[i], edge_line_pts[i + 1], (0, 160, 0), 6, cv2.LINE_AA)
-                    cv2.line(vis, edge_line_pts[i], edge_line_pts[i + 1], (0, 255, 0), 2, cv2.LINE_AA)
-
-                # Detected front edge points (Yellow dots)
-                if edge_pts_3d:
-                    for (x_p, y_p) in edge_pts_3d:
-                        pt = self.project_point_to_image(x_p, y_p, z_b=0.14)
-                        if pt is not None:
-                            u_s = int(pt[0] * sx)
-                            v_s = int(pt[1] * sy)
-                            if 0 <= u_s < vis_w and 0 <= v_s < vis_h:
-                                cv2.circle(vis, (u_s, v_s), 4, (0, 255, 255), -1, cv2.LINE_AA)
-                                cv2.circle(vis, (u_s, v_s), 5, (0, 0, 0), 1, cv2.LINE_AA)
-
-            # 2.5 Draw Target Object (Red Box) & Virtual Docking Axis
-            if self.target_bbox is not None:
-                bx, by, bw, bh = self.target_bbox
-                u1 = int(bx * sx)
-                v1 = int(by * sy)
-                u2 = int((bx + bw) * sx)
-                v2 = int((by + bh) * sy)
-                cv2.rectangle(vis, (u1, v1), (u2, v2), (0, 0, 255), 2)
-                cv2.circle(vis, (int((u1 + u2) / 2), int((v1 + v2) / 2)), 5, (0, 0, 255), -1)
-                t_label = "TARGET RED BOX"
-                if self.target_obj.valid and self.target_obj.center is not None:
-                    t_label += f" ({self.target_obj.center[0]:.2f}m, {self.target_obj.center[1]*100:+.1f}cm)"
-                cv2.putText(vis, t_label, (max(10, u1), max(20, v1 - 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 60, 255), 1, cv2.LINE_AA)
-
-            # Virtual Docking Axis (Approach centerline toward target object)
-            if self.target_obj.valid and self.target_obj.center is not None:
-                y_dock = float(self.target_obj.center[1])
-                dock_ray_pts = []
-                for x_samp in np.linspace(0.10, max(0.50, float(self.target_obj.center[0]) + 0.10), 16):
-                    pt = self.project_point_to_image(x_samp, y_dock, z_b=0.14)
-                    if pt is not None:
-                        u_s = int(pt[0] * sx)
-                        v_s = int(pt[1] * sy)
-                        if 0 <= u_s < vis_w and 0 <= v_s < vis_h:
-                            dock_ray_pts.append((u_s, v_s))
-                for i in range(len(dock_ray_pts) - 1):
-                    if i % 2 == 0:
-                        cv2.line(vis, dock_ray_pts[i], dock_ray_pts[i + 1], (255, 220, 0), 2, cv2.LINE_AA)
-                if dock_ray_pts:
-                    mid_ray = dock_ray_pts[0]
-                    cv2.putText(vis, "DOCKING AXIS", (mid_ray[0] + 6, mid_ray[1] - 6),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 220, 0), 1, cv2.LINE_AA)
-
-            # Carrot Point (Lookahead goal along docking axis)
-            if self.carrot_x_b is not None and self.carrot_y_b is not None:
-                pt_c = self.project_point_to_image(self.carrot_x_b, self.carrot_y_b, z_b=0.14)
-                if pt_c is not None:
-                    uc_s = int(pt_c[0] * sx)
-                    vc_s = int(pt_c[1] * sy)
-                    if 0 <= uc_s < vis_w and 0 <= vc_s < vis_h:
-                        cv2.circle(vis, (uc_s, vc_s), 6, (255, 0, 255), -1, cv2.LINE_AA)
-                        cv2.circle(vis, (uc_s, vc_s), 8, (255, 255, 255), 1, cv2.LINE_AA)
-                        cv2.putText(vis, "CARROT", (uc_s + 8, vc_s + 4),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 0, 255), 1, cv2.LINE_AA)
-
-            # 3. Mini Depth Inset (Picture-in-Picture at bottom-right)
-            d_vis = np.nan_to_num(depth_m, nan=0.0, posinf=0.0, neginf=0.0)
-            d_norm = cv2.normalize(d_vis, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-            depth_thumb = cv2.applyColorMap(d_norm, cv2.COLORMAP_TURBO)
-            thumb_w, thumb_h = 160, 120
-            depth_thumb = cv2.resize(depth_thumb, (thumb_w, thumb_h))
-            x_off = vis_w - thumb_w - 12
-            y_off = vis_h - thumb_h - 12
-            vis[y_off:y_off + thumb_h, x_off:x_off + thumb_w] = depth_thumb
-            cv2.rectangle(vis, (x_off, y_off), (x_off + thumb_w, y_off + thumb_h), (200, 200, 200), 1)
-            cv2.putText(vis, "DEPTH MAP (OS30A)", (x_off + 6, y_off + 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
-
-            # 4. Modern Glassmorphism Top HUD Dashboard
-            overlay = vis.copy()
-            hud_h = 92
-            cv2.rectangle(overlay, (0, 0), (vis_w, hud_h), (15, 15, 18), -1)
-            cv2.addWeighted(overlay, 0.82, vis, 0.18, 0, vis)
-            cv2.line(vis, (0, hud_h), (vis_w, hud_h), (60, 60, 70), 1)
-
-            # State color logic
-            state_color = (0, 255, 255)
-            if self.state == 'DOCKED':
-                state_color = (0, 255, 0)
-            elif 'ALIGN' in self.state:
-                state_color = (255, 200, 0)
-            elif 'CRAWL' in self.state or 'FINAL' in self.state:
-                state_color = (0, 165, 255)
-            elif 'ABORT' in self.state or 'UNDOCK' in self.state:
-                state_color = (0, 140, 255)  # Orange for active safety retreat
-            elif self.state == 'FAILSAFE':
-                state_color = (0, 0, 255)
-
-            # Row 1: State & Bumper Status
-            if self.state == 'ABORT_TO_NAV2':
-                elapsed_abort = (self.get_clock().now() - self.state_start_time).nanoseconds / 1e9
-                state_text = f"STATE: ABORTING [{max(0.0, 4.0 - elapsed_abort):3.1f}s RETREAT]"
-            elif self.state == 'UNDOCKING':
-                elapsed_undock = (self.get_clock().now() - self.state_start_time).nanoseconds / 1e9
-                state_text = f"STATE: UNDOCKING [{max(0.0, 3.0 - elapsed_undock):3.1f}s BACKUP]"
-            else:
-                state_text = f"STATE: {self.state}"
-                if self.docking_routine_start_time is not None:
-                    elapsed_dock = (self.get_clock().now() - self.docking_routine_start_time).nanoseconds / 1e9
-                    rem_dock = max(0.0, self.docking_timeout_sec - elapsed_dock)
-                    state_text += f" [{rem_dock:4.1f}s left]"
-
-            cv2.putText(vis, state_text, (14, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, state_color, 2, cv2.LINE_AA)
-
-            bumper_text = "BUMPER: [ CONTACT! ]" if self.contact_detected else "BUMPER: [ CLEAR ]"
-            bumper_color = (0, 0, 255) if self.contact_detected else (180, 180, 180)
-            cv2.putText(vis, bumper_text, (vis_w - 225, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, bumper_color, 2 if self.contact_detected else 1, cv2.LINE_AA)
-
-            # Row 2 & 3: Distance, Yaw Error, Lateral Offset (ey), and Target Object Status
-            e_x, e_y, e_theta = self.compute_docking_errors()
-            if self.desk_distance is not None and self.desk_yaw_error is not None:
-                dist_cm = self.desk_distance * 100.0
-                dist_err_cm = (self.desk_distance - self.target_clearance) * 100.0
-                yaw_deg = math.degrees(self.desk_yaw_error)
-
-                dist_col = (0, 255, 0) if abs(dist_err_cm) <= 1.0 else ((0, 255, 255) if dist_cm <= 20.0 else (240, 240, 240))
-                yaw_col = (0, 255, 0) if abs(yaw_deg) <= 2.0 else (0, 200, 255)
-
-                dist_str = f"DIST: {dist_cm:4.1f}cm (Target: 5.0cm, Err: {dist_err_cm:+4.1f}cm)"
-                yaw_str = f"YAW ERR: {yaw_deg:+5.1f}° (Tol: ±2.0°)"
-
-                cv2.putText(vis, dist_str, (14, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.48, dist_col, 1, cv2.LINE_AA)
-                cv2.putText(vis, yaw_str, (14, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.48, yaw_col, 1, cv2.LINE_AA)
-            else:
-                cv2.putText(vis, "DESK EDGE: SEARCHING...", (14, 55),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.48, (120, 120, 255), 1, cv2.LINE_AA)
-
-            # Column 2 (x = 340): Lateral Error (ey) & Target Object
-            if e_y is not None:
-                ey_cm = e_y * 100.0
-                ey_col = (0, 255, 0) if abs(ey_cm) <= 1.2 else (0, 220, 255)
-                ey_str = f"LATERAL (ey): {ey_cm:+5.1f}cm (Tol: ±1.2cm)"
-                cv2.putText(vis, ey_str, (340, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.48, ey_col, 1, cv2.LINE_AA)
-            else:
-                cv2.putText(vis, "LATERAL (ey): --", (340, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (160, 160, 160), 1, cv2.LINE_AA)
+            e_x = self.desk_distance - self.target_clearance
+            e_theta = self.desk_yaw_error if self.desk_yaw_error is not None else 0.0
 
             if self.target_obj.valid and self.target_obj.center is not None:
-                t_status_str = f"TARGET: [ FOUND ] X={self.target_obj.center[0]:.2f}m"
-                cv2.putText(vis, t_status_str, (340, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 120), 1, cv2.LINE_AA)
+                # Fixed-Frame (Odom) Centerline Error: measures true perpendicular distance to box corridor
+                # (Invariant under robot in-place rotation, completely eliminating false divergence during turns!)
+                used_fixed_ey = False
+                if self.odom_target_latched and self.odom_target_center is not None and self.odom_target_normal is not None:
+                    try:
+                        t_b_o = self.tf_buffer.lookup_transform('odom', 'base_footprint', rclpy.time.Time())
+                        rx = t_b_o.transform.translation.x
+                        ry = t_b_o.transform.translation.y
+                        bx = float(self.odom_target_center[0])
+                        by = float(self.odom_target_center[1])
+                        # n_odom points into desk; outward corridor is -n_odom
+                        ux = -float(self.odom_target_normal[0])
+                        uy = -float(self.odom_target_normal[1])
+                        u_len = math.hypot(ux, uy)
+                        if u_len > 1e-6:
+                            ux /= u_len
+                            uy /= u_len
+                        # Perpendicular distance: vector (box - robot) cross corridor unit vector
+                        dx = bx - rx
+                        dy = by - ry
+                        raw_e_y = float(dx * uy - dy * ux)
+                        used_fixed_ey = True
+                    except Exception:
+                        pass
+
+                if not used_fixed_ey:
+                    phi = e_theta + self.marker_yaw_bias_rad
+                    ux = -math.cos(phi)
+                    uy = -math.sin(phi)
+                    px = float(self.target_obj.center[0])
+                    py = float(self.target_obj.center[1])
+                    raw_e_y = float(px * uy - py * ux)
+
+                # 2-Stage Anti-Chatter & Outlier Filter on Centerline Error (e_y)
+                self.ey_history.append(raw_e_y)
+                if len(self.ey_history) > self.ey_history_len:
+                    self.ey_history.pop(0)
+                median_ey = float(np.median(self.ey_history))
+
+                if self.filtered_ey is None:
+                    self.filtered_ey = median_ey
+                else:
+                    alpha_ey = 0.50 if abs(median_ey - self.filtered_ey) > 0.03 else 0.25
+                    self.filtered_ey = float(self.filtered_ey + alpha_ey * (median_ey - self.filtered_ey))
+
+                e_y = self.filtered_ey
             else:
-                cv2.putText(vis, "TARGET: [ SEARCHING ]", (340, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (120, 120, 255), 1, cv2.LINE_AA)
+                e_y = 0.0
 
-            # 5. Publish to ROS 2 Image Topic
-            out_msg = self.bridge.cv2_to_imgmsg(vis, encoding='bgr8')
-            out_msg.header.stamp = self.get_clock().now().to_msg()
-            out_msg.header.frame_id = 'os30a_camera_color_optical_frame'
-            self.vis_pub.publish(out_msg)
+            return e_x, e_y, e_theta
 
-            # 6. Display OpenCV GUI window if requested (Only during active docking)
-            if self.show_window and self.state in DOCKING_ACTIVE_STATES:
-                cv2.imshow("OS30A Precision Docking Visualizer", vis)
-                cv2.waitKey(1)
-            elif self.show_window and self.state not in DOCKING_ACTIVE_STATES:
+        # 2. Odom-Anchored Visual Memory Tracking (Blind Pursuit when markers swing out of FOV)
+        elif self.odom_target_latched and self.odom_target_center is not None:
+            try:
+                t = self.tf_buffer.lookup_transform('base_footprint', 'odom', rclpy.time.Time())
+                trans = t.transform.translation
+                rot = t.transform.rotation
+                R_b_o = self.quaternion_to_matrix([rot.x, rot.y, rot.z, rot.w])
+                t_b_o = np.array([trans.x, trans.y, trans.z], dtype=np.float64)
+
+                p_base = R_b_o @ self.odom_target_center + t_b_o
+                # desk_normal was saved pointing into desk in odom frame
+                desk_normal = R_b_o @ self.odom_target_normal
+                norm_l = np.linalg.norm(desk_normal)
+                if norm_l > 1e-6:
+                    desk_normal /= norm_l
+
+                dist_m = float(p_base[0]) - self.reference_x
+                self.desk_distance = dist_m
+                self.marker_pos_base = p_base
+                self.marker_normal_base = desk_normal
+                self.target_obj.center = p_base
+                self.target_obj.docking_point = p_base
+                self.target_obj.valid = True
+
+                self.desk_yaw_error = math.atan2(desk_normal[1], desk_normal[0]) - self.marker_yaw_bias_rad
+                self.odom_tracking_active = True
+                if self.odom_blind_start_time is None:
+                    self.odom_blind_start_time = time.time()
+
+                e_x = self.desk_distance - self.target_clearance
+                e_theta = self.desk_yaw_error
+
+                used_fixed_ey = False
                 try:
-                    cv2.destroyWindow("OS30A Precision Docking Visualizer")
+                    t_o_b = self.tf_buffer.lookup_transform('odom', 'base_footprint', rclpy.time.Time())
+                    rx = t_o_b.transform.translation.x
+                    ry = t_o_b.transform.translation.y
+                    bx = float(self.odom_target_center[0])
+                    by = float(self.odom_target_center[1])
+                    ux = -float(self.odom_target_normal[0])
+                    uy = -float(self.odom_target_normal[1])
+                    u_len = math.hypot(ux, uy)
+                    if u_len > 1e-6:
+                        ux /= u_len
+                        uy /= u_len
+                    dx = bx - rx
+                    dy = by - ry
+                    raw_e_y = float(dx * uy - dy * ux)
+                    used_fixed_ey = True
                 except Exception:
                     pass
 
-        except Exception as e:
-            self.get_logger().warn(f"Visualization render error: {e}", throttle_duration_sec=2.0)
+                if not used_fixed_ey:
+                    phi = e_theta + self.marker_yaw_bias_rad
+                    ux = -math.cos(phi)
+                    uy = -math.sin(phi)
+                    px = float(p_base[0])
+                    py = float(p_base[1])
+                    raw_e_y = float(px * uy - py * ux)
 
-    def publish_edge_marker(self, c, m):
-        marker = Marker()
-        marker.header.frame_id = 'base_footprint'
-        marker.header.stamp = self.get_clock().now().to_msg()
-        marker.ns = 'desk_edge'
-        marker.id = 0
-        marker.type = Marker.LINE_STRIP
-        marker.action = Marker.ADD
-        marker.scale.x = 0.015  # Line width
-        marker.color.r = 0.1
-        marker.color.g = 0.9
-        marker.color.b = 0.2
-        marker.color.a = 1.0
+                self.ey_history.append(raw_e_y)
+                if len(self.ey_history) > self.ey_history_len:
+                    self.ey_history.pop(0)
+                median_ey = float(np.median(self.ey_history))
 
-        for y in [-0.25, 0.25]:
-            x = m * y + c
-            from geometry_msgs.msg import Point
-            p = Point(x=float(x), y=float(y), z=0.14)
-            marker.points.append(p)
+                if self.filtered_ey is None:
+                    self.filtered_ey = median_ey
+                else:
+                    alpha_ey = 0.50 if abs(median_ey - self.filtered_ey) > 0.03 else 0.25
+                    self.filtered_ey = float(self.filtered_ey + alpha_ey * (median_ey - self.filtered_ey))
 
-        self.marker_pub.publish(marker)
+                e_y = self.filtered_ey
+                return e_x, e_y, e_theta
+            except Exception as e:
+                self.get_logger().warn(f"Odom memory TF lookup failed: {e}", throttle_duration_sec=2.0)
+                return None, None, None
 
-    def publish_standby_hud(self):
-        """Publishes a clean standby banner when in NAV2_READY so HUD doesn't freeze on old state."""
-        try:
-            h, w = 480, 640
-            vis = np.zeros((h, w, 3), dtype=np.uint8)
-            vis[:] = (20, 24, 28)
-            cv2.rectangle(vis, (40, 140), (w - 40, 340), (35, 40, 48), -1)
-            cv2.rectangle(vis, (40, 140), (w - 40, 340), (0, 200, 255), 2)
-            cv2.putText(vis, "NAV2 AUTONOMOUS NAVIGATION ACTIVE", (70, 205),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(vis, "Astra S Camera Active  |  RTAB-Map SLAM Resumed", (85, 250),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (200, 200, 200), 1, cv2.LINE_AA)
-            cv2.putText(vis, "[ Precision Docking Engine on Standby ]", (135, 295),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (100, 255, 100), 1, cv2.LINE_AA)
-            out_msg = self.bridge.cv2_to_imgmsg(vis, encoding='bgr8')
-            out_msg.header.stamp = self.get_clock().now().to_msg()
-            out_msg.header.frame_id = 'os30a_camera_color_optical_frame'
-            self.vis_pub.publish(out_msg)
-        except Exception:
-            pass
+        return None, None, None
 
-    # ==========================================================================
-    # Main Finite State Machine (FSM)
-    # ==========================================================================
     def control_loop(self):
         try:
             self._control_loop_impl()
         except Exception as e:
-            self.get_logger().error(f"Unexpected error in control_loop: {e}", throttle_duration_sec=1.0)
+            self.get_logger().error(f"Error in control_loop: {e}", throttle_duration_sec=1.0)
 
     def _control_loop_impl(self):
         now = self.get_clock().now()
         twist = Twist()
 
-        # Compute 3-DOF docking errors
         e_x, e_y, e_theta = self.compute_docking_errors()
 
         # Publish status string
         ey_str = f"{e_y*100:+.1f}" if e_y is not None else "0.0"
+        yaw_str = f"{math.degrees(e_theta):+.1f}" if e_theta is not None else "0.0"
+        dist_str = f"{self.desk_distance:.3f}" if self.desk_distance is not None else "None"
+        sensor_type = "DEPTH" if "DEPTH" in self.docking_alignment_mode else ("RGB" if "RGB" in self.docking_alignment_mode else "NONE")
         status_msg = String()
-        status_msg.data = f"STATE={self.state}, dist={self.desk_distance}, yaw_err={self.desk_yaw_error}, ey={ey_str}, target={self.target_obj.valid}, contact={self.contact_detected}"
+        status_msg.data = (
+            f"STATE={self.state}, dist={dist_str}, yaw_err={yaw_str}deg, "
+            f"ey={ey_str}cm, dual={1 if self.dual_markers_visible else 0}, "
+            f"sensor={sensor_type}, mode={self.docking_alignment_mode}, "
+            f"latched={1 if self.odom_target_latched else 0}, odom_track={1 if self.odom_tracking_active else 0}, "
+            f"target={self.target_obj.valid}, contact={self.contact_detected}, "
+            f"retries={self.retry_count}/{self.max_retries}, reason={self.backup_reason}"
+        )
         self.status_pub.publish(status_msg)
+
+        # If no camera frames have arrived yet, publish diagnostic screen to /docking/debug_image
+        if self.last_color_img is None:
+            self.render_and_publish_diagnostic_screen()
+
+        # Static calibration mode: keep motors halted
+        if self.calibration_mode:
+            self.send_cmd_vel(0.0, 0.0)
+            return
+
+        # Fully docked or bumper contact latched: enforce immediate full motor lock
+        if self.state == 'DOCKED' or self.contact_latched:
+            self.stop_robot(hard_brake=False)
+            return
 
         # ----------------------------------------------------------------------
         # Global Docking Timeout Guard: Abort, reverse, and return to Nav2
@@ -855,60 +1186,51 @@ class PrecisionApproacherNode(Node):
             if self.docking_routine_start_time is not None:
                 total_docking_elapsed = (now - self.docking_routine_start_time).nanoseconds / 1e9
                 if total_docking_elapsed > self.docking_timeout_sec:
-                    self.get_logger().warn(f">>> [DOCKING TIMEOUT] Exceeded {self.docking_timeout_sec:.1f}s without docking. Aborting, retreating, and returning to Nav2 mode...")
+                    self.get_logger().warn(
+                        f">>> [DOCKING TIMEOUT] Exceeded {self.docking_timeout_sec:.1f}s without docking. "
+                        f"Aborting and retreating to Nav2 mode..."
+                    )
                     self.transition_to('ABORT_TO_NAV2')
                     return
 
-            # Note: Target object may exit camera FOV when getting close to desk surface.
-            # If target object is lost but desk edge is visible, continue docking using desk edge alignment!
-            if self.state in ('CARROT_PURSUIT_ALIGN', 'VERIFY_DUAL_ALIGN'):
-                if not self.target_obj.valid and self.desk_distance is not None:
-                    self.get_logger().info(">>> [TARGET FOV] Object out of view close to desk. Holding centerline heading with desk edge.", throttle_duration_sec=3.0)
-
+        # ======================================================================
+        # FSM State Handlers
+        # ======================================================================
         # ----------------------------------------------------------------------
         # STATE: INIT
         # ----------------------------------------------------------------------
         if self.state == 'INIT':
-            curr_pose = self.get_robot_pose_in_map()
-            if curr_pose is None:
-                self.get_logger().info(">>> [INIT] Waiting for map -> base_footprint TF...", throttle_duration_sec=2.0)
-                return
-
-            # If desk is already in view of OS30A, robot is at the staging area
-            if self.desk_distance is not None and 0.20 <= self.desk_distance <= 0.55:
-                self.get_logger().info(f">>> [INIT] Desk already in view ({self.desk_distance*100:.1f}cm). Transitioning directly to CHECK_STAGING.")
-                self.transition_to('CHECK_STAGING')
-                return
-
-            dist_to_staging = math.hypot(curr_pose[0] - self.staging_x, curr_pose[1] - self.staging_y)
-            self.get_logger().info(f">>> [INIT] Current pose: X={curr_pose[0]:.2f}, Y={curr_pose[1]:.2f}, Yaw={math.degrees(curr_pose[2]):.1f}°. Dist to staging: {dist_to_staging:.2f}m")
-            if self.skip_nav2_if_close and dist_to_staging <= 0.50:
-                self.get_logger().info(">>> Already near staging position. Transitioning to CHECK_STAGING.")
-                self.transition_to('CHECK_STAGING')
+            if self.docking_mode == 'marker':
+                if self.marker_detected:
+                    self.get_logger().info(f">>> [INIT] Marker ID {self.marker_id} acquired ({self.desk_distance*100:.1f}cm). Proceeding to CHECK_STAGING.")
+                    self.transition_to('CHECK_STAGING')
+                    return
+                else:
+                    self.transition_to('SEARCH_MARKER')
+                    return
             else:
-                self.get_logger().info(">>> Far from staging position. Dispatching Nav2 Staging Goal...")
-                self.send_nav2_staging_goal()
-                self.transition_to('WAIT_NAV2')
+                curr_pose = self.get_robot_pose_in_map()
+                if curr_pose is None:
+                    return
+                if self.desk_distance is not None and 0.20 <= self.desk_distance <= 0.55:
+                    self.transition_to('CHECK_STAGING')
+                    return
+                dist_to_staging = math.hypot(curr_pose[0] - self.staging_x, curr_pose[1] - self.staging_y)
+                if self.skip_nav2_if_close and dist_to_staging <= 0.50:
+                    self.transition_to('CHECK_STAGING')
+                else:
+                    self.send_nav2_staging_goal()
+                    self.transition_to('WAIT_NAV2')
 
         # ----------------------------------------------------------------------
-        # STATE: WAIT_NAV2 (Wait for Nav2 staging navigation to reach vicinity)
+        # STATE: WAIT_NAV2
         # ----------------------------------------------------------------------
         elif self.state == 'WAIT_NAV2':
             elapsed = (now - self.state_start_time).nanoseconds / 1e9
-            curr_pose = self.get_robot_pose_in_map()
-
-            # 1. Check if Nav2 completed
             if self.nav2_finished:
-                if self.nav2_success:
-                    self.get_logger().info(">>> Nav2 reached staging pose successfully! Proceeding to CHECK_STAGING.")
-                else:
-                    self.get_logger().warn(">>> Nav2 ended without success. Proceeding to CHECK_STAGING directly.")
                 self.transition_to('CHECK_STAGING')
                 return
-
-            # 2. Camera desk acquisition: as soon as desk is seen, cancel Nav2 and take over
-            if self.desk_distance is not None and 0.20 <= self.desk_distance <= 0.55:
-                self.get_logger().info(f">>> Desk acquired in view ({self.desk_distance*100:.1f}cm). Canceling Nav2 and taking over precision approach!")
+            if self.desk_distance is not None and 0.20 <= self.desk_distance <= 0.65:
                 if self.nav2_goal_handle is not None:
                     try:
                         self.nav2_goal_handle.cancel_goal_async()
@@ -916,641 +1238,1182 @@ class PrecisionApproacherNode(Node):
                         pass
                 self.transition_to('CHECK_STAGING')
                 return
-
-            # 3. Timeout guard: 25s
             if elapsed > 25.0:
-                self.get_logger().warn(">>> Nav2 staging wait timeout (25s). Transitioning to CHECK_STAGING directly.")
-                if self.nav2_goal_handle is not None:
-                    try:
-                        self.nav2_goal_handle.cancel_goal_async()
-                    except Exception:
-                        pass
                 self.transition_to('CHECK_STAGING')
                 return
 
         # ----------------------------------------------------------------------
-        # STATE: CHECK_STAGING (Assess clearance and lateral offset)
+        # STATE: SEARCH_MARKER
+        # ----------------------------------------------------------------------
+        elif self.state == 'SEARCH_MARKER':
+            elapsed = (now - self.state_start_time).nanoseconds / 1e9
+            if self.marker_detected and self.desk_distance is not None:
+                self.get_logger().info(f">>> [SEARCH_MARKER] Marker found at d={self.desk_distance*100:.1f}cm! Transitioning to CHECK_STAGING.")
+                self.stop_robot()
+                self.transition_to('CHECK_STAGING')
+                return
+
+            # Active visual search sweep (±30° rotation to bring marker into camera FOV)
+            if elapsed < 0.8:
+                twist.linear.x = 0.0
+                twist.angular.z = 0.0
+            elif elapsed < 4.0:
+                twist.linear.x = 0.0
+                twist.angular.z = 0.25  # Sweep left
+                self.get_logger().info(">>> [SEARCH_MARKER] Scanning left for ArUco marker...", throttle_duration_sec=1.5)
+            elif elapsed < 10.0:
+                twist.linear.x = 0.0
+                twist.angular.z = -0.25  # Sweep right
+                self.get_logger().info(">>> [SEARCH_MARKER] Scanning right for ArUco marker...", throttle_duration_sec=1.5)
+            elif elapsed < 13.0:
+                twist.linear.x = 0.0
+                twist.angular.z = 0.25  # Return to center
+            else:
+                self.get_logger().warn(">>> [SEARCH_MARKER] Marker not found after 13s scan. Aborting to Nav2 mode...")
+                self.transition_to('ABORT_TO_NAV2')
+                return
+
+        # ----------------------------------------------------------------------
+        # STATE: CHECK_STAGING (Assess clearance and route to STAGING_SETTLE)
         # ----------------------------------------------------------------------
         elif self.state == 'CHECK_STAGING':
             if self.desk_distance is not None:
                 e_x, e_y, e_theta = self.compute_docking_errors()
                 e_y_val = abs(e_y) if e_y is not None else 0.0
+                e_theta_val = abs(e_theta) if e_theta is not None else 0.0
 
-                # 1. Need standoff clearance if too close to desk (< 35cm)
-                if self.desk_distance < 0.35:
+                # 1. Clearance Check: If too close (< 35cm) where marker starts clipping from FOV, back up to 52cm
+                if self.desk_distance < 0.35 and (e_y_val > 0.025 or e_theta_val > math.radians(3.0)):
+                    self.backup_reason = f"초기 위치 너무 가까움 ({self.desk_distance*100:.0f}cm < 35cm, 편차={e_y_val*100:.1f}cm)"
                     self.get_logger().info(
-                        f">>> [CHECK_STAGING] Clearance too tight ({self.desk_distance*100:.1f}cm < 35cm). "
-                        f"Backing up to 40cm optimal standoff..."
+                        f">>> [CHECK_STAGING] Distance too close ({self.desk_distance*100:.1f}cm < 35cm) for camera FOV. "
+                        f"Backing up to 52cm optimal long-range staging zone..."
                     )
                     self.transition_to('BACKUP_STANDOFF')
                     return
 
-                # 2. Too far (> 48cm), gently advance to 38-42cm zone
-                if self.desk_distance > 0.48:
-                    twist.linear.x = 0.04
-                    self.get_logger().info(f">>> Approaching staging zone ({self.desk_distance*100:.1f}cm)...", throttle_duration_sec=1.5)
-                    return
-
-                # 3. Optimal standoff distance secured (35cm ~ 48cm): Evaluate Lateral Offset (ey)
-                self.target_lateral_offset = e_y if e_y is not None else 0.0
-                curr_pose = self.get_robot_pose_in_map()
-                self.turn_start_yaw = curr_pose[2] if curr_pose is not None else 0.0
-
-                # Branch B: Large Lateral Offset (|ey| > 4.0cm) -> In-place 90 deg Turn & Cruise
-                if abs(self.target_lateral_offset) > 0.040:
-                    self.get_logger().info(
-                        f">>> [CASE B] Large lateral offset detected (ey={self.target_lateral_offset*100:+.1f}cm > 4.0cm). "
-                        f"Initiating In-place 90° Turn toward target object..."
-                    )
-                    self.transition_to('TURN_LATERAL')
-                    return
-
-                # Branch A: Small Lateral Offset (1.2cm < |ey| <= 4.0cm) -> Fine Carrot Alignment
-                elif abs(self.target_lateral_offset) > 0.012:
-                    self.get_logger().info(
-                        f">>> [CASE A] Small lateral offset detected (ey={self.target_lateral_offset*100:+.1f}cm <= 4.0cm). "
-                        f"Initiating Carrot-Point Pure Pursuit alignment..."
-                    )
-                    self.dual_align_stable_count = 0
-                    self.transition_to('CARROT_ALIGN')
-                    return
-
-                # Both aligned: |ey| <= 1.2cm -> Parallel Check or Direct Final Approach
-                else:
-                    if abs(e_theta) > math.radians(2.0):
-                        self.get_logger().info(f">>> Centerline matched (ey={self.target_lateral_offset*100:+.1f}cm). Aligning heading parallel...")
-                        self.dual_align_stable_count = 0
-                        self.transition_to('ALIGN_PARALLEL')
-                    else:
-                        self.get_logger().info(f">>> Center and heading fully aligned! Proceeding directly to FINAL_APPROACH.")
-                        self.transition_to('FINAL_APPROACH')
-                    return
+                # Route to STAGING_SETTLE to halt all motors and statically evaluate errors before aiming
+                self.transition_to('STAGING_SETTLE')
+                return
 
             else:
-                # Searching for desk
+                # Searching for target
                 elapsed = (now - self.state_start_time).nanoseconds / 1e9
-                if elapsed < 2.0:
-                    twist.linear.x = 0.0
-                elif elapsed < 25.0:
-                    twist.linear.x = 0.04
-                    self.get_logger().info(">>> Seeking desk edge... advancing forward at 4cm/s...", throttle_duration_sec=1.5)
-                else:
-                    self.get_logger().warn(">>> Cannot find desk edge after 25s search. Aborting to Nav2 mode...")
-                    self.transition_to('ABORT_TO_NAV2')
+                if elapsed > 3.0:
+                    self.transition_to('SEARCH_MARKER' if self.docking_mode == 'marker' else 'ABORT_TO_NAV2')
+                    return
 
         # ----------------------------------------------------------------------
-        # STATE: BACKUP_STANDOFF (Retreat to 40cm optimal standoff distance)
+        # STATE: STAGING_SETTLE (Stationary settling >= 1.2s to extinguish vibration and collect stable errors)
+        # ----------------------------------------------------------------------
+        elif self.state == 'STAGING_SETTLE':
+            twist.linear.x = 0.0
+            twist.angular.z = 0.0
+
+            elapsed = (now - self.state_start_time).nanoseconds / 1e9
+            if elapsed < 1.2:
+                self.get_logger().info(
+                    f">>> [STAGING_SETTLE] Stationary wait for chassis/camera vibration settling ({elapsed:.1f}s / 1.2s)...",
+                    throttle_duration_sec=0.3
+                )
+                return
+
+            e_x, e_y, e_theta = self.compute_docking_errors()
+            if e_y is not None and e_x is not None:
+                # --------------------------------------------------------------
+                # Calculate and Latch True Virtual Carrot Point Aiming Goal (1-Time)
+                # --------------------------------------------------------------
+                d_ref = max(0.10, e_x if e_x is not None else (self.desk_distance if self.desk_distance is not None else 0.45))
+                L = float(np.clip(0.60 * d_ref, 0.18, 0.28))
+
+                c_pt = self.get_carrot_point_in_base(L)
+                if c_pt is not None:
+                    c_x = float(c_pt[0])
+                    c_y = float(c_pt[1])
+                    dist_to_c = math.hypot(c_x, c_y)
+                    self.latched_aim_delta_yaw = math.atan2(c_y, max(0.05, c_x))
+                    self.carrot_x_b = c_x
+                    self.carrot_y_b = c_y
+                else:
+                    dist_to_c = max(0.15, d_ref - L)
+                    self.latched_aim_delta_yaw = math.atan2(e_y, dist_to_c)
+                    self.carrot_x_b = dist_to_c
+                    self.carrot_y_b = e_y
+
+                curr_yaw = self.get_robot_yaw()
+                if curr_yaw is not None:
+                    self.latched_aim_target_yaw = math.atan2(
+                        math.sin(curr_yaw + self.latched_aim_delta_yaw),
+                        math.cos(curr_yaw + self.latched_aim_delta_yaw)
+                    )
+                else:
+                    self.latched_aim_target_yaw = None
+
+                self.get_logger().info(
+                    f">>> [STAGING_SETTLE] Settling complete! Target Desk: dist={self.desk_distance*100:.1f}cm, ey={e_y*100:+.1f}cm, yaw={math.degrees(e_theta):+.1f}°. "
+                    f"Virtual Carrot: dist={dist_to_c*100:.1f}cm, Aim Delta: {math.degrees(self.latched_aim_delta_yaw):+.1f}°. "
+                    f"Transitioning to STAGING_AIM..."
+                )
+                self.transition_to('STAGING_AIM')
+                return
+            else:
+                if elapsed > 3.5:
+                    self.get_logger().warn(">>> [STAGING_SETTLE] Marker lost while settling. Transitioning to SEARCH_MARKER.")
+                    self.transition_to('SEARCH_MARKER')
+                    return
+
+        # ----------------------------------------------------------------------
+        # STATE: STAGING_AIM (Aim robot heading directly at CARROT POINT using IMU/Odom closed loop)
+        # ----------------------------------------------------------------------
+        elif self.state == 'STAGING_AIM':
+            twist.linear.x = 0.0  # In-place rotation only: no forward translation while aiming!
+
+            curr_yaw = self.get_robot_yaw()
+            elapsed = (now - self.state_start_time).nanoseconds / 1e9
+
+            # Determine remaining heading error to the LATCHED carrot point
+            if self.latched_aim_target_yaw is not None and curr_yaw is not None:
+                # IMU/Odom closed-loop: clean, zero-jitter relative angle
+                aim_err = math.atan2(
+                    math.sin(self.latched_aim_target_yaw - curr_yaw),
+                    math.cos(self.latched_aim_target_yaw - curr_yaw)
+                )
+            else:
+                # Fallback only if TF/Odom missing: compute live relative aim error to carrot
+                e_x, e_y, e_theta = self.compute_docking_errors()
+                if e_x is None or e_y is None:
+                    twist.angular.z = 0.0
+                    if elapsed > 2.5:
+                        self.transition_to('SEARCH_MARKER')
+                    return
+                d_ref = max(0.10, e_x if e_x is not None else 0.45)
+                L = float(np.clip(0.60 * d_ref, 0.18, 0.28))
+                c_pt = self.get_carrot_point_in_base(L)
+                if c_pt is not None:
+                    aim_err = math.atan2(float(c_pt[1]), max(0.05, float(c_pt[0])))
+                    self.carrot_x_b = float(c_pt[0])
+                    self.carrot_y_b = float(c_pt[1])
+                else:
+                    aim_err = math.atan2(e_y, max(0.15, d_ref - L))
+                    self.carrot_x_b = max(0.15, d_ref - L)
+                    self.carrot_y_b = e_y
+
+            # Aiming Tolerance Condition: Heading aligned to Carrot Point within 2.0 deg
+            if abs(aim_err) <= math.radians(2.0) or elapsed > 4.5:
+                self.stop_robot()
+                self.get_logger().info(
+                    f">>> [STAGING_AIM] Carrot point aiming completed! (aim_err={math.degrees(aim_err):+.1f}° <= 2.0°). "
+                    f"Initiating smooth CARROT_ALIGN approach!"
+                )
+                self.transition_to('CARROT_ALIGN')
+                return
+            else:
+                w_z = math.copysign(min(0.18, max(0.05, 0.70 * abs(aim_err))), aim_err)
+                twist.angular.z = float(w_z)
+                self.get_logger().info(
+                    f">>> [STAGING_AIM] In-place aiming at latched carrot: aim_err={math.degrees(aim_err):+.1f}°, wz={w_z:+.2f}rad/s ({elapsed:.1f}s/4.5s)",
+                    throttle_duration_sec=0.3
+                )
+
+        # ----------------------------------------------------------------------
+        # STATE: BACKUP_STANDOFF (Virtual Reverse Carrot: BACK_AIM -> BACK_REVERSE -> BACK_REALIGN)
+        # Closed-loop IMU/Wheel Odom ONLY; zero vision polling to eliminate sensor noise during maneuvers.
         # ----------------------------------------------------------------------
         elif self.state in ('BACKUP_STANDOFF', 'BACKUP_PREPARE', 'BACKUP_ALIGN_PREPARE'):
             elapsed = (now - self.state_start_time).nanoseconds / 1e9
-            twist.linear.x = -0.05  # -5 cm/s reverse
-            if (self.desk_distance is not None and self.desk_distance >= 0.40) or elapsed > 4.5:
-                self.get_logger().info(">>> Optimal 40cm standoff secured. Re-assessing staging...")
-                self.stop_robot()
-                self.transition_to('CHECK_STAGING')
-                return
 
-        # ======================================================================
-        # CASE B: Large Lateral Error Sequence (TURN_LATERAL -> LATERAL_CRUISE -> TURN_FACE_DESK)
-        # ======================================================================
-        # STATE: TURN_LATERAL (In-place 90 deg turn toward object direction)
-        # ----------------------------------------------------------------------
-        elif self.state == 'TURN_LATERAL':
-            twist.linear.x = 0.0  # Strict zero linear velocity
-            curr_pose = self.get_robot_pose_in_map()
-            if curr_pose is not None:
-                curr_yaw = curr_pose[2]
-                # If target is to left (ey > 0), turn CCW (+90 deg, +pi/2)
-                # If target is to right (ey < 0), turn CW (-90 deg, -pi/2)
-                target_yaw = self.turn_start_yaw + (math.pi / 2.0 if self.target_lateral_offset > 0 else -math.pi / 2.0)
-                yaw_err = math.atan2(math.sin(target_yaw - curr_yaw), math.cos(target_yaw - curr_yaw))
-
-                if abs(yaw_err) <= math.radians(2.5):
-                    self.stable_yaw_count += 1
-                    twist.angular.z = 0.0
-                    if self.stable_yaw_count >= 3:
-                        self.get_logger().info(f">>> [TURN_LATERAL] 90° Turn Complete! Heading aligned with desk lateral axis.")
-                        self.stop_robot()
-                        self.transition_to('LATERAL_CRUISE')
-                        return
+            # Phase 1: In-place pivot towards Reverse Virtual Carrot Point (Pure IMU/Odom Closed-Loop)
+            if self.backup_substate == 'BACK_AIM':
+                twist.linear.x = 0.0
+                curr_yaw = self.get_robot_yaw()
+                if self.reverse_latched_aim_yaw is not None and curr_yaw is not None:
+                    yaw_err = math.atan2(
+                        math.sin(self.reverse_latched_aim_yaw - curr_yaw),
+                        math.cos(self.reverse_latched_aim_yaw - curr_yaw)
+                    )
                 else:
-                    self.stable_yaw_count = 0
-                    w_z = math.copysign(min(0.25, max(0.06, 0.65 * abs(yaw_err))), yaw_err)
-                    twist.angular.z = float(w_z)
-            else:
-                # TF fallback: time-based turn ~ 0.20 rad/s * 7.85s = 1.57 rad
-                elapsed = (now - self.state_start_time).nanoseconds / 1e9
-                w_dir = 0.20 if self.target_lateral_offset > 0 else -0.20
-                twist.angular.z = w_dir
-                if elapsed >= 7.85:
+                    yaw_err = 0.0
+
+                if abs(yaw_err) <= math.radians(2.0) or elapsed > 2.5:
                     self.stop_robot()
-                    self.transition_to('LATERAL_CRUISE')
+                    odom_p = self.get_robot_pose_in_odom()
+                    self.reverse_start_odom_pose = odom_p if odom_p is not None else (0.0, 0.0, 0.0)
+                    self.backup_substate = 'BACK_REVERSE'
+                    self.state_start_time = now
+                    self.get_logger().info(
+                        f">>> [BACKUP_STANDOFF: BACK_AIM] Pivot complete (aim_err={math.degrees(yaw_err):+.1f}°). "
+                        f"Beginning straight reverse of {self.reverse_target_distance*100:.1f}cm..."
+                    )
                     return
-
-        # ----------------------------------------------------------------------
-        # STATE: LATERAL_CRUISE (Cruise along desk to eliminate lateral offset ey)
-        # ----------------------------------------------------------------------
-        elif self.state == 'LATERAL_CRUISE':
-            # Target translation distance = |target_lateral_offset|
-            dist_target = max(0.02, abs(self.target_lateral_offset))
-            curr_pose = self.get_robot_pose_in_map()
-
-            if self.lateral_start_pose is None and curr_pose is not None:
-                self.lateral_start_pose = (curr_pose[0], curr_pose[1])
-
-            if curr_pose is not None and self.lateral_start_pose is not None:
-                dx = curr_pose[0] - self.lateral_start_pose[0]
-                dy = curr_pose[1] - self.lateral_start_pose[1]
-                self.lateral_traveled = math.hypot(dx, dy)
-            else:
-                elapsed = (now - self.state_start_time).nanoseconds / 1e9
-                self.lateral_traveled = elapsed * 0.040
-
-            self.get_logger().info(
-                f">>> [LATERAL_CRUISE] Cruising toward object: traveled {self.lateral_traveled*100:.1f}cm / target {dist_target*100:.1f}cm...",
-                throttle_duration_sec=1.0
-            )
-
-            # Check termination: reached target distance (with 1.0cm margin)
-            if self.lateral_traveled >= (dist_target - 0.010):
-                self.get_logger().info(f">>> [LATERAL_CRUISE] Target displacement reached! Preparing to face desk...")
-                self.stop_robot()
-                self.transition_to('TURN_FACE_DESK')
-                return
-
-            twist.linear.x = 0.040  # 4 cm/s forward along desk edge
-            twist.angular.z = 0.0
-
-        # ----------------------------------------------------------------------
-        # STATE: TURN_FACE_DESK (Turn in-place 90 deg back to face desk front via Odometry)
-        # ----------------------------------------------------------------------
-        elif self.state == 'TURN_FACE_DESK':
-            twist.linear.x = 0.0  # Strict zero linear velocity
-            curr_pose = self.get_robot_pose_in_map()
-
-            if curr_pose is not None:
-                curr_yaw = curr_pose[2]
-                # Target yaw is the original frontal desk orientation saved at CHECK_STAGING
-                target_yaw = self.turn_start_yaw
-                yaw_err = math.atan2(math.sin(target_yaw - curr_yaw), math.cos(target_yaw - curr_yaw))
-
-                if abs(yaw_err) <= math.radians(2.5):
-                    self.stable_yaw_count += 1
-                    twist.angular.z = 0.0
-                    if self.stable_yaw_count >= 3:
-                        self.get_logger().info(
-                            f">>> [TURN_FACE_DESK] 90° Reverse Turn Complete! Re-faced desk front (yaw_err={math.degrees(yaw_err):+.1f}°). "
-                            f"Resuming camera perception and re-evaluating staging..."
-                        )
-                        self.stop_robot()
-                        self.reset_docking_variables()  # Clear stale depth data
-                        self.transition_to('CHECK_STAGING')
-                        return
                 else:
-                    self.stable_yaw_count = 0
-                    w_z = math.copysign(min(0.25, max(0.06, 0.65 * abs(yaw_err))), yaw_err)
+                    w_z = math.copysign(min(0.20, max(0.06, 0.70 * abs(yaw_err))), yaw_err)
                     twist.angular.z = float(w_z)
-            else:
-                # Time-based blind turn fallback: opposite to TURN_LATERAL
-                elapsed = (now - self.state_start_time).nanoseconds / 1e9
-                w_dir = -0.20 if self.target_lateral_offset > 0 else 0.20
-                twist.angular.z = w_dir
-                if elapsed >= 7.85:
-                    self.stop_robot()
-                    self.reset_docking_variables()
-                    self.transition_to('CHECK_STAGING')
-                    return
+                    self.get_logger().info(
+                        f">>> [BACKUP_STANDOFF: BACK_AIM] Pivoting to reverse carrot: yaw_err={math.degrees(yaw_err):+.1f}°, wz={w_z:+.2f}rad/s ({elapsed:.1f}s/2.5s)",
+                        throttle_duration_sec=0.4
+                    )
 
-        # ======================================================================
-        # CASE A: Small Lateral Error Sequence (CARROT_ALIGN -> ALIGN_PARALLEL)
-        # ======================================================================
-        # STATE: CARROT_ALIGN (Fine Carrot-Point Pure Pursuit without heading damping)
-        # ----------------------------------------------------------------------
-        elif self.state in ('CARROT_ALIGN', 'CARROT_PURSUIT_ALIGN', 'COARSE_APPROACH'):
-            if self.check_depth_timeout():
-                return
+            # Phase 2: Straight reverse along aimed vector using wheel odometry (No vision polling)
+            elif self.backup_substate == 'BACK_REVERSE':
+                twist.linear.x = -0.065  # -6.5 cm/s straight reverse
+                twist.angular.z = 0.0    # Pure straight trajectory
 
-            e_x, e_y, e_theta = self.compute_docking_errors()
-            if e_x is not None:
-                # Reach 12cm standoff from target (i.e. desk_dist <= 17cm)
-                if e_x <= 0.12 or (e_y is not None and abs(e_y) <= 0.010):
-                    ey_val_str = f"{e_y*100:+.1f}cm" if e_y is not None else "None"
-                    self.get_logger().info(f">>> [CARROT_ALIGN] Standoff reached (ex={e_x*100:.1f}cm, ey={ey_val_str}). Aligning parallel...")
-                    self.dual_align_stable_count = 0
-                    self.stop_robot()
-                    self.transition_to('ALIGN_PARALLEL')
-                    return
-
-                # Pure Pursuit toward Carrot Point along docking axis
-                L = 0.20  # 20cm lookahead
-                e_y_val = e_y if e_y is not None else 0.0
-                y_carrot = float(e_y_val * np.clip(L / max(e_x, 0.06), 0.35, 1.0))
-                x_carrot = float(L)
-                alpha = math.atan2(y_carrot, x_carrot)
-
-                v_x = 0.030  # 3 cm/s gentle advance
-                w_z = float(np.clip((2.0 * v_x * math.sin(alpha)) / L, -0.22, 0.22))
-
-                twist.linear.x = v_x
-                twist.angular.z = w_z
-                self.carrot_x_b = x_carrot
-                self.carrot_y_b = y_carrot
-
-        # ----------------------------------------------------------------------
-        # STATE: ALIGN_PARALLEL (In-place rotation to make desk edge strictly parallel)
-        # ----------------------------------------------------------------------
-        elif self.state in ('ALIGN_PARALLEL', 'FINE_APPROACH', 'VERIFY_DUAL_ALIGN'):
-            if self.check_depth_timeout() or self.check_contact_trigger():
-                return
-
-            twist.linear.x = 0.0  # Zero forward motion during in-place parallel alignment
-            e_x, e_y, e_theta = self.compute_docking_errors()
-
-            if e_theta is not None:
-                e_y_val = abs(e_y) if e_y is not None else 0.0
-                aligned = (abs(e_theta) <= math.radians(1.5)) and (e_y_val <= 0.018)
-
-                if aligned:
-                    self.dual_align_stable_count += 1
-                    twist.angular.z = 0.0
-                    if self.dual_align_stable_count >= self.dual_align_stable_required:
-                        self.get_logger().info(
-                            f">>> [ALIGN_PARALLEL] Both Center & Parallelism Verified! (ey={e_y*100:+.1f}cm, yaw={math.degrees(e_theta):+.1f}°). "
-                            f"Commencing FINAL_APPROACH."
-                        )
-                        self.stop_robot()
-                        self.transition_to('FINAL_APPROACH')
-                        return
+                curr_odom_p = self.get_robot_pose_in_odom()
+                if curr_odom_p is not None and self.reverse_start_odom_pose is not None:
+                    dist_traveled = math.hypot(
+                        curr_odom_p[0] - self.reverse_start_odom_pose[0],
+                        curr_odom_p[1] - self.reverse_start_odom_pose[1]
+                    )
                 else:
-                    self.dual_align_stable_count = 0
-                    w_z = -math.copysign(min(0.15, max(0.03, 0.40 * abs(e_theta))), e_theta)
-                    twist.angular.z = float(w_z)
+                    dist_traveled = 0.065 * elapsed  # Fallback dead reckoning
 
-            elapsed = (now - self.state_start_time).nanoseconds / 1e9
-            if elapsed > 8.0:
-                self.get_logger().warn(">>> Parallel alignment time limit (8s). Checking ey before final approach...")
-                if e_y is not None and abs(e_y) <= 0.025:
-                    self.transition_to('FINAL_APPROACH')
-                else:
-                    # Still misaligned: re-stage
-                    self.transition_to('CHECK_STAGING')
-                return
-
-        # ----------------------------------------------------------------------
-        # STATE: FINAL_APPROACH (Straight crawl, heading strictly locked)
-        # ----------------------------------------------------------------------
-        elif self.state in ('CRAWL_CONTACT', 'FINAL_APPROACH'):
-            # HARD GUARD: Do not allow final crawl if lateral offset is unacceptable (> 2.5cm)
-            e_x, e_y, e_theta = self.compute_docking_errors()
-            if e_y is not None and abs(e_y) > 0.025 and self.desk_distance is not None and self.desk_distance > 0.12:
-                self.get_logger().warn(f">>> [GUARD] Lateral offset ey={e_y*100:+.1f}cm exceeded 2.5cm in FINAL_APPROACH! Returning to CHECK_STAGING.")
-                self.stop_robot()
-                self.transition_to('CHECK_STAGING')
-                return
-
-            # 1. Primary Trigger: Physical Contact Switch (Micro Bumper) - Highest Reliability
-            if self.check_contact_trigger():
-                return
-
-            # 2. Secondary Trigger: Optical Clearance Fallback (5.0cm +- 2mm) with Travel Guard
-            if self.desk_distance is not None and self.desk_distance <= 0.052:
-                # Calculate actual forward movement since entering FINAL_APPROACH
-                curr_pose = self.get_robot_pose_in_map()
-                fwd_travel = 0.0
-                if curr_pose is not None and self.final_approach_start_pose is not None:
-                    fwd_travel = math.hypot(curr_pose[0] - self.final_approach_start_pose[0], curr_pose[1] - self.final_approach_start_pose[1])
-
-                dist_reduced = 0.0
-                if self.final_approach_start_dist is not None:
-                    dist_reduced = self.final_approach_start_dist - self.desk_distance
-
-                # Require either physical contact, actual forward progress (>=3.0cm), or confirmed approach
-                if self.contact_detected or fwd_travel >= 0.030 or dist_reduced >= 0.030:
-                    self.get_logger().info("========================================================")
-                    self.get_logger().info(f" ★ EXACT 5CM CLEARANCE REACHED (Clearance: {self.desk_distance*100:.1f}cm, Travel: {fwd_travel*100:.1f}cm)! ")
-                    self.get_logger().info(" ★ Single Bumper Flush with Desk Front!                ")
-                    self.get_logger().info(" ★ DOCKED STATE ACHIEVED! Full Motor Lock Engaged.     ")
-                    self.get_logger().info("========================================================")
+                # Complete reverse once target distance (~14cm) reached or safety timeout
+                if dist_traveled >= self.reverse_target_distance or elapsed > 3.2:
                     self.stop_robot()
-                    self.transition_to('DOCKED')
+                    self.backup_substate = 'BACK_REALIGN'
+                    self.state_start_time = now
+                    self.get_logger().info(
+                        f">>> [BACKUP_STANDOFF: BACK_REVERSE] Reverse complete (traveled={dist_traveled*100:.1f}cm). "
+                        f"Commencing BACK_REALIGN to face marker normal..."
+                    )
                     return
                 else:
                     self.get_logger().info(
-                        f">>> [FINAL_APPROACH] Optical dist={self.desk_distance*100:.1f}cm but bumper CLEAR & fwd_travel={fwd_travel*100:.1f}cm < 3cm. "
-                        f"Continuing crawl for physical bumper contact...",
-                        throttle_duration_sec=1.0
+                        f">>> [BACKUP_STANDOFF: BACK_REVERSE] Reversing: traveled={dist_traveled*100:.1f}cm / {self.reverse_target_distance*100:.1f}cm ({elapsed:.1f}s)",
+                        throttle_duration_sec=0.5
                     )
 
-            # 3. Tertiary Trigger: Forward Progress Stall
-            if self.desk_distance is not None and self.desk_distance <= 0.075:
-                if self._stall_check_dist is None:
-                    self._stall_check_dist = self.desk_distance
-                    self._stall_start_time = now
+            # Phase 3: In-place pivot back to face marker normal axis (Pure IMU/Odom Closed-Loop)
+            elif self.backup_substate == 'BACK_REALIGN':
+                twist.linear.x = 0.0
+                curr_yaw = self.get_robot_yaw()
+                if self.reverse_latched_origin_yaw is not None and curr_yaw is not None:
+                    realign_err = math.atan2(
+                        math.sin(self.reverse_latched_origin_yaw - curr_yaw),
+                        math.cos(self.reverse_latched_origin_yaw - curr_yaw)
+                    )
                 else:
-                    dist_diff = abs(self.desk_distance - self._stall_check_dist)
-                    if dist_diff < 0.003:
-                        stall_duration = (now - self._stall_start_time).nanoseconds / 1e9
-                        if stall_duration > 1.0:
-                            self.get_logger().info("========================================================")
-                            self.get_logger().info(f" ★ PHYSICAL CONTACT CONFIRMED BY STALL (Clearance: {self.desk_distance*100:.1f}cm)! ")
-                            self.get_logger().info(" ★ Robot firmly docked against desk surface.            ")
-                            self.get_logger().info(" ★ DOCKED STATE ACHIEVED! Full Motor Lock Engaged.     ")
-                            self.get_logger().info("========================================================")
-                            self.stop_robot()
-                            self.transition_to('DOCKED')
-                            return
-                    else:
-                        self._stall_check_dist = self.desk_distance
-                        self._stall_start_time = now
-            else:
-                self._stall_check_dist = None
-                self._stall_start_time = None
+                    realign_err = 0.0
 
-            # Straight crawl (2.0 cm/s), heading strictly locked
-            twist.linear.x = 0.020
-            twist.angular.z = 0.0
+                if abs(realign_err) <= math.radians(2.0) or elapsed > 2.5:
+                    self.stop_robot()
+                    self.get_logger().info(
+                        f">>> [BACKUP_STANDOFF: BACK_REALIGN] Realign complete (err={math.degrees(realign_err):+.1f}°). "
+                        f"Staging zone reached. Transitioning to STAGING_SETTLE for static evaluation..."
+                    )
+                    self.transition_to('STAGING_SETTLE')
+                    return
+                else:
+                    w_z = math.copysign(min(0.20, max(0.06, 0.70 * abs(realign_err))), realign_err)
+                    twist.angular.z = float(w_z)
+                    self.get_logger().info(
+                        f">>> [BACKUP_STANDOFF: BACK_REALIGN] Realigning to front normal: err={math.degrees(realign_err):+.1f}°, wz={w_z:+.2f}rad/s ({elapsed:.1f}s/2.5s)",
+                        throttle_duration_sec=0.4
+                    )
+
+        # ======================================================================
+        # STATE: CARROT_ALIGN (Continuous Adaptive Pure Pursuit & Heading Alignment)
+        # ======================================================================
+        elif self.state == 'CARROT_ALIGN':
+            # Safety contact check: immediate stop if bumper clicks during approach
+            if self.check_contact_trigger():
+                return
+            if self.check_sensor_timeout():
+                return
+
+            e_x, e_y, e_theta = self.compute_docking_errors()
+            if e_x is not None and e_y is not None:
+                # ------------------------------------------------------------------
+                # Case 1 Failure Guard: Dynamic Centerline Deviation Divergence
+                # - Allow 3.0s grace period for initial differential-drive pivot & transient response.
+                # - Allow max(15cm, initial_ey + 6cm) buffer so natural S-curve pivot is not aborted.
+                # ------------------------------------------------------------------
+                if self.initial_ey is None:
+                    self.initial_ey = abs(e_y)
+
+                elapsed = (now - self.state_start_time).nanoseconds / 1e9
+                ey_diverge_threshold = max(0.180, self.initial_ey + 0.080)
+                if elapsed > 4.0 and abs(e_y) > ey_diverge_threshold:
+                    self.backup_reason = f"중심선 편차 발산 (현재:{e_y*100:+.1f}cm > 한계:{ey_diverge_threshold*100:.1f}cm)"
+                    self.get_logger().warn(
+                        f">>> [CASE 1] {self.backup_reason}. Aborting carrot alignment, retreating to standoff..."
+                    )
+                    self.stop_robot()
+                    self.transition_to('BACKUP_STANDOFF')
+                    return
+
+                # ------------------------------------------------------------------
+                # Case 2 Failure Guard: Blind Odom Pursuit Timeout (> 8.0s)
+                # ------------------------------------------------------------------
+                if self.odom_tracking_active and self.odom_blind_start_time is not None:
+                    blind_elapsed = time.time() - self.odom_blind_start_time
+                    if blind_elapsed > 8.0:
+                        self.backup_reason = f"시각 메모리 블라인드 주행 시간 초과 ({blind_elapsed:.1f}s > 8.0s)"
+                        self.get_logger().warn(
+                            f">>> [CASE 2] {self.backup_reason}. Marker not re-acquired. Initiating SEARCH_MARKER visual sweep..."
+                        )
+                        self.stop_robot()
+                        self.transition_to('SEARCH_MARKER')
+                        return
+
+                # ------------------------------------------------------------------
+                # ------------------------------------------------------------------
+                # 2. Standoff Zone Reached Gate (Elastic 33cm ~ 38cm):
+                # If already well centered (|ey| <= 2.5cm and |e_theta| <= 4.0 deg) at <= 38cm, halt immediately!
+                # If still converging (|ey| > 2.5cm), allow gentle crawling down to 33cm to finish S-curve!
+                # ------------------------------------------------------------------
+                # 2. Standoff Zone Reached Gate (<= 38cm):
+                # Completely halt forward motion and enter STANDOFF_SETTLE for static evaluation & in-place facing
+                # ------------------------------------------------------------------
+                if self.desk_distance is not None and self.desk_distance <= 0.38:
+                    self.get_logger().info(
+                        f">>> [CARROT_ALIGN] Standoff zone reached ({self.desk_distance*100:.1f}cm <= 38cm). "
+                        f"Halting forward motion and transitioning to STANDOFF_SETTLE for static evaluation..."
+                    )
+                    self.stop_robot()
+                    self.dual_align_stable_count = 0
+                    self.transition_to('STANDOFF_SETTLE')
+                    return
+
+                # 3. Adaptive Lookahead (True 3D Virtual Carrot Waypoint)
+                d_ref = max(0.10, e_x if e_x is not None else (self.desk_distance if self.desk_distance is not None else 0.40))
+                L = float(np.clip(0.60 * d_ref, 0.14, 0.28))
+
+                c_pt = self.get_carrot_point_in_base(L)
+                if c_pt is not None:
+                    c_x = float(c_pt[0])
+                    c_y = float(c_pt[1])
+                    dist_carrot = math.hypot(c_x, c_y)
+                    alpha_carrot = math.atan2(c_y, max(0.05, c_x))
+                    self.carrot_x_b = c_x
+                    self.carrot_y_b = c_y
+                else:
+                    dist_carrot = max(0.15, d_ref - L)
+                    alpha_carrot = math.atan2(e_y, dist_carrot)
+                    self.carrot_x_b = dist_carrot
+                    self.carrot_y_b = e_y
+
+                # 4. Decoupled Velocity & Steering Control (Pure Pursuit on Virtual Carrot)
+                # A. Distance-to-Carrot Smoothstep Deceleration Profile (5.0 cm/s initial -> 2.5 cm/s near carrot)
+                v_init = 0.050   # 5.0 cm/s initial cruise speed along straight corridor
+                v_final = 0.025  # 2.5 cm/s gentle arrival speed as carrot point is reached
+                ratio = float(np.clip((dist_carrot - 0.15) / (0.40 - 0.15), 0.0, 1.0))
+                smooth_s = ratio * ratio * (3.0 - 2.0 * ratio)  # S-curve smoothstep weight
+                v_x = float(v_final + (v_init - v_final) * smooth_s)
+
+                # B. Pure Pursuit steering directly targeting the Virtual Carrot Waypoint
+                omega_pp = (2.0 * v_x * math.sin(alpha_carrot)) / max(0.15, dist_carrot)
+                w_z = float(np.clip(omega_pp, -0.22, 0.22))
+
+                twist.linear.x = v_x
+                twist.angular.z = w_z
+                self.get_logger().info(
+                    f">>> [CARROT_ALIGN] Tracking CARROT | Carrot: d={dist_carrot*100:.1f}cm, aim={math.degrees(alpha_carrot):+.1f}° | "
+                    f"Target Desk: d={self.desk_distance*100:.1f}cm, ey={e_y*100:+.1f}cm, yaw={math.degrees(e_theta):+.1f}°, "
+                    f"vx={v_x*100:.1f}cm/s, wz={w_z:+.2f}rad/s",
+                    throttle_duration_sec=0.8
+                )
+            else:
+                # Marker momentarily lost while in CARROT_ALIGN:
+                # If already close (<= 33cm) and was well centered, commence CRAWL_CONTACT
+                if self.desk_distance is not None and self.desk_distance <= 0.33 and abs(self.target_lateral_offset) <= 0.025:
+                    self.get_logger().info(">>> [CARROT_ALIGN] Standoff reached (<=33cm) and centered. Locking heading and commencing CRAWL_CONTACT.")
+                    self.locked_docking_yaw = self.get_robot_yaw()
+                    self.transition_to('CRAWL_CONTACT')
+                    return
+                else:
+                    elapsed = (now - self.state_start_time).nanoseconds / 1e9
+                    if elapsed > 2.5:
+                        self.get_logger().warn(">>> [CARROT_ALIGN] Target lost at standoff without odom latch. Transitioning to SEARCH_MARKER.")
+                        self.transition_to('SEARCH_MARKER')
+                        return
+
+        # ----------------------------------------------------------------------
+        # STATE: STANDOFF_SETTLE (Step 1: Fine Rotate to Marker Normal -> Step 2: Static Halt & Evaluate Errors)
+        # ----------------------------------------------------------------------
+        elif self.state == 'STANDOFF_SETTLE':
+            if self.check_sensor_timeout() or self.check_contact_trigger():
+                return
+
+            elapsed = (now - self.state_start_time).nanoseconds / 1e9
+            twist.linear.x = 0.0  # Zero forward velocity: completely halted
+
+            e_x, e_y, e_theta = self.compute_docking_errors()
+            if e_theta is None or e_y is None:
+                twist.angular.z = 0.0
+                if elapsed > 3.5:
+                    self.backup_reason = "스탠드오프 정지 계측 중 마커 미감지"
+                    self.get_logger().warn(">>> [STANDOFF_SETTLE] Marker lost while settling. Transitioning to SEARCH_MARKER.")
+                    self.transition_to('SEARCH_MARKER')
+                return
+
+            # Step 1: In-place fine rotation to bring camera directly facing marker normal (|e_theta| <= 3.5 deg)
+            # BEFORE evaluating lateral error, we must align heading so camera lever-arm distortion is eliminated!
+            if self.settle_substate == 'FINE_ROTATE':
+                rotate_elapsed = (now - self.settle_rotate_start_time).nanoseconds / 1e9 if self.settle_rotate_start_time else elapsed
+                if abs(e_theta) > math.radians(3.5) and rotate_elapsed < 4.5:
+                    w_z = math.copysign(min(0.18, max(0.05, 0.60 * abs(e_theta))), e_theta)
+                    twist.angular.z = float(w_z)
+                    self.settle_stop_start_time = None
+                    self.get_logger().info(
+                        f">>> [STANDOFF_SETTLE] Fine rotating heading to marker normal: yaw_err={math.degrees(e_theta):+.1f}°, wz={w_z:+.2f}rad/s ({rotate_elapsed:.1f}s/4.5s)",
+                        throttle_duration_sec=0.4
+                    )
+                else:
+                    # Heading aligned within 3.5 deg (or 4.5s budget reached) -> Full Stop and begin STATIC_WAIT
+                    twist.angular.z = 0.0
+                    self.stop_robot()
+                    self.settle_substate = 'STATIC_WAIT'
+                    self.settle_stop_start_time = now
+                    self.dual_align_stable_count = 0
+                    self.get_logger().info(">>> [STANDOFF_SETTLE] Heading rotation finished. Halting all motors for 1.0s vibration settling & static evaluation...")
+                    return
+
+            # Step 2: Stationary pause (>=1.0s) + Extended Static Verification Window (up to 4.5s)
+            elif self.settle_substate == 'STATIC_WAIT':
+                twist.angular.z = 0.0
+                twist.linear.x = 0.0
+
+                if self.settle_stop_start_time is None:
+                    self.settle_stop_start_time = now
+                    return
+
+                stopped_elapsed = (now - self.settle_stop_start_time).nanoseconds / 1e9
+
+                # Mandatory stationary pause of at least 1.0 full second for camera/chassis settling
+                if stopped_elapsed < 1.0:
+                    self.get_logger().info(
+                        f">>> [STANDOFF_SETTLE] Stationary wait for rotation settling ({stopped_elapsed:.1f}s / 1.0s)...",
+                        throttle_duration_sec=0.3
+                    )
+                    return
+
+                # Statically evaluate error after >= 1.0s complete standstill with robot facing marker
+                aligned_ok = (abs(e_y) <= 0.028 and abs(e_theta) <= math.radians(3.5))
+                if aligned_ok:
+                    self.dual_align_stable_count += 1
+                    if self.dual_align_stable_count >= 3:
+                        self.locked_docking_yaw = self.get_robot_yaw()
+                        self.get_logger().info(
+                            f">>> [STANDOFF_SETTLE] Statically verified after {stopped_elapsed:.1f}s stationary evaluation! "
+                            f"(ey={e_y*100:+.1f}cm <= 2.8cm, yaw={math.degrees(e_theta):+.1f}° <= 3.5°). "
+                            f"Commencing terminal CRAWL_CONTACT."
+                        )
+                        self.stop_robot()
+                        self.transition_to('CRAWL_CONTACT')
+                        return
+                else:
+                    self.dual_align_stable_count = 0
+
+                # Generous evaluation window: Only abort after 4.5s standstill without passing consistency
+                if stopped_elapsed > 4.5:
+                    self.backup_reason = f"정지 계측(4.5초간 계측) 오차 초과 (ey={e_y*100:+.1f}cm > 2.8cm, yaw={math.degrees(e_theta):+.1f}° > 3.5°)"
+                    self.get_logger().warn(f">>> [STANDOFF_SETTLE] {self.backup_reason}. Backing up to standoff...")
+                    self.stop_robot()
+                    self.transition_to('BACKUP_STANDOFF')
+                    return
+
+        # ----------------------------------------------------------------------
+        # STATE: CRAWL_CONTACT (Terminal crawl with IMU heading lock & micro-switch bumper)
+        # ----------------------------------------------------------------------
+        elif self.state == 'CRAWL_CONTACT':
+            # 1. Exclusive Trigger: Physical Contact Micro-Switch Bumper
+            if self.check_contact_trigger():
+                return
+
+            # 2. Case 4 Failure Guard: Timeout (12.0s) without physical bumper contact -> BACKUP_RETRY
+            # (Note: From 38cm standoff to 12cm bumper touch = 26cm forward travel. At 4.5cm/s, travel takes ~5.8s. 12.0s provides safe margin)
+            elapsed = (now - self.state_start_time).nanoseconds / 1e9
+            if elapsed > 12.0:
+                self.backup_reason = "최종 접근 12.0초 동안 범퍼 미접촉 (타임아웃)"
+                self.get_logger().warn(">>> [CASE 4] Terminal crawl timeout (12.0s) without bumper contact. Initiating BACKUP_RETRY...")
+                self.transition_to('BACKUP_RETRY')
+                return
+
+            # 4. Gyro Heading Lock Straight Crawl: drive forward holding locked_docking_yaw
+            twist.linear.x = max(0.045, self.min_crawl_speed)
+            curr_yaw = self.get_robot_yaw()
+            if curr_yaw is not None and self.locked_docking_yaw is not None:
+                yaw_diff = math.atan2(math.sin(self.locked_docking_yaw - curr_yaw), math.cos(self.locked_docking_yaw - curr_yaw))
+                twist.angular.z = float(np.clip(1.2 * yaw_diff, -0.12, 0.12))
+            else:
+                twist.angular.z = 0.0
+
+            dist_str = f"{self.desk_distance*100:.1f}cm" if self.desk_distance is not None else "blind"
+            self.get_logger().info(
+                f">>> [CRAWL_CONTACT] Crawling to bumper touch (dist={dist_str}, vx={twist.linear.x:.2f}m/s, wz={twist.angular.z:.2f}rad/s)...",
+                throttle_duration_sec=1.0
+            )
+
+        # ----------------------------------------------------------------------
+        # STATE: BACKUP_RETRY (Reverse 12.5cm [cut in half], increment retry counter, re-approach)
+        # ----------------------------------------------------------------------
+        elif self.state == 'BACKUP_RETRY':
+            elapsed = (now - self.state_start_time).nanoseconds / 1e9
+            # Reverse at -0.05m/s for 2.5s (total 12.5cm, cut in half from 25cm)
+            if elapsed < 2.5:
+                twist.linear.x = -0.05
+                twist.angular.z = 0.0
+            else:
+                self.stop_robot()
+                self.retry_count += 1
+                if self.retry_count <= self.max_retries:
+                    self.get_logger().info(f">>> [RETRY] Half-backup complete (12.5cm). Attempting re-approach (Retry {self.retry_count}/{self.max_retries})...")
+                    self.transition_to('CHECK_STAGING')
+                else:
+                    self.get_logger().error(f">>> [FAILED] Exceeded maximum retries ({self.max_retries}). Aborting to Nav2 mode...")
+                    self.transition_to('ABORT_TO_NAV2')
+                return
 
         # ----------------------------------------------------------------------
         # STATE: DOCKED
         # ----------------------------------------------------------------------
         elif self.state == 'DOCKED':
-            # Complete Zero-Velocity Lock
             twist.linear.x = 0.0
             twist.angular.z = 0.0
 
         # ----------------------------------------------------------------------
-        # STATE: UNDOCKING (Safely backup 15cm from desk before returning to Nav2)
+        # ----------------------------------------------------------------------
+        # STATE: UNDOCKING
         # ----------------------------------------------------------------------
         elif self.state == 'UNDOCKING':
             elapsed = (now - self.state_start_time).nanoseconds / 1e9
-            if elapsed < 3.0:
-                twist.linear.x = -0.05
+            if elapsed < 2.4:
+                twist.linear.x = -0.10  # Firm reverse 24cm at -0.10 m/s
                 twist.angular.z = 0.0
             else:
-                twist.linear.x = 0.0
-                twist.angular.z = 0.0
-                self.cmd_vel_pub.publish(twist)
-                self.get_logger().info(">>> Safely backed up 15cm from desk. Switching camera mode to NAV2...")
+                self.stop_robot()
                 self.transition_to('NAV2_READY')
                 return
 
         # ----------------------------------------------------------------------
-        # STATE: ABORT_TO_NAV2 (Safely retreat 24cm from desk, restore Nav2)
+        # STATE: ABORT_TO_NAV2
         # ----------------------------------------------------------------------
         elif self.state == 'ABORT_TO_NAV2':
             elapsed = (now - self.state_start_time).nanoseconds / 1e9
-            if elapsed < 4.0:
-                twist.linear.x = -0.06  # Safe reverse at 6 cm/s (total 24cm)
+            if elapsed < 2.4:
+                twist.linear.x = -0.10  # Firm reverse 24cm at -0.10 m/s
                 twist.angular.z = 0.0
             else:
-                twist.linear.x = 0.0
-                twist.angular.z = 0.0
-                self.cmd_vel_pub.publish(twist)
-                self.get_logger().info(">>> Abort retreat complete. Switching camera mode to NAV2...")
+                self.stop_robot()
                 self.transition_to('NAV2_READY')
                 return
 
         # ----------------------------------------------------------------------
-        # STATE: NAV2_READY (Idle state allowing user Nav2 2D goal navigation)
+        # STATE: NAV2_READY & FAILSAFE
         # ----------------------------------------------------------------------
-        elif self.state == 'NAV2_READY':
-            # Precision approacher yields full control of /cmd_vel to Nav2
+        elif self.state in ('NAV2_READY', 'FAILSAFE'):
             return
 
-        # ----------------------------------------------------------------------
-        # STATE: FAILSAFE
-        # ----------------------------------------------------------------------
-        elif self.state == 'FAILSAFE':
-            twist.linear.x = 0.0
-            twist.angular.z = 0.0
-
         if self.state not in ('WAIT_NAV2', 'NAV2_READY'):
-            self.cmd_vel_pub.publish(twist)
+            self.send_cmd_vel(twist)
 
     # ==========================================================================
-    # Helper Functions & Guard Conditions
+    # Visual HUD Overlay & Debug Image Publisher
     # ==========================================================================
-    def reset_docking_variables(self):
-        """Resets all transient docking variables for a fresh approach sequence."""
-        self.desk_distance = None
-        self.desk_yaw_error = None
-        self.last_depth_time = None
-        self.contact_detected = False
-        self.contact_duration_start = None
-        self.align_stable_count = 0
-        self.dual_align_stable_count = 0
-        self.retry_count = 0
-        self.nav2_finished = False
-        self.nav2_success = False
-        self.docking_routine_start_time = None
-        self.target_obj = TargetObject()
-        self.target_u_c = None
-        self.target_v_c = None
-        self.target_bbox = None
-        self.carrot_x_b = None
-        self.carrot_y_b = None
-        self._stall_check_dist = None
-        self._stall_start_time = None
-        self.target_lateral_offset = 0.0
-        self.turn_start_yaw = 0.0
-        self.target_turn_angle = 0.0
-        self.lateral_start_pose = None
-        self.lateral_traveled = 0.0
-        self.stable_yaw_count = 0
-        self.in_place_turn_dir = 1.0
+    def render_and_publish_diagnostic_screen(self):
+        """Publishes an informative diagnostic screen to /docking/debug_image when camera feed is not yet active."""
+        if not self.publish_debug_img:
+            return
+        self._debug_img_counter += 1
+        # Publish at ~4Hz (every 5 ticks of 20Hz control loop)
+        if (self._debug_img_counter % 5) != 0:
+            return
 
-    def stop_robot(self):
-        """Immediately commands zero velocity to prevent robot inertia drift."""
-        twist = Twist()
-        twist.linear.x = 0.0
-        twist.angular.z = 0.0
-        for _ in range(3):
-            self.cmd_vel_pub.publish(twist)
+        vis = np.zeros((480, 640, 3), dtype=np.uint8)
+        vis[:] = (22, 26, 32)
 
+        # Top Banner
+        cv2.rectangle(vis, (0, 0), (640, 80), (15, 18, 22), -1)
+        cv2.line(vis, (0, 80), (640, 80), (55, 65, 75), 1)
+
+        state_col = (255, 255, 0) if self.calibration_mode else (0, 255, 255)
+        calib_tag = "[PASSIVE]" if self.calibration_mode else ""
+        cv2.putText(vis, f"STATE: {self.state} {calib_tag}",
+                    (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.52, state_col, 2, cv2.LINE_AA)
+
+        bumper_str = "BUMPER: [ CONTACT! ]" if self.contact_detected else "BUMPER: [ CLEAR ]"
+        bumper_col = (0, 0, 255) if self.contact_detected else (180, 180, 180)
+        cv2.putText(vis, bumper_str, (430, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.48, bumper_col, 2 if self.contact_detected else 1, cv2.LINE_AA)
+
+        # Central Diagnostic Box
+        cv2.rectangle(vis, (40, 110), (600, 390), (30, 36, 45), -1)
+        cv2.rectangle(vis, (40, 110), (600, 390), (0, 180, 255), 2)
+
+        cv2.putText(vis, "WAITING FOR CAMERA STREAM...", (85, 160),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 220, 255), 2, cv2.LINE_AA)
+
+        cv2.putText(vis, f"Subscribed Topic: {self.color_topic}", (65, 215),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (230, 230, 230), 1, cv2.LINE_AA)
+
+        cv2.putText(vis, "Next Step on Raspberry Pi:", (65, 265),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (100, 255, 150), 1, cv2.LINE_AA)
+        cv2.putText(vis, "1. Open a new terminal on Pi: ssh user@192.168.0.148", (80, 300),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+        cv2.putText(vis, "2. Launch Astra S camera driver: bash ~/run_astra.sh", (80, 335),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 1, cv2.LINE_AA)
+
+        cv2.putText(vis, f"Target Marker: ArUco DICT_4X4_50 | ID: {self.marker_id} ({self.marker_size*1000:.0f}mm)",
+                    (65, 370), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (170, 180, 190), 1, cv2.LINE_AA)
+
+        # Bottom Bar
+        cv2.putText(vis, "Precision Marker Docking System v2.0 - Active Watchdog", (15, 460),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (110, 120, 130), 1, cv2.LINE_AA)
+
+        try:
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+            succ, enc_img = cv2.imencode('.jpg', vis, encode_param)
+            if succ:
+                comp_msg = CompressedImage()
+                comp_msg.header.stamp = self.get_clock().now().to_msg()
+                comp_msg.header.frame_id = 'camera_color_optical_frame'
+                comp_msg.format = 'jpeg'
+                comp_msg.data = enc_img.tobytes()
+                self.vis_comp_pub.publish(comp_msg)
+
+            msg_out = self.bridge.cv2_to_imgmsg(vis, encoding='bgr8')
+            msg_out.header.stamp = self.get_clock().now().to_msg()
+            msg_out.header.frame_id = 'camera_color_optical_frame'
+            self.vis_pub.publish(msg_out)
+        except Exception:
+            pass
+
+    def render_and_publish_visualization(self, color_img, corners_img, rvec, tvec, depth_m=None):
+        try:
+            if color_img is not None:
+                vis = color_img.copy()
+            elif depth_m is not None:
+                d_vis = np.nan_to_num(depth_m, nan=0.0, posinf=0.0, neginf=0.0)
+                d_norm = cv2.normalize(d_vis, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                vis = cv2.applyColorMap(d_norm, cv2.COLORMAP_TURBO)
+            else:
+                vis = np.zeros((480, 640, 3), dtype=np.uint8)
+
+            vis_h, vis_w = vis.shape[:2]
+
+            # 1. Draw ArUco 2D Bounding Boxes & 3D Frame Axes for all tracked markers
+            if hasattr(self, 'tracked_markers') and len(self.tracked_markers) > 0:
+                for mid, mdata in self.tracked_markers.items():
+                    c_pts = mdata['corners'].astype(np.int32)
+                    cv2.polylines(vis, [c_pts], True, (0, 255, 0), 2, cv2.LINE_AA)
+                    center_2d = np.mean(c_pts, axis=0).astype(int)
+                    cv2.circle(vis, tuple(center_2d), 4, (0, 255, 255), -1, cv2.LINE_AA)
+                    cv2.putText(vis, f"ID:{mid}", (int(c_pts[0][0]), max(14, int(c_pts[0][1]) - 4)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 0), 1, cv2.LINE_AA)
+                    if mdata['rvec'] is not None and mdata['tvec'] is not None:
+                        cv2.drawFrameAxes(vis, self.camera_matrix, self.dist_coeffs, mdata['rvec'], mdata['tvec'], 0.035)
+
+                # If dual markers active, draw connecting baseline & box center
+                if len(self.tracked_markers) >= 2:
+                    active_mids = list(self.tracked_markers.keys())
+                    active_mids.sort(key=lambda m: self.tracked_markers[m]['tvec'][0][0])
+                    left_c = np.mean(self.tracked_markers[active_mids[0]]['corners'], axis=0).astype(int)
+                    right_c = np.mean(self.tracked_markers[active_mids[-1]]['corners'], axis=0).astype(int)
+                    cv2.line(vis, tuple(left_c), tuple(right_c), (0, 200, 255), 2, cv2.LINE_AA)
+                    mid_c = ((left_c + right_c) // 2)
+                    cv2.circle(vis, tuple(mid_c), 5, (0, 0, 255), -1, cv2.LINE_AA)
+            elif corners_img is not None:
+                pts = corners_img.astype(np.int32)
+                cv2.polylines(vis, [pts], True, (0, 255, 0), 2, cv2.LINE_AA)
+                center_2d = np.mean(pts, axis=0).astype(int)
+                cv2.circle(vis, tuple(center_2d), 4, (0, 0, 255), -1, cv2.LINE_AA)
+                if rvec is not None and tvec is not None:
+                    cv2.drawFrameAxes(vis, self.camera_matrix, self.dist_coeffs, rvec, tvec, 0.04)
+
+            # Draw Depth Plane Sampling ROI if active
+            if self.plane_roi_rect is not None and self.plane_fit_source.startswith("DEP"):
+                u1, v1, u2, v2 = self.plane_roi_rect
+                cv2.rectangle(vis, (u1, v1), (u2, v2), (0, 220, 255), 1)
+                cv2.putText(vis, f"PLANE ROI ({self.plane_fit_points}pts)", (u1, max(14, v1 - 4)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.30, (0, 220, 255), 1, cv2.LINE_AA)
+
+            # 2. Top Dashboard Banner (Ultra-clean non-overlapping layout for 320x240 & 640x480)
+            hud_h = 58
+            cv2.rectangle(vis, (0, 0), (vis_w, hud_h), (16, 18, 22), -1)
+            cv2.line(vis, (0, hud_h), (vis_w, hud_h), (45, 55, 65), 1)
+
+            # State color coding
+            state_color = (0, 255, 255)
+            if self.calibration_mode:
+                state_color = (255, 255, 0)
+            elif self.state == 'NAV2_READY':
+                state_color = (100, 255, 120)
+            elif self.state == 'DOCKED':
+                state_color = (0, 255, 0)
+            elif 'CRAWL' in self.state or 'FINAL' in self.state:
+                state_color = (0, 165, 255)
+            elif 'ABORT' in self.state or 'RETRY' in self.state:
+                state_color = (0, 100, 255)
+
+            # --- ROW 1 (Y=16): State & Mode Badge ---
+            state_str = f"STATE: {self.state}"
+            if self.docking_routine_start_time is not None and self.state not in ('NAV2_READY', 'DOCKED'):
+                elapsed = (self.get_clock().now() - self.docking_routine_start_time).nanoseconds / 1e9
+                rem = max(0.0, self.docking_timeout_sec - elapsed)
+                state_str += f" [{rem:2.0f}s]"
+            cv2.putText(vis, state_str, (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.38, state_color, 1, cv2.LINE_AA)
+
+            # Right: Mode Badge Box (Top Right, Y=3~18)
+            if "DEPTH" in self.docking_alignment_mode:
+                b_txt = "ASTRA DEPTH"
+                b_col = (255, 220, 0)      # Cyan in BGR
+                b_bg = (45, 28, 6)
+            elif "RGB" in self.docking_alignment_mode:
+                b_txt = "RGB OPTICAL"
+                b_col = (0, 255, 100)      # Green in BGR
+                b_bg = (10, 38, 15)
+            elif self.odom_tracking_active:
+                b_txt = "ODOM TRACK"
+                b_col = (255, 160, 50)     # Sky Blue in BGR
+                b_bg = (38, 20, 10)
+            else:
+                b_txt = "SEARCHING"
+                b_col = (180, 180, 180)
+                b_bg = (30, 30, 30)
+
+            bw = 88 if vis_w <= 360 else 105
+            bx1 = vis_w - bw - 4
+            cv2.rectangle(vis, (bx1, 3), (vis_w - 4, 18), b_bg, -1)
+            cv2.rectangle(vis, (bx1, 3), (vis_w - 4, 18), b_col, 1)
+            cv2.putText(vis, b_txt, (bx1 + 5, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.32, b_col, 1, cv2.LINE_AA)
+
+            # --- ROW 2 (Y=33): Tracking Info & Bumper ---
+            if self.desk_distance is not None:
+                dist_cm = self.desk_distance * 100.0
+                if self.state in ('STAGING_AIM', 'CARROT_ALIGN') and self.carrot_y_b is not None:
+                    aim_deg = math.degrees(math.atan2(self.carrot_y_b, max(0.05, getattr(self, 'carrot_x_b', 0.20))))
+                    target_info = f"TRACK: CARROT (aim:{aim_deg:+2.0f}deg)"
+                    t_col = (0, 165, 255)  # Orange
+                elif self.state in ('STANDOFF_SETTLE', 'FINAL_APPROACH', 'CRAWL_CONTACT'):
+                    target_info = f"TRACK: DOCK (clear:{self.target_clearance*100:.0f}cm)"
+                    t_col = (0, 255, 0)    # Green
+                elif 'BACKUP' in self.state:
+                    target_info = f"TRACK: REV_CARROT ({self.backup_substate})"
+                    t_col = (255, 100, 200)  # Pink
+                else:
+                    target_info = f"TRACK: TARGET ({dist_cm:4.1f}cm)"
+                    t_col = (210, 215, 220)
+            else:
+                target_info = f"SEARCHING ARUCO ID {self.marker_id}..."
+                t_col = (120, 190, 255)
+            cv2.putText(vis, target_info, (6, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.36, t_col, 1, cv2.LINE_AA)
+
+            bumper_str = "BUMP: CONTACT!" if self.contact_detected else "BUMP: CLEAR"
+            bumper_col = (0, 0, 255) if self.contact_detected else (160, 160, 160)
+            cv2.putText(vis, bumper_str, (vis_w - 88, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.34, bumper_col, 1, cv2.LINE_AA)
+
+            # --- ROW 3 (Y=50): Telemetry (d, ey, yaw, try) ---
+            if self.desk_distance is not None:
+                e_x, e_y, e_theta = self.compute_docking_errors()
+                dist_cm = self.desk_distance * 100.0
+                yaw_deg = math.degrees(self.desk_yaw_error) if self.desk_yaw_error is not None else 0.0
+                ey_cm = (e_y * 100.0) if e_y is not None else 0.0
+
+                telem_str = f"d:{dist_cm:4.1f}cm  ey:{ey_cm:+4.1f}cm  yaw:{yaw_deg:+4.1f}deg"
+                cv2.putText(vis, telem_str, (6, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (225, 225, 225), 1, cv2.LINE_AA)
+
+                retry_text = f"T:{self.retry_count}/{self.max_retries}"
+                cv2.putText(vis, retry_text, (vis_w - 42, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (170, 170, 170), 1, cv2.LINE_AA)
+            else:
+                cv2.putText(vis, "Target not detected", (6, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (140, 140, 140), 1, cv2.LINE_AA)
+
+            # Publish image to ROS 2 topic
+            if self.publish_debug_img:
+                self._debug_img_counter += 1
+                if (self._debug_img_counter % max(1, self.debug_img_stride)) == 0:
+                    stamp = self.get_clock().now().to_msg()
+                    # 1. Publish lightweight compressed JPEG over Wi-Fi
+                    try:
+                        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+                        succ, enc_img = cv2.imencode('.jpg', vis, encode_param)
+                        if succ:
+                            comp_msg = CompressedImage()
+                            comp_msg.header.stamp = stamp
+                            comp_msg.header.frame_id = self.last_color_frame_id
+                            comp_msg.format = 'jpeg'
+                            comp_msg.data = enc_img.tobytes()
+                            self.vis_comp_pub.publish(comp_msg)
+                    except Exception:
+                        pass
+
+                    # 2. Publish uncompressed locally
+                    try:
+                        msg_out = self.bridge.cv2_to_imgmsg(vis, encoding='bgr8')
+                        msg_out.header.stamp = stamp
+                        msg_out.header.frame_id = self.last_color_frame_id
+                        self.vis_pub.publish(msg_out)
+                    except Exception:
+                        pass
+
+            if self.show_window:
+                cv2.imshow("Precision Docking Visualizer", vis)
+                cv2.waitKey(1)
+        except Exception as e:
+            self.get_logger().warn(f"Visualizer render error: {e}", throttle_duration_sec=2.0)
+
+    # ==========================================================================
+    # Helper Functions & Safety Guards
+    # ==========================================================================
     def check_contact_trigger(self) -> bool:
-        if self.contact_detected:
+        if self.contact_detected or self.contact_latched:
+            self.contact_latched = True
             self.get_logger().info("========================================================")
-            self.get_logger().info(" ★ SINGLE BUMPER CONTACT CONFIRMED! (50ms debounced)   ")
+            self.get_logger().info(" ★ INSTANT BUMPER CONTACT CONFIRMED! Full Motor Lock!   ")
             self.get_logger().info(" ★ Exactly 5cm clearance established at Desk Front!     ")
             self.get_logger().info(" ★ DOCKED STATE ACHIEVED! Full Motor Lock Engaged.     ")
             self.get_logger().info("========================================================")
-            self.stop_robot()
+            self.stop_robot(hard_brake=True)
             self.transition_to('DOCKED')
             return True
         return False
 
-    def check_depth_timeout(self) -> bool:
-        if self.last_depth_time is not None:
-            age = (self.get_clock().now() - self.last_depth_time).nanoseconds / 1e9
-            if age > self.depth_timeout_sec:
-                self.get_logger().warn(f"Depth stream interrupted for {age:.2f}s. Pausing movement.", throttle_duration_sec=2.0)
+    def check_sensor_timeout(self) -> bool:
+        if self.last_sensor_time is not None:
+            age = (self.get_clock().now() - self.last_sensor_time).nanoseconds / 1e9
+            if age > 2.0:
+                self.get_logger().warn(f"Sensor stream interrupted for {age:.2f}s. Pausing movement.", throttle_duration_sec=2.0)
                 return True
         return False
+
+    def send_cmd_vel(self, twist_or_vx, wz=0.0):
+        if isinstance(twist_or_vx, Twist):
+            target_vx = float(twist_or_vx.linear.x)
+            target_wz = float(twist_or_vx.angular.z)
+        elif isinstance(twist_or_vx, (int, float)):
+            target_vx = float(twist_or_vx)
+            target_wz = float(wz)
+        else:
+            target_vx = 0.0
+            target_wz = 0.0
+
+        now_t = time.time()
+        dt = now_t - self._last_cmd_vel_time
+        self._last_cmd_vel_time = now_t
+
+        if dt > 0.5:  # First call or hiatus
+            dt = 0.05
+        dt = max(0.005, min(dt, 0.20))
+
+        # Slew-rate acceleration limits (prevents Dynamixel gear backlash chattering)
+        max_dw = self.max_wz_accel * dt
+        dw = target_wz - self.current_cmd_wz
+        if abs(dw) > max_dw:
+            self.current_cmd_wz += math.copysign(max_dw, dw)
+        else:
+            self.current_cmd_wz = target_wz
+
+        max_dv = self.max_vx_accel * dt
+        dv = target_vx - self.current_cmd_vx
+        if abs(dv) > max_dv:
+            self.current_cmd_vx += math.copysign(max_dv, dv)
+        else:
+            self.current_cmd_vx = target_vx
+
+        # Deadband snap for stationary commands
+        if abs(target_vx) < 1e-4 and abs(self.current_cmd_vx) < 0.005:
+            self.current_cmd_vx = 0.0
+        if abs(target_wz) < 1e-4 and abs(self.current_cmd_wz) < 0.01:
+            self.current_cmd_wz = 0.0
+
+        vx = self.current_cmd_vx
+        wz = self.current_cmd_wz
+
+        if self.enable_stamped_cmd_vel:
+            msg = TwistStamped()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = 'base_footprint'
+            msg.twist.linear.x = vx
+            msg.twist.angular.z = wz
+            self.cmd_vel_pub.publish(msg)
+        else:
+            msg = Twist()
+            msg.linear.x = vx
+            msg.angular.z = wz
+            self.cmd_vel_pub.publish(msg)
+
+    def stop_robot(self, hard_brake=False):
+        self.current_cmd_vx = 0.0
+        self.current_cmd_wz = 0.0
+        repeats = 5 if hard_brake else 3
+        for _ in range(repeats):
+            if self.enable_stamped_cmd_vel:
+                msg = TwistStamped()
+                msg.header.stamp = self.get_clock().now().to_msg()
+                msg.header.frame_id = 'base_footprint'
+                msg.twist.linear.x = 0.0
+                msg.twist.angular.z = 0.0
+                self.cmd_vel_pub.publish(msg)
+            else:
+                msg = Twist()
+                msg.linear.x = 0.0
+                msg.angular.z = 0.0
+                self.cmd_vel_pub.publish(msg)
 
     def transition_to(self, new_state: str):
         self.get_logger().info(f"[FSM] Transition: {self.state} -> {new_state}")
         self.state = new_state
         self.state_start_time = self.get_clock().now()
 
-        # Start docking overall stopwatch when starting docking
-        if new_state == 'CHECK_STAGING' and self.docking_routine_start_time is None:
+        if new_state in ('CHECK_STAGING', 'SEARCH_MARKER') and self.docking_routine_start_time is None:
             self.docking_routine_start_time = self.get_clock().now()
         elif new_state in ('NAV2_READY', 'FAILSAFE', 'DOCKED', 'ABORT_TO_NAV2'):
             self.docking_routine_start_time = None
 
-        if new_state in ('FINAL_APPROACH', 'CRAWL_CONTACT'):
-            self.final_approach_start_pose = self.get_robot_pose_in_map()
-            self.final_approach_start_dist = self.desk_distance
+        if new_state == 'CRAWL_CONTACT':
             self._stall_check_dist = None
             self._stall_start_time = None
 
-        # Stop robot when entering idle, docked, or fail states
+        if new_state == 'STAGING_SETTLE':
+            self.latched_aim_target_yaw = None
+            self.latched_aim_delta_yaw = 0.0
+
+        if new_state == 'CARROT_ALIGN':
+            self.initial_ey = None
+
+        if new_state in ('STANDOFF_SETTLE', 'CARROT_ALIGN'):
+            self.dual_align_stable_count = 0
+
+        if new_state in ('STANDOFF_SETTLE', 'FINAL_APPROACH', 'CRAWL_CONTACT', 'BACKUP_STANDOFF', 'BACKUP_RETRY', 'NAV2_READY', 'FAILSAFE', 'DOCKED', 'ABORT_TO_NAV2'):
+            self.carrot_x_b = None
+            self.carrot_y_b = None
+
+        if new_state == 'STANDOFF_SETTLE':
+            self.settle_substate = 'FINE_ROTATE'
+            self.settle_stop_start_time = None
+            self.settle_rotate_start_time = self.get_clock().now()
+
+        if new_state == 'BACKUP_STANDOFF':
+            self.backup_substate = 'BACK_AIM'
+            self.reverse_start_odom_pose = None
+
+            # Latch reference static errors and determine Reverse Virtual Carrot aiming parameters
+            e_x, e_y, e_theta = self.compute_docking_errors()
+            curr_yaw = self.get_robot_yaw()
+            self.reverse_latched_origin_yaw = curr_yaw
+
+            # 1. Target Reverse Distance: retreat to ~52cm staging zone (nominal 14cm)
+            if e_x is not None:
+                self.reverse_target_distance = float(np.clip(0.52 - e_x, 0.12, 0.18))
+            elif self.desk_distance is not None:
+                self.reverse_target_distance = float(np.clip(0.52 - self.desk_distance, 0.12, 0.18))
+            else:
+                self.reverse_target_distance = 0.14
+
+            # 2. Aiming Angle to Reverse Virtual Carrot:
+            # Inverted sign: target reverse vector to cancel ey during straight retreat
+            # Clamped to +/- 18 deg to guarantee marker stays well within camera FOV
+            if e_y is not None:
+                delta_yaw = -math.atan2(e_y, max(0.10, self.reverse_target_distance))
+                delta_yaw = float(np.clip(delta_yaw, -math.radians(18.0), math.radians(18.0)))
+            else:
+                delta_yaw = 0.0
+
+            if curr_yaw is not None:
+                self.reverse_latched_aim_yaw = math.atan2(
+                    math.sin(curr_yaw + delta_yaw),
+                    math.cos(curr_yaw + delta_yaw)
+                )
+            else:
+                self.reverse_latched_aim_yaw = None
+
+            self.get_logger().info(
+                f">>> [TRANSITION: BACKUP_STANDOFF] Latching Reverse Virtual Carrot: "
+                f"ey={e_y*100 if e_y is not None else 0.0:+.1f}cm, "
+                f"target_dist={self.reverse_target_distance*100:.1f}cm, "
+                f"aim_delta={math.degrees(delta_yaw):+.1f}°, "
+                f"origin_yaw={math.degrees(curr_yaw) if curr_yaw is not None else 0.0:+.1f}° -> "
+                f"aim_yaw={math.degrees(self.reverse_latched_aim_yaw) if self.reverse_latched_aim_yaw is not None else 0.0:+.1f}°"
+            )
+        else:
+            self.backup_reason = "NONE"
+
         if new_state in ('NAV2_READY', 'FAILSAFE', 'DOCKED'):
             self.stop_robot()
 
-        # Time-division sensor management:
-        # Keep OS30A active during all docking phases including safe abort/undock retreat!
-        # Only switch to Nav2 when retreat has fully concluded and robot enters NAV2_READY.
-        if new_state in DOCKING_ACTIVE_STATES or new_state in ('ABORT_TO_NAV2', 'UNDOCKING'):
-            self.call_set_mode_docking()
+        if new_state in DOCKING_ACTIVE_STATES:
             self.pause_rtabmap()
-        elif new_state in ('FAILSAFE', 'WAIT_NAV2', 'NAV2_READY'):
-            self.call_set_mode_nav2()
+        elif new_state in ('NAV2_READY', 'FAILSAFE'):
             self.resume_rtabmap()
-            self.reset_docking_variables()
-            self.publish_standby_hud()
-
-    def call_set_mode_docking(self):
-        self._internal_mode_request = 'DOCKING_OS30A'
-        self._mode_request_time = time.time()
-        if not self.set_mode_docking_cli.service_is_ready():
-            self.set_mode_docking_cli.wait_for_service(timeout_sec=0.5)
-        if self.set_mode_docking_cli.service_is_ready():
-            self.get_logger().info("[CAMERA_MODE] Requesting DOCKING mode (OS30A ON, Astra OFF)...")
-            self.set_mode_docking_cli.call_async(Trigger.Request())
-        else:
-            self.get_logger().warn("[CAMERA_MODE] /set_mode_docking service unavailable!")
-
-    def call_set_mode_nav2(self):
-        self._internal_mode_request = 'NAV2_ASTRA'
-        self._mode_request_time = time.time()
-        if not self.set_mode_nav2_cli.service_is_ready():
-            self.set_mode_nav2_cli.wait_for_service(timeout_sec=0.5)
-        if self.set_mode_nav2_cli.service_is_ready():
-            self.get_logger().info("[CAMERA_MODE] Requesting NAV2 mode (Astra ON, OS30A OFF)...")
-            self.set_mode_nav2_cli.call_async(Trigger.Request())
-        else:
-            self.get_logger().warn("[CAMERA_MODE] /set_mode_nav2 service unavailable!")
-
-    def handle_start_docking(self, request, response):
-        self.get_logger().info(">>> [/start_docking] Triggering Precision Close-Docking Routine!")
-        self.reset_docking_variables()
-        self.stop_robot()
-
-    def handle_start_docking(self, request, response):
-        self.get_logger().info(">>> [/start_docking] Triggering Precision Close-Docking Routine!")
-        self.reset_docking_variables()
-        self.stop_robot()
-        self.transition_to('CHECK_STAGING')
-        response.success = True
-        response.message = "Precision Close-Docking Started (OS30A active, Astra S paused)."
-        return response
-
-    def handle_undock_to_nav2(self, request, response):
-        self.get_logger().info(">>> [/undock_to_nav2] Received command to undock and return to Nav2!")
-        self.stop_robot()
-        if self.state == 'DOCKED':
-            self.transition_to('UNDOCKING')
-            response.success = True
-            response.message = "Initiated safe undocking backup (15cm) and switching to Nav2 mode."
-        else:
-            self.transition_to('NAV2_READY')
-            response.success = True
-            response.message = "Switched to NAV2_READY mode (Astra S Active, OS30A Inactive)."
-        return response
-
-    def handle_abort_docking(self, request, response):
-        self.get_logger().warn(">>> [/abort_docking] Abort requested by user/GUI. Retreating and returning to Nav2 mode...")
-        self.stop_robot()
-        self.transition_to('ABORT_TO_NAV2')
-        response.success = True
-        response.message = "Docking aborted. Retreating 24cm and returning to Nav2 mode."
-        return response
-
-    def camera_mode_callback(self, msg: String):
-        current_cam = msg.data.strip()
-        self.get_logger().info(f"[CAMERA_MODE] Current active sensor: {current_cam}", throttle_duration_sec=5.0)
 
     def pause_rtabmap(self):
         if self.rtabmap_pause_client.service_is_ready():
-            self.get_logger().info("[RESOURCE] Pausing RTAB-Map SLAM to free CPU for precision docking...")
-            req = Empty.Request()
-            self.rtabmap_pause_client.call_async(req)
+            self.get_logger().info("[RESOURCE] Pausing RTAB-Map SLAM to free Pi 4 CPU and prevent map drift...")
+            self.rtabmap_pause_client.call_async(Empty.Request())
 
     def resume_rtabmap(self):
         if self.rtabmap_resume_client.service_is_ready():
             self.get_logger().info("[RESOURCE] Resuming RTAB-Map SLAM...")
-            req = Empty.Request()
-            self.rtabmap_resume_client.call_async(req)
+            self.rtabmap_resume_client.call_async(Empty.Request())
+
+    def _init_motor_power_callback(self):
+        if hasattr(self, '_motor_init_timer') and self._motor_init_timer is not None:
+            self._motor_init_timer.cancel()
+            self._motor_init_timer = None
+        self.ensure_motor_power()
+
+    def ensure_motor_power(self):
+        if self.motor_power_cli.service_is_ready():
+            req = SetBool.Request()
+            req.data = True
+            self.motor_power_cli.call_async(req)
+            self.get_logger().info("[MOTOR] Dynamixel motor torque enabled via /motor_power")
+        else:
+            self.get_logger().warn("[MOTOR] /motor_power service not available yet", throttle_duration_sec=5.0)
+
+    def handle_start_docking(self, request, response):
+        self.get_logger().info(">>> [/start_docking] Received request to start Precision Docking...")
+
+        # Strict Safety Gate 1: Both ArUco markers must be actively detected in camera FOV
+        if not self.dual_markers_visible:
+            msg = "도킹 시작 실패: 마커 2개가 모두 카메라 시야에 인식되어야 합니다."
+            self.get_logger().warn(f">>> [/start_docking] Rejected: {msg}")
+            response.success = False
+            response.message = msg
+            return response
+
+        # Strict Safety Gate 2: Distance to target must be within 100cm (1.00m)
+        if self.desk_distance is None or self.desk_distance > 1.00:
+            dist_val = f"{self.desk_distance*100:.1f}cm" if self.desk_distance is not None else "미인식"
+            msg = f"도킹 시작 실패: 마커와의 거리가 100cm 이내여야 합니다 (현재: {dist_val})."
+            self.get_logger().warn(f">>> [/start_docking] Rejected: {msg}")
+            response.success = False
+            response.message = msg
+            return response
+
+        self.get_logger().info(f">>> [/start_docking] Dual markers verified (d={self.desk_distance*100:.1f}cm <= 100cm). Starting docking routine!")
+        self.contact_latched = False
+        self.ensure_motor_power()
+        self.retry_count = 0
+        self.initial_ey = None
+        self.stop_robot()
+        self.transition_to('CHECK_STAGING')
+        response.success = True
+        response.message = f"정밀 도킹 루틴 시작 (마커 2개 확인 완료, 거리: {self.desk_distance*100:.1f}cm)."
+        return response
+
+    def handle_undock_to_nav2(self, request, response):
+        self.get_logger().info(">>> [/undock_to_nav2] Received command to undock and return to Nav2!")
+        self.contact_latched = False
+        self.odom_target_latched = False
+        self.odom_target_center = None
+        self.odom_target_normal = None
+        self.odom_tracking_active = False
+        self.initial_ey = None
+        self.stop_robot()
+        if self.state == 'DOCKED':
+            self.transition_to('UNDOCKING')
+            response.success = True
+            response.message = "Initiating safe undock retreat (15cm)."
+        else:
+            self.transition_to('NAV2_READY')
+            response.success = True
+            response.message = "Switched to NAV2_READY mode."
+        return response
+
+    def handle_abort_docking(self, request, response):
+        self.get_logger().warn(">>> [/abort_docking] Abort requested. Clearing odom memory and retreating to Nav2 mode...")
+        self.contact_latched = False
+        self.odom_target_latched = False
+        self.odom_target_center = None
+        self.odom_target_normal = None
+        self.odom_tracking_active = False
+        self.initial_ey = None
+        self.stop_robot()
+        self.transition_to('ABORT_TO_NAV2')
+        response.success = True
+        response.message = "Docking aborted. Retreating 24cm."
+        return response
+
+    def handle_emergency_stop(self, request, response):
+        self.get_logger().warn(">>> [/emergency_stop] E-STOP Triggered! Immediate Motor Halt and Docking Reset.")
+        self.contact_latched = False
+        self.odom_target_latched = False
+        self.odom_target_center = None
+        self.odom_target_normal = None
+        self.odom_tracking_active = False
+        self.initial_ey = None
+        self.stop_robot(hard_brake=True)
+        self.transition_to('NAV2_READY')
+        response.success = True
+        response.message = "E-STOP: Robot motors halted immediately."
+        return response
 
     def get_robot_pose_in_map(self):
         try:
-            t = self.tf_buffer.lookup_transform(
-                'map', 'base_footprint', rclpy.time.Time()
-            )
+            t = self.tf_buffer.lookup_transform('map', 'base_footprint', rclpy.time.Time())
             x = t.transform.translation.x
             y = t.transform.translation.y
             q = t.transform.rotation
-            # Compute yaw from quaternion
-            siny_cosp = 2 * (q.w * q.z + q.x * q.y)
-            cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+            siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+            cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
             yaw = math.atan2(siny_cosp, cosy_cosp)
             return (x, y, yaw)
         except Exception:
             return None
 
+    def get_robot_pose_in_odom(self):
+        """Returns robot (x, y, yaw) in odom frame using wheel odometry."""
+        for base_frame in ('base_footprint', 'base_link'):
+            try:
+                t = self.tf_buffer.lookup_transform('odom', base_frame, rclpy.time.Time())
+                x = t.transform.translation.x
+                y = t.transform.translation.y
+                q = t.transform.rotation
+                siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+                cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+                yaw = math.atan2(siny_cosp, cosy_cosp)
+                return (x, y, yaw)
+            except Exception:
+                continue
+        return None
+
+    def get_robot_yaw(self):
+        """Returns robot yaw in odom or map frame using high-rate IMU/Wheel odometry."""
+        for target_frame in ('odom', 'map'):
+            for base_frame in ('base_footprint', 'base_link'):
+                try:
+                    t = self.tf_buffer.lookup_transform(target_frame, base_frame, rclpy.time.Time())
+                    q = t.transform.rotation
+                    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+                    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+                    return math.atan2(siny_cosp, cosy_cosp)
+                except Exception:
+                    continue
+        return None
+
     def send_nav2_staging_goal(self):
-        self.get_logger().info(">>> Waiting for Nav2 NavigateToPose action server...")
-        if not self.nav2_client.wait_for_server(timeout_sec=5.0):
-            self.get_logger().warn("Nav2 Action Server not available. Proceeding directly to Staging Check.")
+        if not NAV2_ACTION_AVAILABLE or self.nav2_client is None:
+            self.transition_to('CHECK_STAGING')
+            return
+        if not self.nav2_client.wait_for_server(timeout_sec=3.0):
             self.transition_to('CHECK_STAGING')
             return
 
-        goal_msg = NavigateToPose.Goal()
-        goal_msg.pose.header.frame_id = 'map'
-        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
-        goal_msg.pose.pose.position.x = self.staging_x
-        goal_msg.pose.pose.position.y = self.staging_y
-        goal_msg.pose.pose.position.z = 0.0
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = 'map'
+        goal.pose.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.pose.position.x = self.staging_x
+        goal.pose.pose.position.y = self.staging_y
+        goal.pose.pose.orientation.w = math.cos(self.staging_yaw / 2.0)
+        goal.pose.pose.orientation.z = math.sin(self.staging_yaw / 2.0)
 
-        # Orientation: staging_yaw = 0.0 -> quaternion (0, 0, 0, 1)
-        goal_msg.pose.pose.orientation.w = math.cos(self.staging_yaw / 2.0)
-        goal_msg.pose.pose.orientation.z = math.sin(self.staging_yaw / 2.0)
-
-        self.get_logger().info(f">>> Sending Nav2 Goal: ({self.staging_x:.2f}, {self.staging_y:.2f})")
-        send_goal_future = self.nav2_client.send_goal_async(goal_msg)
-        send_goal_future.add_done_callback(self.nav2_goal_response_callback)
+        future = self.nav2_client.send_goal_async(goal)
+        future.add_done_callback(self.nav2_goal_response_callback)
 
     def nav2_goal_response_callback(self, future):
         goal_handle = future.result()
         if not goal_handle.accepted:
-            self.get_logger().error(">>> Nav2 Staging Goal was REJECTED.")
             self.nav2_finished = True
             self.nav2_success = False
             return
-
-        self.get_logger().info(">>> Nav2 Staging Goal ACCEPTED. Tracking execution...")
         self.nav2_goal_handle = goal_handle
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self.nav2_result_callback)
+        res_future = goal_handle.get_result_async()
+        res_future.add_done_callback(self.nav2_result_callback)
 
     def nav2_result_callback(self, future):
-        result = future.result()
+        res = future.result()
         self.nav2_finished = True
-        if result.status == GoalStatus.STATUS_SUCCEEDED:
-            self.nav2_success = True
-        else:
-            self.nav2_success = False
+        self.nav2_success = (res.status == GoalStatus.STATUS_SUCCEEDED)
 
 
 def main(args=None):
@@ -1564,14 +2427,13 @@ def main(args=None):
         import traceback
         node.get_logger().error(f"Fatal unhandled exception in precision_approacher: {e}\n{traceback.format_exc()}")
     finally:
-        # Zero velocity fail-safe shutdown
         try:
             cv2.destroyAllWindows()
         except Exception:
             pass
         stop_twist = Twist()
         try:
-            node.cmd_vel_pub.publish(stop_twist)
+            node.send_cmd_vel(0.0, 0.0)
             node.resume_rtabmap()
             node.destroy_node()
         except Exception:
