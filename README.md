@@ -1,6 +1,6 @@
 # 🤖 TurtleBot3 Visual SLAM & Precision Dual-ArUco Docking System
 
-본 저장소는 **TurtleBot3 Waffle Pi** 로봇을 기반으로 한 **3D Visual SLAM 자율주행** 및 **Dual ArUco 마커 기반 cm 단위 정밀 도킹(Precision Docking)** 통합 솔루션입니다.
+본 저장소는 **TurtleBot3 Waffle Pi** 로봇을 기반으로 한 **Pure 3D Visual SLAM 자율주행** 및 **Dual ArUco 마커 기반 cm 단위 정밀 도킹(Precision Docking)** 통합 솔루션입니다.
 
 ---
 
@@ -10,7 +10,7 @@
 3. [전체 프로젝트 디렉토리 및 파일 구성 (Project Structure)](#3-전체-프로젝트-디렉토리-및-파일-구성-project-structure)
 4. [자율주행 및 정밀 도킹 실행 순서 (Step-by-Step Guide)](#4-자율주행-및-정밀-도킹-실행-순서-step-by-step-guide)
 5. [주요 노드 및 기술 사양 (Core Architecture)](#5-주요-노드-및-기술-사양-core-architecture)
-6. [트러블슈팅 및 개발 팁 (Troubleshooting)](#6-트러블슈팅-및-개발-팁-troubleshooting)
+6. [트러블슈팅 및 필수 하드웨어 주의사항 (Troubleshooting)](#6-트러블슈팅-및-필수-하드웨어-주의사항-troubleshooting)
 
 ---
 
@@ -19,13 +19,12 @@
 | 구분 | 장비 / 사양 | 주요 역할 |
 | :--- | :--- | :--- |
 | **로봇 플랫폼** | **TurtleBot3 Waffle Pi** | 차동 구동(Differential Drive) 모바일 베이스 |
-| **SBC (로봇 탑재)** | **Raspberry Pi 4 Model B** (Ubuntu 24.04 Server) | OpenCR 통신, 카메라 및 라이다 드라이버 실행 |
+| **SBC (로봇 탑재)** | **Raspberry Pi 4 Model B** (Ubuntu 24.04 Server) | OpenCR 통신, 카메라 드라이버 실행 |
 | **모터 제어기** | **ROBOTIS OpenCR 1.0** + DYNAMIXEL XM430 | 모터 구동 및 엔코더 오도메트리(`/odom`), IMU 수집 |
-| **비전 센서** | **Orbbec Astra S** (RGB-D Depth Camera) | 3D 포인트클라우드 SLAM 및 Dual ArUco 마커 인식 |
-| **라이다 센서** | **RPLIDAR C1** (또는 360 LDS-02) | 2D 장애물 회피, Nav2 Costmap 레이어 생성 |
+| **비전 센서** | **Orbbec Astra S** (RGB-D Depth Camera) | 3D 포인트클라우드 Visual SLAM 및 Dual ArUco 마커 인식 |
 | **접촉 센서** | **전면 마이크로스위치 범퍼 센서** (GPIO 연동) | 최종 도킹 완료 물리 감지 및 긴급 정지 안전장치 |
 | **도킹 마커** | **Dual ArUco Markers** (`DICT_4X4_50`) | ID: Left #7, Right #19 (마커 변 50mm, 간격 150mm) |
-| **제어 워크스테이션** | **Ubuntu 24.04 LTS (x86_64)** PC | RTAB-Map SLAM 연산, Nav2 경로계획, 도킹 GUI |
+| **제어 워크스테이션** | **Ubuntu 24.04 LTS (x86_64)** PC | RTAB-Map Visual SLAM 연산, Nav2 경로계획, 도킹 GUI |
 | **통신 환경** | **Wi-Fi 무선 네트워크 (`ROS_DOMAIN_ID=101`)** | ROS 2 DDS 분산 통신 |
 
 ---
@@ -48,8 +47,7 @@ sudo apt update && sudo apt install -y \
   ros-jazzy-image-transport \
   ros-jazzy-image-transport-plugins \
   ros-jazzy-cv-bridge \
-  ros-jazzy-turtlebot3-msgs \
-  ros-jazzy-rplidar-ros
+  ros-jazzy-turtlebot3-msgs
 ```
 
 ### 2.3 Python 필수 라이브러리
@@ -91,7 +89,7 @@ pip install opencv-python opencv-contrib-python numpy PyQt5 pynput
 │       │
 │       ├── turtlebot3_visual_slam/ # [항법] 3D Visual SLAM 및 Nav2 설정 패키지
 │       │   ├── launch/
-│       │   │   ├── vslam_rgbd_imu.launch.py          # RTAB-Map 3D SLAM 실행 런치
+│       │   │   ├── vslam_rgbd_imu.launch.py          # RTAB-Map 3D Visual SLAM 실행 런치
 │       │   │   └── vslam_navigation.launch.py        # 3D 맵 기반 Nav2 통합 내비게이션
 │       │   ├── config/
 │       │   │   ├── rtabmap_params.yaml                # RTAB-Map 루프 클로저 및 특징점 파라미터
@@ -102,7 +100,7 @@ pip install opencv-python opencv-contrib-python numpy PyQt5 pynput
 │       │       └── setup_os30a_udev.sh                # OS30A 센서 udev 룰 등록
 │       │
 │       └── turtlebot3/              # [기본] 터틀봇3 하드웨어 드라이버 및 모델 (Source)
-│           ├── turtlebot3_bringup/  # 로봇 부팅 런치 (RPLIDAR-C1 드라이버 지원 패치 완료)
+│           ├── turtlebot3_bringup/  # 로봇 부팅 런치
 │           ├── turtlebot3_description/ # 3D 로봇 모델(URDF) 및 메쉬
 │           ├── turtlebot3_node/     # OpenCR 시리얼 통신, TwistStamped 모터 제어
 │           └── turtlebot3_teleop/   # 터틀봇 텔레옵
@@ -125,7 +123,20 @@ source ~/Documents/Dapier/Project/robot_ws/install/setup.bash
 ---
 
 ### [1단계] 터틀봇3 하드웨어 구동 (라즈베리파이)
-로봇 본체(라즈베리파이)에 SSH로 접속하거나 원격 스크립트를 사용합니다.
+
+#### ⚠️ 다른 컴퓨터에서 처음 실행 시 주의사항 (SSH 비밀번호 / 인증키)
+[`remote_start_robot.sh`](file:///home/jjj/Documents/Dapier/Project/remote_start_robot.sh) 스크립트는 내부적으로 SSH(`ssh user@192.168.0.148`)를 통해 라즈베리파이에 명령을 내립니다.
+* **현재 개발 PC**: SSH 공개키가 기등록되어 있어 비밀번호 입력 없이 즉시 실행됩니다.
+* **다른 새 PC에서 실행할 경우**: 파이 비밀번호 인증이 필요하므로 스크립트가 멈추거나 실패할 수 있습니다. 아래 명령어로 먼저 SSH 키를 등록하거나 터미널에서 비밀번호를 입력해 주어야 합니다:
+  ```bash
+  # SSH 공개키를 라즈베리파이에 복사 (최초 1회, 비밀번호: user)
+  ssh-copy-id user@192.168.0.148
+  ```
+
+#### 🔌 필수 하드웨어 조작: 카메라 USB 재연결 (Plug & Re-plug)
+> [!IMPORTANT]
+> **라즈베리파이 부팅 및 드라이버 실행 후, Astra 카메라의 USB 케이블을 물리적으로 한 번 뽑았다가 다시 꽂아야 카메라 영상 스트림이 정상 인식됩니다.** (USB 버스 초기화 특성으로 인해 재연결 전에는 영상 토픽이 발행되지 않을 수 있습니다.)
+
 ```bash
 # 옵션 A: PC에서 원격 스크립트 실행
 ./remote_start_robot.sh
@@ -133,7 +144,7 @@ source ~/Documents/Dapier/Project/robot_ws/install/setup.bash
 # 옵션 B: 라즈베리파이 터미널에서 직접 실행
 ros2 launch turtlebot3_bringup robot.launch.py
 ```
-* **확인 사항**: OpenCR 연결 (`/odom`), 라이다 가동 (`/scan`), Astra 카메라 가동 (`/camera/color/image_raw`).
+* **확인 사항**: OpenCR 연결 (`/odom`), Astra 카메라 가동 (`/camera/color/image_raw`).
 
 ---
 
@@ -163,7 +174,7 @@ Wi-Fi 통신 환경에서 고화질 영상을 원활히 처리하기 위해 영�
 ./2_start_3d_nav.sh
 ```
 * RViz 상단 도구 모음에서 **[Nav2 Goal]**을 선택하여 마커가 위치한 스테이션 전방 0.8m ~ 1.0m 지점을 클릭합니다.
-* 로봇이 장애물을 회피하며 목적지까지 주행 후 정지합니다.
+* 로봇이 깊이 센서 기반 장애물 회피를 수행하며 목적지까지 주행 후 정지합니다.
 
 ---
 
@@ -212,22 +223,20 @@ ros2 launch precision_docker real_robot_marker_docking.launch.py
 
 ---
 
-## 6. 트러블슈팅 및 개발 팁 (Troubleshooting)
+## 6. 트러블슈팅 및 필수 하드웨어 주의사항 (Troubleshooting)
 
-### Q1. 로봇이 `/cmd_vel` 명령을 받고도 움직이지 않습니다.
+### Q1. 파이 구동 후 카메라 영상 토픽이 들어오지 않습니다.
+* **필수 조치**: Astra S 카메라의 USB 버스 초기화 문제로 인해, **파이 부팅 및 드라이버 실행 후 카메라 USB 케이블을 물리적으로 한 번 뽑았다가 다시 꽂아주어야** 정상적으로 영상 장치가 잡히고 스트림이 시작됩니다.
+* 또한 압축 토픽(`/camera/color/image_raw/compressed`)은 QoS가 **`BEST_EFFORT`**입니다. 일반 `RELIABLE` 구독자로는 수신되지 않으므로 주의가 필요합니다.
+
+### Q2. 다른 PC에서 `./remote_start_robot.sh` 실행 시 반응이 없거나 실패합니다.
+* **원인**: 새 PC에서는 라즈베리파이(`user@192.168.0.148`) SSH 인증키가 등록되어 있지 않아 암호 입력 대기 상태에 걸릴 수 있습니다.
+* **해결**: `ssh-copy-id user@192.168.0.148` (비밀번호: `user`) 명령으로 PC의 공개키를 파이에 등록해 주시면 이후 비밀번호 없이 원클릭 실행이 가능합니다.
+
+### Q3. 로봇이 `/cmd_vel` 명령을 받고도 움직이지 않습니다.
 * **원인**: ROS 2 Jazzy 버전의 `turtlebot3_node`는 레거시 `geometry_msgs/msg/Twist`를 무시하고 **`geometry_msgs/msg/TwistStamped`**만 수신하도록 업데이트되었습니다.
 * **해결**: 모든 제어 노드 및 스크립트에서 `TwistStamped` 형식과 `header.stamp`, `header.frame_id='base_footprint'`를 지정해 발행해야 합니다.
 
-### Q2. 카메라 영상 토픽을 구독해도 이미지가 들어오지 않습니다.
-* **원인**: Orbbec Astra S 드라이버의 압축 토픽(`/camera/color/image_raw/compressed`)은 QoS 프로파일이 **`BEST_EFFORT`**로 설정되어 있습니다. 기본 `RELIABLE` 구독자로 연결하면 DDS 매칭이 실패합니다.
-* **해결**: 구독 노드 생성 시 `QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT)`를 명시해야 합니다.
-
-### Q3. 마커 인식이 불안정하거나 튕깁니다.
+### Q4. 마커 인식이 불안정하거나 튕깁니다.
 * 실내 형광등의 반사광(글레어)으로 인해 흰색 테두리가 날아가는 경우가 있습니다.
 * `markers/` 디렉토리에 있는 고대비 매트 재질 마커를 인쇄하여 사용하고, 카메라 조리개/노출을 일정하게 고정하는 것을 권장합니다.
-
----
-
-## 👥 담당 및 유지보수
-* **프로젝트 저장소**: [GitHub - Dapier_project_visaul_slam](https://github.com/shouttt1320/Dapier_project_visaul_slam.git)
-* **담당 문의**: shouttt1320@gmail.com
