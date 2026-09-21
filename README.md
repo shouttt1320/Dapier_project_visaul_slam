@@ -70,7 +70,8 @@ pip install opencv-python opencv-contrib-python numpy PyQt5 pynput
 ├── remote_start_robot.sh           # [유틸] 라즈베리파이 로봇 노드 SSH 원격 실행 (모터, 카메라, 압축)
 ├── remote_stop_robot.sh            # [유틸] 라즈베리파이 구동 프로세스 원격 긴급 정지
 ├── run_teleop.py / run_teleop.sh   # [제어] TwistStamped 호환 키보드 원격 수동 주행 툴
-├── docking_algorithm_notion_guide.md# [문서] 정밀 도킹 알고리즘 및 PND 제어 수학적 기술 문서
+├── visual_slam_guide.md            # [문서] RGB-D 기반 3D Visual SLAM 파이프라인 및 기술 명세서
+├── docking_algorithm_guide.md      # [문서] 정밀 도킹 알고리즘 및 PND 제어 수학적 기술 문서
 ├── REAL_ROBOT_DOCKING_IMPLEMENTATION_PLAN.md # [문서] 실로봇 도킹 아키텍처 및 구현 계획서
 ├── my_office_3d.db                  # [데이터] RTAB-Map으로 생성된 3D 공간 데이터베이스 (지도 파일)
 ├── my_office_map.pgm / .yaml       # [데이터] 2D 격자 지도 (Occupancy Grid Map)
