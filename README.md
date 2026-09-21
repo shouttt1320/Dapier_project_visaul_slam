@@ -8,7 +8,9 @@
 1. [시스템 및 장비 사양 (Hardware Specs)](#1-시스템-및-장비-사양-hardware-specs)
 2. [필요 라이브러리 및 소프트웨어 환경 (Prerequisites)](#2-필요-라이브러리-및-소프트웨어-환경-prerequisites)
 3. [전체 프로젝트 디렉토리 및 파일 구성 (Project Structure)](#3-전체-프로젝트-디렉토리-및-파일-구성-project-structure)
-4. [자율주행 및 정밀 도킹 실행 순서 (Step-by-Step Guide)](#4-자율주행-및-정밀-도킹-실행-순서-step-by-step-guide)
+4. [운용 워크플로우: 지도 작성 및 자율주행·도킹 (Step-by-Step Guide)](#4-운용-워크플로우-지도-작성-및-자율주행도킹-step-by-step-guide)
+   - 4.1 [최초 1회] 3D 지도 작성 (Mapping Mode)
+   - 4.2 [일상 운용] 3D 맵 기반 자율주행 및 정밀 도킹 (Navigation & Docking Mode)
 5. [주요 노드 및 기술 사양 (Core Architecture)](#5-주요-노드-및-기술-사양-core-architecture)
 6. [트러블슈팅 및 필수 하드웨어 주의사항 (Troubleshooting)](#6-트러블슈팅-및-필수-하드웨어-주의사항-troubleshooting)
 
@@ -19,7 +21,7 @@
 | 구분 | 장비 / 사양 | 주요 역할 |
 | :--- | :--- | :--- |
 | **로봇 플랫폼** | **TurtleBot3 Waffle Pi** | 차동 구동(Differential Drive) 모바일 베이스 |
-| **SBC (로봇 탑재)** | **Raspberry Pi 4 Model B** (Ubuntu 24.04 Server) | OpenCR 통신, 카메라 드라이버 실행 |
+| **SBC (로봇 탑재)** | **Raspberry Pi 4 Model B** (Ubuntu 24.04 Server) | OpenCR 통신, 카메라 드라이버 및 실시간 압축 실행 |
 | **모터 제어기** | **ROBOTIS OpenCR 1.0** + DYNAMIXEL XM430 | 모터 구동 및 엔코더 오도메트리(`/odom`), IMU 수집 |
 | **비전 센서** | **Orbbec Astra S** (RGB-D Depth Camera) | 3D 포인트클라우드 Visual SLAM 및 Dual ArUco 마커 인식 |
 | **접촉 센서** | **전면 마이크로스위치 범퍼 센서** (GPIO 연동) | 최종 도킹 완료 물리 감지 및 긴급 정지 안전장치 |
@@ -62,16 +64,15 @@ pip install opencv-python opencv-contrib-python numpy PyQt5 pynput
 
 ```text
 /home/jjj/Documents/Dapier/Project/
-├── 1_build_3d_map.sh               # [실행] RTAB-Map 기반 3D Visual SLAM 지도 작성 스크립트
-├── 2_start_3d_nav.sh                # [실행] 작성된 3D 지도 기반 Nav2 자율주행 실행 스크립트
-├── run_real_robot_pc.sh             # [실행] PC 측 Astra 카메라 압축 브리지 및 상태 모니터링
-├── remote_start_robot.sh           # [유틸] 라즈베리파이 로봇 노드 SSH 원격 실행
+├── 1_build_3d_map.sh               # [실행] 3D 지도 작성: RTAB-Map Mapping 모드 실행
+├── 2_start_3d_nav.sh                # [실행] 3D 자율주행: 파이 구동 + Nav2 내비게이션 통합 원클릭 실행
+├── run_real_robot_pc.sh             # [실행] 3D 자율주행: PC 측 Nav2 + RTAB-Map Localization + GUI 실행 (지도 필수)
+├── remote_start_robot.sh           # [유틸] 라즈베리파이 로봇 노드 SSH 원격 실행 (모터, 카메라, 압축)
 ├── remote_stop_robot.sh            # [유틸] 라즈베리파이 구동 프로세스 원격 긴급 정지
-├── run_teleop.py / run_teleop.sh   # [제어] TwistStamped 호환 키보드 원격 주행 툴
-├── astra_compressor.py              # [비전] 실시간 대역폭 최적화를 위한 RGB-D 압축 브리지 노드
+├── run_teleop.py / run_teleop.sh   # [제어] TwistStamped 호환 키보드 원격 수동 주행 툴
 ├── docking_algorithm_notion_guide.md# [문서] 정밀 도킹 알고리즘 및 PND 제어 수학적 기술 문서
 ├── REAL_ROBOT_DOCKING_IMPLEMENTATION_PLAN.md # [문서] 실로봇 도킹 아키텍처 및 구현 계획서
-├── my_office_3d.db                  # [데이터] RTAB-Map으로 생성된 3D 공간 데이터베이스
+├── my_office_3d.db                  # [데이터] RTAB-Map으로 생성된 3D 공간 데이터베이스 (지도 파일)
 ├── my_office_map.pgm / .yaml       # [데이터] 2D 격자 지도 (Occupancy Grid Map)
 │
 ├── robot_ws/                        # 메인 ROS 2 워크스페이스
@@ -89,8 +90,8 @@ pip install opencv-python opencv-contrib-python numpy PyQt5 pynput
 │       │
 │       ├── turtlebot3_visual_slam/ # [항법] 3D Visual SLAM 및 Nav2 설정 패키지
 │       │   ├── launch/
-│       │   │   ├── vslam_rgbd_imu.launch.py          # RTAB-Map 3D Visual SLAM 실행 런치
-│       │   │   └── vslam_navigation.launch.py        # 3D 맵 기반 Nav2 통합 내비게이션
+│       │   │   ├── vslam_rgbd_imu.launch.py          # RTAB-Map 3D Visual SLAM 매핑 실행 런치
+│       │   │   └── vslam_navigation.launch.py        # 3D 맵 기반 Nav2 자율주행 및 위치추정 런치
 │       │   ├── config/
 │       │   │   ├── rtabmap_params.yaml                # RTAB-Map 루프 클로저 및 특징점 파라미터
 │       │   │   ├── nav2_vslam_params.yaml             # Nav2 Costmap, Controller, Planner 설정
@@ -105,15 +106,19 @@ pip install opencv-python opencv-contrib-python numpy PyQt5 pynput
 │           ├── turtlebot3_node/     # OpenCR 시리얼 통신, TwistStamped 모터 제어
 │           └── turtlebot3_teleop/   # 터틀봇 텔레옵
 │
-└── robot_scripts/                   # 라즈베리파이 설정 스크립트 및 OpenCR 펌웨어
+└── robot_scripts/                   # 라즈베리파이 설정 스크립트 및 보조 유틸리티
+    └── pi/
+        ├── astra_compressor.py      # [파이 탑재] Wi-Fi 대역폭 절감을 위한 RGB-D 실시간 영상 압축기
+        ├── start_robot_all.sh       # [파이 탑재] 모터 + 카메라 + 압축기 + 범퍼 일괄 시작 스크립트
+        └── run_astra.sh             # [파이 탑재] Astra 카메라 및 astra_compressor 실행 스크립트
 ```
 
 ---
 
-## 4. 자율주행 및 정밀 도킹 실행 순서 (Step-by-Step Guide)
+## 4. 운용 워크플로우: 지도 작성 및 자율주행·도킹 (Step-by-Step Guide)
 
-### [준비 단계] 네트워크 및 환경 변수 일치
-모든 터미널과 라즈베리파이에서 반드시 동일한 `ROS_DOMAIN_ID`를 사용해야 토픽이 공유됩니다:
+### [사전 준비] 네트워크 및 환경 변수 일치
+모든 PC 터미널과 라즈베리파이에서 반드시 동일한 `ROS_DOMAIN_ID`를 사용해야 토픽이 연결됩니다:
 ```bash
 export ROS_DOMAIN_ID=101
 source /opt/ros/jazzy/setup.bash
@@ -122,80 +127,69 @@ source ~/Documents/Dapier/Project/robot_ws/install/setup.bash
 
 ---
 
-### [1단계] 터틀봇3 하드웨어 구동 (라즈베리파이)
+### 4.1 [최초 1회] 3D 지도 작성 (Mapping Mode)
+새로운 장소에서 주행 지도가 없거나 맵을 다시 생성해야 할 때 수행합니다.
 
-#### ⚠️ 다른 컴퓨터에서 처음 실행 시 주의사항 (SSH 비밀번호 / 인증키)
-[`remote_start_robot.sh`](file:///home/jjj/Documents/Dapier/Project/remote_start_robot.sh) 스크립트는 내부적으로 SSH(`ssh user@192.168.0.148`)를 통해 라즈베리파이에 명령을 내립니다.
-* **현재 개발 PC**: SSH 공개키가 기등록되어 있어 비밀번호 입력 없이 즉시 실행됩니다.
-* **다른 새 PC에서 실행할 경우**: 파이 비밀번호 인증이 필요하므로 스크립트가 멈추거나 실패할 수 있습니다. 아래 명령어로 먼저 SSH 키를 등록하거나 터미널에서 비밀번호를 입력해 주어야 합니다:
-  ```bash
-  # SSH 공개키를 라즈베리파이에 복사 (최초 1회, 비밀번호: user)
-  ssh-copy-id user@192.168.0.148
-  ```
-
-#### 🔌 필수 하드웨어 조작: 카메라 USB 재연결 (Plug & Re-plug)
-> [!IMPORTANT]
-> **라즈베리파이 부팅 및 드라이버 실행 후, Astra 카메라의 USB 케이블을 물리적으로 한 번 뽑았다가 다시 꽂아야 카메라 영상 스트림이 정상 인식됩니다.** (USB 버스 초기화 특성으로 인해 재연결 전에는 영상 토픽이 발행되지 않을 수 있습니다.)
-
+#### 1) 라즈베리파이 로봇 하드웨어 구동
 ```bash
-# 옵션 A: PC에서 원격 스크립트 실행
 ./remote_start_robot.sh
-
-# 옵션 B: 라즈베리파이 터미널에서 직접 실행
-ros2 launch turtlebot3_bringup robot.launch.py
 ```
-* **확인 사항**: OpenCR 연결 (`/odom`), Astra 카메라 가동 (`/camera/color/image_raw`).
+> [!IMPORTANT]
+> **필수 하드웨어 조작**: 파이 구동 후 **Astra 카메라 USB 케이블을 물리적으로 한 번 뺐다가 다시 꽂아주어야** 카메라 영상 토픽(`/camera/color/image_raw`)이 정상 발행됩니다.
 
----
-
-### [2단계] PC 측 센서 수신 및 대역폭 최적화 브리지 구동 (PC 터미널)
-Wi-Fi 통신 환경에서 고화질 영상을 원활히 처리하기 위해 영상 압축 브리지를 실행합니다:
-```bash
-./run_real_robot_pc.sh
-```
-* **동작**: `/camera/color/image_raw/compressed` 및 깊이 영상 토픽 최적화 스트리밍 시작.
-
----
-
-### [3단계] 3D Visual SLAM 지도 작성 (초기 1회 수행 시)
-새로운 환경에서 3D 맵을 구축할 때 실행합니다:
+#### 2) PC에서 3D Visual Mapping 실행
 ```bash
 ./1_build_3d_map.sh
 ```
-* RViz가 열리며 카메라 포인트클라우드가 표시됩니다.
-* 다른 터미널에서 `./run_teleop.sh`를 켜고 로봇을 천천히 수동 주행시켜 지도를 완성합니다.
-* 완료 시 맵 데이터가 `my_office_3d.db`로 자동 저장됩니다.
+* RTAB-Map이 새 매핑 모드로 시작되며 RViz2에 실시간 3D 포인트클라우드가 그려집니다.
 
----
-
-### [4단계] 3D 맵 기반 Nav2 자율주행 실행
-작성된 맵을 바탕으로 목적지(도킹 스테이션 근방 1m 이내)까지 자율주행합니다:
+#### 3) 키보드 텔레옵으로 공간 스캔
+별도의 터미널을 열고 수동 조종 툴을 실행합니다:
 ```bash
-./2_start_3d_nav.sh
+./run_teleop.sh
 ```
-* RViz 상단 도구 모음에서 **[Nav2 Goal]**을 선택하여 마커가 위치한 스테이션 전방 0.8m ~ 1.0m 지점을 클릭합니다.
-* 로봇이 깊이 센서 기반 장애물 회피를 수행하며 목적지까지 주행 후 정지합니다.
+* 로봇을 천천히 전진 및 회전시키며 사무실 구석구석을 스캔합니다.
+* 매핑을 마치고 `./1_build_3d_map.sh` 터미널을 `Ctrl+C`로 종료하면 맵 데이터가 **`my_office_3d.db`** 파일로 자동 저장됩니다.
 
 ---
 
-### [5단계] 정밀 도킹(Precision Docking) 실행 (목표 영역 도착 후)
-로봇이 도킹 스테이션 시야 내에 들어오면 정밀 비전 도킹을 시작합니다:
+### 4.2 [일상 운용] 3D 맵 기반 자율주행 및 정밀 도킹 (Navigation & Docking Mode)
+이미 완성된 3D 지도(`my_office_3d.db`)가 준비되어 있는 일상 운용 단계입니다.
+
+#### 1) 라즈베리파이 로봇 하드웨어 구동
+```bash
+./remote_start_robot.sh
+```
+*(카메라 USB 재연결 확인)*
+
+#### 2) PC 자율주행 및 미션 컨트롤 실행
+```bash
+./run_real_robot_pc.sh
+# 또는 원클릭 스크립트: ./2_start_3d_nav.sh
+```
+* **동작 원리**:
+  - 기존에 저장된 `my_office_3d.db` 맵을 불러옵니다.
+  - RTAB-Map이 **위치 추정(Localization) 모드**로 작동하여 카메라 영상으로 현재 로봇 위치를 실시간 추정합니다.
+  - Nav2 자율주행 스택 및 RViz2 화면이 열립니다.
+* **주행 명령**:
+  - RViz 상단 도구 모음에서 **[Nav2 Goal]**을 선택하고, 도킹 스테이션(파란 박스) 전방 약 0.8m ~ 1.0m 지점을 클릭합니다.
+  - 로봇이 3D 장애물을 회피하며 목적지까지 스스로 이동하여 정지합니다.
+
+#### 3) 목표 영역 도착 후 정밀 비전 도킹 (Precision Docking)
+로봇이 도킹 스테이션 전방에 도착하면 비전 도킹 런치를 실행합니다:
 ```bash
 ros2 launch precision_docker real_robot_marker_docking.launch.py
 ```
-* **PyQt5 도킹 GUI**가 화면에 표시됩니다:
-  1. 실시간 카메라 화면에 좌/우 ArUco 마커 바운딩 박스와 중심선이 오버레이됩니다.
-  2. 현재 마커와의 상대 거리($d$), 상대 편각($\theta$), 횡방향 오차($e_y$)가 표시됩니다.
-  3. GUI의 **[Start Auto Docking]** 버튼을 클릭하면 도킹 시퀀스가 자동 시작됩니다:
-     - **Phase 1 (Approach)**: 마커 중심선을 정면으로 바라보며 고속 접근.
-     - **Phase 2 (Fine Alignment)**: 30cm 이내에서 PND(Proportional Navigation)를 통해 회전각 오차를 $\pm 1^\circ$ 이내로 정렬.
-     - **Phase 3 (Final Contact)**: 10cm 이내 극저속(2cm/s) 직진 $\to$ 범퍼 센서가 접촉을 감지하면 즉시 모터를 차단하고 도킹 완료 상태를 잠급니다.
+* **PyQt5 도킹 GUI 화면 조작**:
+  1. 실시간 카메라 화면에 좌/우 Dual ArUco 마커(#7, #19) 바운딩 박스가 잡히는지 확인합니다.
+  2. GUI의 **[Start Auto Docking]** 버튼을 클릭합니다:
+     - **Phase 1 (접근)**: 마커 중앙 축선을 따라 안전 속도로 전진.
+     - **Phase 2 (정렬)**: 30cm 이내에서 PND 각도 제어로 회전각 편차를 $\pm 1^\circ$ 이내로 정밀 보정.
+     - **Phase 3 (최종 접촉)**: 10cm 이내 극저속(2cm/s) 직진 $\to$ 전면 범퍼 마이크로스위치가 접촉을 감지하면 즉시 모터를 차단하고 도킹 완료 잠금.
 
----
-
-### [비상 정지 및 종료]
+#### [비상 정지]
 * GUI 창의 **[EMERGENCY STOP]** 버튼 클릭
-* 또는 PC 터미널에서 즉시 원격 정지 스크립트 실행:
+* 또는 터미널에서 즉시 원격 정지 스크립트 실행:
   ```bash
   ./remote_stop_robot.sh
   ```
