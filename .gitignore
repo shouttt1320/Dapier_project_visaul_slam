@@ -40,7 +40,6 @@ test_cmd_vel.py
 test_dual_marker.py
 test_marker_accuracy.py
 run_pi_hardware_test.sh
-docking_algorithm_notion_guide_.md
 
 # Unused Drivers, Simulation & Legacy Code
 unused_drivers/
@@ -60,6 +59,14 @@ robot_ws/src/redbox_navigator/legacy/
 !robot_ws/src/**/config/**/*
 !robot_ws/src/**/worlds/**/*
 !markers/**/*
+
+# Large models, weights, and point clouds
+weights/
+*.pt
+*.ply
+
+# External vendor drivers
+robot_ws/src/ros2_astra_camera/
 
 # Local agent artifacts
 .agents/

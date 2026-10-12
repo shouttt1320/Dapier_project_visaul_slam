@@ -1,0 +1,677 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+[LLM Agent Node v5.0] Qwen2.5-VL Multimodal Unified ROS 2 Agent
+- 자연어 음성/텍스트 명령을 파싱하여 5대 자율주행 모드 및 도킹 Action JSON 발행
+- Astra S 실시간 카메라 영상 기반 Qwen2.5-VL Visual Grounding (2D BBox 추출 및 시각 검증)
+- 0.1ms 이내 Emergency Software STOP 인터셉트
+- CommandValidator를 통한 Pydantic 규격 및 물리적 안전 범위 검증
+- Task Manager(/task/command) 및 3D 비전 도킹(/qwen/target_bbox) 연동
+"""
+
+import os
+import sys
+import time
+import json
+import base64
+import urllib.request
+import urllib.error
+import threading
+import re
+from typing import Optional, Dict, Any, Tuple
+
+import cv2
+import numpy as np
+from PIL import Image as PILImage, ImageDraw as PILImageDraw, ImageFont as PILImageFont
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from std_msgs.msg import String, Bool
+from std_srvs.srv import Trigger
+from sensor_msgs.msg import Image, CompressedImage
+from cv_bridge import CvBridge
+
+from llm_semantic_docker.command_validator import CommandValidator, RobotIntent, ActionEnum, TargetSpec
+from llm_semantic_docker.software_stop_interceptor import SoftwareStopInterceptor
+
+
+class TermColor:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    MAGENTA = "\033[95m"
+    CYAN = "\033[96m"
+    WHITE = "\033[97m"
+    BG_CYAN = "\033[46m"
+    BG_RED = "\033[41m"
+
+
+class LLMAgentNode(Node):
+    def __init__(self, enable_cli_input: bool = True):
+        super().__init__('llm_agent_node')
+        self.enable_cli_input = enable_cli_input
+        self.bridge = CvBridge()
+
+        # ----------------------------------------------------------------------
+        # Parameters
+        # ----------------------------------------------------------------------
+        self.declare_parameter('ollama_url', 'http://127.0.0.1:11434/api/generate')
+        self.declare_parameter('model_name', 'qwen2.5vl:3b')
+        self.declare_parameter('color_topic', '/camera/color/image_raw')
+        self.declare_parameter('keep_alive', -1)
+
+        self.ollama_url = self.get_parameter('ollama_url').get_parameter_value().string_value
+        self.model_name = self.get_parameter('model_name').get_parameter_value().string_value
+        self.color_topic = self.get_parameter('color_topic').get_parameter_value().string_value
+        self.keep_alive = self.get_parameter('keep_alive').get_parameter_value().integer_value
+
+        # Validator 초기화
+        self.validator = CommandValidator()
+        self.current_anchor_cue = "red_object"
+
+        # Frame state
+        self.latest_color_img: Optional[np.ndarray] = None
+        self.lock = threading.Lock()
+
+        # ----------------------------------------------------------------------
+        # ROS 2 Interfaces
+        # ----------------------------------------------------------------------
+        # Subscriptions
+        qos_best_effort = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+        self.create_subscription(String, '/user_voice_command', self._voice_command_cb, 10)
+        self.create_subscription(String, '/qwen/detect_query', self._detect_query_cb, 10)
+        self.create_subscription(Image, self.color_topic, self._color_img_cb, qos_best_effort)
+        self.create_subscription(CompressedImage, f"{self.color_topic}/compressed", self._color_comp_cb, qos_best_effort)
+
+        # Publishers
+        self.task_cmd_pub = self.create_publisher(String, '/task/command', 10)
+        self.task_status_pub = self.create_publisher(String, '/task/status', 10)
+        self.stop_pub = self.create_publisher(Bool, '/safety/software_stop', 10)
+        self.target_bbox_pub = self.create_publisher(String, '/qwen/target_bbox', 10)
+        self.debug_img_pub = self.create_publisher(Image, '/qwen/debug_image', 10)
+        self.agent_resp_pub = self.create_publisher(String, '/llm/agent_response', 10)
+        self.dock_station_pub = self.create_publisher(String, '/docking/start_station', 10)
+        self.dock_start_cli = self.create_client(Trigger, '/docking/start')
+
+        # OpenCV ArUco detector for direct visual docking pre-flight check
+        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+        try:
+            self.aruco_params = cv2.aruco.DetectorParameters_create()
+        except AttributeError:
+            self.aruco_params = cv2.aruco.DetectorParameters()
+
+        # Services
+        self.verify_srv = self.create_service(Trigger, '/qwen/verify_target', self._handle_verify_srv)
+
+        self._print_banner()
+
+        # VLM GPU VRAM 사전 워밍업
+        self._warmup_vlm()
+
+        # Interactive Console CLI (백그라운드 스레드)
+        if self.enable_cli_input:
+            self.cli_thread = threading.Thread(target=self._cli_worker, daemon=True)
+            self.cli_thread.start()
+
+    def _print_banner(self):
+        banner = f"""
+{TermColor.CYAN}╔══════════════════════════════════════════════════════════════════════════╗
+║               🧠 QWEN2.5-VL MULTIMODAL AGENT NODE (v5.0)                ║
+║  Model: {self.model_name:<16} | Engine: Local Ollama (GPU 100%)         ║
+║  Capabilities: 5-Mode Navigation Planning + 3D Visual Grounding Verification ║
+╚══════════════════════════════════════════════════════════════════════════╝{TermColor.RESET}
+"""
+        print(banner)
+
+    # --------------------------------------------------------------------------
+    # Callbacks
+    # --------------------------------------------------------------------------
+    def _color_img_cb(self, msg: Image):
+        try:
+            cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            with self.lock:
+                self.latest_color_img = cv_img
+        except Exception:
+            pass
+
+    def _color_comp_cb(self, msg: CompressedImage):
+        try:
+            np_arr = np.frombuffer(msg.data, np.uint8)
+            cv_img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            with self.lock:
+                self.latest_color_img = cv_img
+        except Exception:
+            pass
+
+    def _voice_command_cb(self, msg: String):
+        user_text = msg.data.strip()
+        if user_text:
+            self.process_command(user_text)
+
+    def _detect_query_cb(self, msg: String):
+        query = msg.data.strip()
+        if query:
+            self.ground_and_publish_target(query)
+
+    def _handle_verify_srv(self, request, response):
+        """Task Manager가 목적지 도착 후 시각 검증 요청 시 호출"""
+        cue = self.current_anchor_cue or "box"
+        self.get_logger().info(f"[Verify Service] Verifying target visual anchor: '{cue}'...")
+        res = self.ground_and_publish_target(cue)
+        if res.get("target_found", False):
+            response.success = True
+            response.message = f"Target '{cue}' verified with BBox: {res.get('bbox_2d')}"
+        else:
+            response.success = False
+            response.message = f"Target '{cue}' NOT found in camera view."
+        return response
+
+    # --------------------------------------------------------------------------
+    # 1. 자연어 명령 파싱 (5대 주행 모드 + 정밀 도킹)
+    # --------------------------------------------------------------------------
+    def check_visual_marker(self) -> Tuple[bool, str, Optional[int]]:
+        """실시간 카메라 프레임에서 전방 ArUco 마커 감지 여부 사전 검사"""
+        with self.lock:
+            if self.latest_color_img is None:
+                return False, "카메라 영상이 아직 수신되지 않았습니다.", None
+            img = self.latest_color_img.copy()
+
+        try:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            corners, ids, _ = cv2.aruco.detectMarkers(gray, self.aruco_dict, parameters=self.aruco_params)
+            if ids is not None and len(ids) > 0:
+                marker_id = int(ids[0][0])
+                return True, f"ArUco 마커(ID:{marker_id}) 감지 성공", marker_id
+            return False, "카메라 화면에 ArUco 마커가 보이지 않습니다.", None
+        except Exception as e:
+            return False, f"마커 검출 중 오류: {e}", None
+
+    def _quick_parse_command(self, user_text: str) -> Optional[Dict[str, Any]]:
+        """정형화된 주요 명령을 LLM 대기 없이 0ms에 즉시 확정 파싱 (오류/부호 역전 완전 방지)"""
+        cleaned = user_text.strip().lower()
+
+        # 1. 마커 직시 도킹 명령
+        if any(kw in cleaned for kw in ["마커 보고 도킹", "마커보고 도킹", "마커보고도킹", "마커 도킹", "마커도킹", "지금 마커"]):
+            return {
+                "action": "DOCK",
+                "target": {
+                    "target_structure": "marker",
+                    "perception_type": "aruco",
+                    "direct_visual": True
+                },
+                "rationale": "마커 직시 도킹",
+                "user_text": user_text
+            }
+
+        # 2. 바닥 물체 직시 접근 명령 (향후 바닥 물체 접근 알고리즘 100% 호환)
+        if any(kw in cleaned for kw in ["바닥 물체", "바닥에 있는 물체", "물체로 다가가", "물체 다가가", "물체 접근"]):
+            return {
+                "action": "DOCK",
+                "target": {
+                    "target_structure": "floor_object",
+                    "perception_type": "floor_object",
+                    "direct_visual": True,
+                    "clearance_cm": 20.0
+                },
+                "rationale": "바닥 물체 직시 접근",
+                "user_text": user_text
+            }
+
+        # 3. 회전 명령 (왼쪽: 양수(+) / 오른쪽: 음수(-))
+        is_turn = any(kw in cleaned for kw in ["회전", "돌아", "돌아줘", "좌회전", "우회전", "turn", "rotate"])
+        if is_turn:
+            angle_match = re.search(r'([0-9]+)\s*(?:도|deg|°)', cleaned)
+            angle = float(angle_match.group(1)) if angle_match else 15.0
+
+            is_left = any(kw in cleaned for kw in ["왼쪽", "왼", "좌회전", "좌", "left", "ccw", "반시계"])
+            is_right = any(kw in cleaned for kw in ["오른쪽", "오른", "우회전", "우", "right", "cw", "시계"])
+
+            if is_left and not is_right:
+                return {
+                    "action": "NAVIGATE",
+                    "target": {
+                        "mode": "RELATIVE",
+                        "relative_x": 0.0,
+                        "relative_y": 0.0,
+                        "relative_yaw": angle
+                    },
+                    "rationale": f"왼쪽 {angle}° 회전",
+                    "user_text": user_text
+                }
+            elif is_right and not is_left:
+                return {
+                    "action": "NAVIGATE",
+                    "target": {
+                        "mode": "RELATIVE",
+                        "relative_x": 0.0,
+                        "relative_y": 0.0,
+                        "relative_yaw": -angle
+                    },
+                    "rationale": f"오른쪽 {angle}° 회전",
+                    "user_text": user_text
+                }
+
+        # 4. 상대 직선 이동 명령
+        cm_match = re.search(r'([0-9]+)\s*cm', cleaned)
+        m_match = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*(?:m|미터)', cleaned)
+        dist_m = None
+        if cm_match:
+            dist_m = float(cm_match.group(1)) / 100.0
+        elif m_match:
+            dist_m = float(m_match.group(1))
+
+        if dist_m is not None:
+            if any(kw in cleaned for kw in ["앞", "전진", "fwd", "forward"]):
+                return {
+                    "action": "NAVIGATE",
+                    "target": {
+                        "mode": "RELATIVE",
+                        "relative_x": dist_m,
+                        "relative_y": 0.0,
+                        "relative_yaw": 0.0
+                    },
+                    "rationale": f"전진 {dist_m*100:.0f}cm",
+                    "user_text": user_text
+                }
+            elif any(kw in cleaned for kw in ["뒤", "후진", "back", "backward"]):
+                return {
+                    "action": "NAVIGATE",
+                    "target": {
+                        "mode": "RELATIVE",
+                        "relative_x": -dist_m,
+                        "relative_y": 0.0,
+                        "relative_yaw": 0.0
+                    },
+                    "rationale": f"후진 {dist_m*100:.0f}cm",
+                    "user_text": user_text
+                }
+
+        return None
+
+    def process_command(self, user_text: str):
+        t0 = time.perf_counter()
+        print(f"\n{TermColor.YELLOW}💬 [User Command Received]{TermColor.RESET} \"{user_text}\"")
+
+        # 1. 초고속 Emergency STOP 인터셉트 (<0.1ms)
+        is_stop, check_time = SoftwareStopInterceptor.inspect(user_text)
+        if is_stop:
+            stop_msg = Bool()
+            stop_msg.data = True
+            self.stop_pub.publish(stop_msg)
+            print(f"{TermColor.BG_RED}{TermColor.WHITE} 🛡️ EMERGENCY STOP INTERCEPTED ({check_time*1000:.2f}ms) {TermColor.RESET}")
+            resp_str = "긴급 정지 신호가 감지되어 즉시 모든 모터를 정지했습니다."
+            self.agent_resp_pub.publish(String(data=resp_str))
+            stop_task = {"action": "STOP", "reason": f"Voice stop keyword '{user_text}'"}
+            self.task_cmd_pub.publish(String(data=json.dumps(stop_task)))
+            return
+
+        # 1.5 초고속 결정론적 정규식 파서 매칭 (<0.1ms)
+        quick_parsed = self._quick_parse_command(user_text)
+        if quick_parsed is not None:
+            parsed_dict = quick_parsed
+            print(f">> 고속 확정 파서 매칭 ({time.perf_counter() - t0:.2f}ms): {parsed_dict.get('rationale')}")
+        else:
+            # 2. Qwen2.5-VL 프롬프트 작성 (등록된 웨이포인트 포함)
+            registered_places = list(self.validator.waypoints.keys())
+            system_prompt = f"""You are an autonomous robot command planner.
+Analyze the user command and output ONLY valid JSON matching this schema:
+{{
+  "action": "NAVIGATE" or "DOCK" or "STATUS",
+  "target": {{
+    "semantic_name": "place name from registered list if navigating to a fixed waypoint",
+    "target_structure": "structure to dock with (e.g. desk, box, charger)",
+    "anchor_cue": "visual object on/near target to look for (e.g. red_object, box, pen, tumbler, or null)",
+    "docking_face": "front",
+    "mode": "WAYPOINT" or "RELATIVE" or "ABSOLUTE" or "LANDMARK_OFFSET",
+    "coordinates": [x, y, yaw_deg] (for ABSOLUTE),
+    "relative_x": float in meters (for RELATIVE, forward+),
+    "relative_y": float in meters (for RELATIVE, left+),
+    "relative_yaw": float in degrees (for RELATIVE),
+    "offset_from": "base place name" (for LANDMARK_OFFSET),
+    "offset_x": float in meters (for LANDMARK_OFFSET),
+    "offset_y": float in meters (for LANDMARK_OFFSET)
+  }},
+  "rationale": "short explanation"
+}}
+Registered places: {registered_places}
+
+Examples:
+- "앞으로 1미터 이동해": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 1.0, "relative_y": 0.0, "relative_yaw": 0.0}}}}
+- "move toward 20cm": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.20, "relative_y": 0.0, "relative_yaw": 0.0}}}}
+- "앞으로 20cm 가줘": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.20, "relative_y": 0.0, "relative_yaw": 0.0}}}}
+- "뒤로 10cm 후진": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": -0.10, "relative_y": 0.0, "relative_yaw": 0.0}}}}
+- "좌회전 15도": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": 15.0}}}}
+- "왼쪽으로 회전해": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": 15.0}}}}
+- "왼쪽으로 돌아줘": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": 15.0}}}}
+- "왼쪽으로 90도 회전해": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": 90.0}}}}
+- "우회전 15도": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": -15.0}}}}
+- "오른쪽으로 회전해": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": -15.0}}}}
+- "오른쪽으로 돌아줘": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": -15.0}}}}
+- "좌회전해": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": 15.0}}}}
+- "우회전해": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": -15.0}}}}
+- "마커 보고 도킹해": {{"action": "DOCK", "target": {{"target_structure": "marker", "perception_type": "aruco", "direct_visual": true}}}}
+- "바닥에 있는 물체로 다가가": {{"action": "DOCK", "target": {{"target_structure": "floor_object", "perception_type": "floor_object", "direct_visual": true, "clearance_cm": 20.0}}}}
+- "workplace1로 도킹해": {{"action": "DOCK", "target": {{"target_structure": "workplace1", "docking_face": "front"}}}}
+- "책상으로 가줘": {{"action": "NAVIGATE", "target": {{"semantic_name": "desk", "mode": "WAYPOINT"}}}}
+
+Important Rules:
+1. When parsing place or station names with numbers (e.g. workplace1), ALWAYS keep the number with the name.
+2. Note for rotation: relative_yaw is in degrees (Left/CCW/좌회전/왼쪽: positive +, Right/CW/우회전/오른쪽: negative -).
+
+User Command: "{user_text}"
+JSON:"""
+
+            payload = {
+                "model": self.model_name,
+                "prompt": system_prompt,
+                "stream": False,
+                "format": "json",
+                "options": {"temperature": 0.1, "num_predict": 128},
+                "keep_alive": self.keep_alive
+            }
+
+            try:
+                req = urllib.request.Request(
+                    self.ollama_url,
+                    data=json.dumps(payload).encode('utf-8'),
+                    headers={"Content-Type": "application/json"}
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    body = json.loads(resp.read().decode('utf-8'))
+                    raw_json = body.get("response", "{}")
+                    parsed_dict = json.loads(raw_json)
+
+                elapsed = time.perf_counter() - t0
+                print(f">> Qwen2.5-VL 추론 완료 ({elapsed*1000:.1f}ms): {parsed_dict.get('action')}")
+            except Exception as e:
+                self.get_logger().error(f"Ollama inference error: {e}")
+                resp_str = f"명령 분석 중 오류가 발생했습니다: {e}"
+                self.agent_resp_pub.publish(String(data=resp_str))
+                return
+
+        parsed_dict["user_text"] = user_text
+
+        try:
+            # 3. CommandValidator를 통한 Pydantic 검증
+            val_result = self.validator.validate(parsed_dict)
+
+            if val_result.is_valid:
+                resolved_task = val_result.resolved_task
+                print(f"{TermColor.GREEN}✅ 검증 성공 (VALID): {resolved_task.get('action')}{TermColor.RESET}")
+
+                # 도킹 타겟 앵커 기억
+                target_dict = parsed_dict.get("target", {})
+                target_cue = target_dict.get("anchor_cue") or target_dict.get("target_structure") or "상자"
+                if target_dict.get("anchor_cue"):
+                    self.current_anchor_cue = target_dict["anchor_cue"]
+
+                # DOCK 액션 처리
+                if resolved_task.get("action") == "DOCK":
+                    is_direct = resolved_task.get("direct_visual", False)
+                    p_type = resolved_task.get("perception_type", "aruco")
+
+                    # 직시 마커 도킹 시: 사전 카메라 프레임 마커 검사 필수 수행
+                    if is_direct and p_type == "aruco":
+                        has_marker, marker_info, marker_id = self.check_visual_marker()
+                        if not has_marker:
+                            warn_msg = "⚠️ [도킹 불가] 현재 카메라 화면에 마커가 보이지 않습니다. 로봇 전방에 마커가 보이도록 위치를 조정해주세요."
+                            print(f"{TermColor.YELLOW}{warn_msg}{TermColor.RESET}")
+                            self.agent_resp_pub.publish(String(data=warn_msg))
+                            self.task_status_pub.publish(String(data=f"ALERT: {warn_msg}"))
+                            return
+                        else:
+                            print(f"{TermColor.GREEN}🎯 [Direct Visual Docking] 전방 마커(ID:{marker_id}) 감지 완료! 정밀 도킹 엔진으로 직접 인계합니다.{TermColor.RESET}")
+                            resp_str = f"🎯 [마커 확인] 전방 마커(ID:{marker_id})를 확인했습니다. 정밀 도킹 작업을 시작합니다."
+                            self.agent_resp_pub.publish(String(data=resp_str))
+
+                            # 정밀 도킹 제어기 직접 가동 트리거 (중간 FSM/YAML 지연 없이 즉시 진입)
+                            if self.dock_start_cli.service_is_ready():
+                                self.dock_start_cli.call_async(Trigger.Request())
+                            self.dock_station_pub.publish(String(data="marker"))
+                    elif is_direct and p_type == "floor_object":
+                        # 바닥 물체 직시 접근 알림
+                        resp_str = "🎯 [바닥 물체 확인] 바닥 물체 시각 검출 및 접근 모드를 개시합니다."
+                        self.agent_resp_pub.publish(String(data=resp_str))
+                    elif resolved_task.get("station_name"):
+                        st_name = resolved_task.get("station_name")
+                        print(f"\n{TermColor.GREEN}🎯 [Direct Station Docking] 등록된 스테이션 '{st_name}'으로 직접 좌표 도킹을 수행합니다. (VLM 시각 탐색 스킵){TermColor.RESET}")
+                    else:
+                        if "상자" in user_text:
+                            target_cue = "상자"
+                        elif "책상" in user_text:
+                            target_cue = "책상"
+                        elif "충전" in user_text:
+                            target_cue = "충전기"
+
+                        print(f"\n{TermColor.CYAN}🎯 [Docking Pre-Grounding] 도킹 대상 '{target_cue}' 실시간 VLM 시각 탐색 수행...{TermColor.RESET}")
+                        ground_res = self.ground_and_publish_target(target_cue)
+                        if ground_res.get("target_found", False):
+                            print(f"{TermColor.GREEN}✅ 도킹 대상 '{target_cue}' VLM 락온 완료 (BBox: {ground_res.get('pixel_box')}){TermColor.RESET}")
+                        else:
+                            print(f"{TermColor.YELLOW}⚠️ 도킹 대상 '{target_cue}' VLM 미감지 (3D Depth Fallback 연계 대기){TermColor.RESET}")
+                        time.sleep(0.15)
+
+                # Task Manager로 태스크 발행
+                task_str = json.dumps(resolved_task, ensure_ascii=False)
+                self.task_cmd_pub.publish(String(data=task_str))
+
+                if not (resolved_task.get("action") == "DOCK" and resolved_task.get("direct_visual", False)):
+                    resp_str = f"명령을 확인했습니다: [{resolved_task.get('action')}] 작업을 시작합니다."
+                    self.agent_resp_pub.publish(String(data=resp_str))
+            else:
+                print(f"{TermColor.RED}❌ 유효성 검증 실패: {val_result.error_msg}{TermColor.RESET}")
+                resp_str = f"명령을 수행할 수 없습니다: {val_result.error_msg}"
+                self.agent_resp_pub.publish(String(data=resp_str))
+
+        except Exception as e:
+            self.get_logger().error(f"Command processing error: {e}")
+            resp_str = f"명령 분석 중 오류가 발생했습니다: {e}"
+            self.agent_resp_pub.publish(String(data=resp_str))
+
+    # --------------------------------------------------------------------------
+    # 2. 실시간 시각 검증 및 Visual Grounding (2D BBox 추출)
+    # --------------------------------------------------------------------------
+    def ground_and_publish_target(self, target_query: str) -> Dict[str, Any]:
+        with self.lock:
+            if self.latest_color_img is None:
+                print(f"{TermColor.YELLOW}⚠️ 카메라 영상이 아직 수신되지 않았습니다. (/camera/color/image_raw 확인 필요){TermColor.RESET}", flush=True)
+                self.get_logger().warn("No camera frame available for visual grounding!")
+                return {"target_found": False, "error": "No camera frame"}
+            img_bgr = self.latest_color_img.copy()
+
+        h, w = img_bgr.shape[:2]
+        success, buffer = cv2.imencode('.jpg', img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not success:
+            return {"target_found": False, "error": "Image encoding failed"}
+        b64_img = base64.b64encode(buffer).decode('utf-8')
+
+        prompt = f"""Locate '{target_query}' in the image.
+Respond strictly in valid JSON format:
+{{
+  "target_found": true or false,
+  "label": "detected object name",
+  "bbox_2d": [xmin, ymin, xmax, ymax]
+}}
+Note: bbox_2d is [xmin, ymin, xmax, ymax] normalized integers [0, 1000] where (xmin, ymin) is top-left and (xmax, ymax) is bottom-right.
+If not found, set target_found to false and bbox_2d to null.
+"""
+
+        payload = {
+            "model": self.model_name,
+            "prompt": prompt,
+            "images": [b64_img],
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0.1, "num_predict": 64},
+            "keep_alive": self.keep_alive
+        }
+
+        t0 = time.perf_counter()
+        try:
+            req = urllib.request.Request(
+                self.ollama_url,
+                data=json.dumps(payload).encode('utf-8'),
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = json.loads(resp.read().decode('utf-8'))
+                raw_json = body.get("response", "{}")
+                result = json.loads(raw_json)
+
+            elapsed = time.perf_counter() - t0
+            result["latency_sec"] = elapsed
+
+            # 2D BBox 좌표를 max(w, h) 비율 보정하여 실제 픽셀 좌표로 환산
+            if result.get("target_found", False) and result.get("bbox_2d"):
+                xmin_n, ymin_n, xmax_n, ymax_n = result["bbox_2d"]
+                scale = max(w, h) / 1000.0
+                xmin = max(0, min(w - 1, int(xmin_n * scale)))
+                ymin = max(0, min(h - 1, int(ymin_n * scale)))
+                xmax = max(0, min(w, int(xmax_n * scale)))
+                ymax = max(0, min(h, int(ymax_n * scale)))
+                if xmin > xmax: xmin, xmax = xmax, xmin
+                if ymin > ymax: ymin, ymax = ymax, ymin
+
+                result["pixel_box"] = [xmin, ymin, xmax, ymax]
+                print(f">> 👁️ Target Found: '{target_query}' at [{xmin}, {ymin}, {xmax}, {ymax}] ({elapsed*1000:.1f}ms)")
+
+                # 디버그 시각화 영상 생성 및 발행
+                vis_img = img_bgr.copy()
+                cv2.rectangle(vis_img, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
+                cv2.circle(vis_img, (int((xmin+xmax)/2), int((ymin+ymax)/2)), 4, (0, 0, 255), -1)
+                vis_img = self._draw_korean_text(vis_img, f"{result.get('label', target_query)}", (xmin, max(5, ymin - 15)))
+
+                try:
+                    img_msg = self.bridge.cv2_to_imgmsg(vis_img, encoding='bgr8')
+                    self.debug_img_pub.publish(img_msg)
+                except Exception:
+                    pass
+            else:
+                print(f">> 👁️ Target NOT Found: '{target_query}' ({elapsed*1000:.1f}ms)")
+
+            # /qwen/target_bbox 토픽으로 전송
+            self.target_bbox_pub.publish(String(data=json.dumps(result, ensure_ascii=False)))
+            return result
+
+        except Exception as e:
+            self.get_logger().error(f"Visual grounding error: {e}")
+            err_dict = {"target_found": False, "error": str(e)}
+            self.target_bbox_pub.publish(String(data=json.dumps(err_dict)))
+            return err_dict
+
+    def _draw_korean_text(self, cv_img, text, position, text_color=(0, 255, 0), font_size=16):
+        font_path = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"
+        if os.path.exists(font_path):
+            try:
+                img_rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+                pil_img = PILImage.fromarray(img_rgb)
+                draw = PILImageDraw.Draw(pil_img)
+                font = PILImageFont.truetype(font_path, font_size)
+                x, y = position
+                for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    draw.text((x + dx, y + dy), text, font=font, fill=(0, 0, 0))
+                draw.text((x, y), text, font=font, fill=(text_color[2], text_color[1], text_color[0]))
+                return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+            except Exception:
+                pass
+        cv2.putText(cv_img, text, position, cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 2)
+        return cv_img
+
+    def _warmup_vlm(self):
+        """시작 시 모델을 GPU VRAM에 상주시킴"""
+        print(">> Qwen2.5-VL GPU VRAM 사전 워밍업 중...")
+        try:
+            payload = {
+                "model": self.model_name,
+                "prompt": "warmup",
+                "stream": False,
+                "keep_alive": self.keep_alive
+            }
+            req = urllib.request.Request(
+                self.ollama_url,
+                data=json.dumps(payload).encode('utf-8'),
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                pass
+            print(f"   {TermColor.GREEN}✅ VLM GPU VRAM 적재 완료 (즉시 추론 준비 완료){TermColor.RESET}")
+        except Exception as e:
+            print(f"   ⚠️ 워밍업 경고: {e}")
+
+    # --------------------------------------------------------------------------
+    # Interactive CLI Input Worker
+    # --------------------------------------------------------------------------
+    def _cli_worker(self):
+        time.sleep(1.0)
+        print(f"\n{TermColor.WHITE}────────────────────────────────────────────────────────────────────────{TermColor.RESET}", flush=True)
+        print(" ⌨️  [인터랙티브 콘솔 활성화] 터미널에 명령어를 입력할 수 있습니다.", flush=True)
+        print("  - 주행 예시: '책상으로 가줘', '앞으로 1m 이동해', '좌표 X 1.5, Y 0.5로 가'", flush=True)
+        print("  - 도킹 예시: '빨간 상자가 있는 책상에 도킹해', '상자에 도킹해줘'", flush=True)
+        print("  - 시각 질의: '? 텀블러', '? 펜', '? 상자'", flush=True)
+        print("  - 비상 정지: '정지', '멈춰', 'stop'", flush=True)
+        print(f"{TermColor.WHITE}────────────────────────────────────────────────────────────────────────{TermColor.RESET}\n", flush=True)
+
+        tty_fp = None
+        try:
+            # Under ros2 launch, sys.stdin is a pipe. Connect directly to /dev/tty if available
+            if not sys.stdin.isatty():
+                tty_fp = open('/dev/tty', 'r', encoding='utf-8', errors='replace')
+                in_stream = tty_fp
+            else:
+                in_stream = sys.stdin
+        except Exception:
+            in_stream = sys.stdin
+
+        while rclpy.ok():
+            try:
+                print(f"{TermColor.CYAN}🤖 명령 입력 >> {TermColor.RESET}", end="", flush=True)
+                line = in_stream.readline()
+                if not line:
+                    time.sleep(0.2)
+                    continue
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("?"):
+                    # 시각 검색 질의
+                    query = line[1:].strip()
+                    if query:
+                        self.ground_and_publish_target(query)
+                else:
+                    self.process_command(line)
+            except (EOFError, KeyboardInterrupt):
+                break
+            except Exception as e:
+                print(f"CLI error: {e}", flush=True)
+
+        if tty_fp:
+            try:
+                tty_fp.close()
+            except Exception:
+                pass
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = LLMAgentNode(enable_cli_input=True)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+

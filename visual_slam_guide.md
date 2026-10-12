@@ -116,7 +116,7 @@ flowchart LR
   - `Grid/RangeMin: "0.4"` (Astra S 카메라 사각지대인 40cm 미만 노이즈 차단)
   - `Grid/RangeMax: "2.5"` (유효 적외선 신뢰 거리인 2.5m까지만 지도에 반영)
 * **장애물 높이 필터링**:
-  - `Grid/MinGroundHeight: "0.05"` ~ `Grid/MaxGroundHeight: "0.15"`: 바닥면 반사 노이즈를 장애물로 오인하지 않도록 지면 필터 적용.
+  - `Grid/MinGroundHeight: "0.03"` ~ `Grid/MaxGroundHeight: "0.08"`: 바닥면 반사 노이즈(3cm 이하)를 제거하면서, 15cm 내외 저상 작업대도 장애물로 정상 검출하도록 설정.
   - `Grid/MaxObstacleHeight: "1.2"`: 천장 조명이나 환풍기 배관 등 주행과 무관한 상부 물체 제외.
 * **광선 추적 (Ray Tracing)**: `Grid/RayTracing: "true"`
   - 물체가 사라지거나 로봇이 이동할 때, 카메라 광선 경로 상에 있는 이전 장애물 셀을 자동으로 빈 공간(Free Space)으로 갱신.

@@ -63,7 +63,7 @@ def launch_setup(context, *args, **kwargs):
         parameters=[{
             'decimation': 1,
             'voxel_size': 0.0,
-            'approx_sync': False,
+            'approx_sync': True,
             'use_sim_time': use_sim_time
         }],
         remappings=[

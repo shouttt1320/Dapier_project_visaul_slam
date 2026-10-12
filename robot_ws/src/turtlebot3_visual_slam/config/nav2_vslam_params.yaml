@@ -93,7 +93,7 @@ controller_server:
 
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
-      desired_linear_vel: 0.30
+      desired_linear_vel: 0.2
       lookahead_dist: 0.4
       min_lookahead_dist: 0.25
       max_lookahead_dist: 0.6
@@ -248,8 +248,8 @@ velocity_smoother:
     stamp_smoothed_velocity_with_smoothing_time: False
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [0.30, 0.0, 1.5]
-    min_velocity: [-0.30, 0.0, -1.5]
+    max_velocity: [0.2, 0.0, 1.5]
+    min_velocity: [-0.2, 0.0, -1.5]
     max_accel: [1.5, 0.0, 2.0]
     max_decel: [-1.5, 0.0, -2.0]
     odom_topic: "odom"
@@ -311,3 +311,18 @@ docking_server:
       use_stall_detection: false
       external_detection_timeout: 1.0
       external_detection_translation_x: -0.18
+
+lifecycle_manager_navigation:
+  ros__parameters:
+    use_sim_time: false
+    autostart: true
+    node_names: ['controller_server',
+                 'smoother_server',
+                 'planner_server',
+                 'behavior_server',
+                 'bt_navigator',
+                 'waypoint_follower',
+                 'velocity_smoother']
+    bond_timeout: 4.0
+    attempt_respawn_reconnection: true
+

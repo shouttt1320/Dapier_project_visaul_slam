@@ -14,12 +14,25 @@ Features:
 """
 
 import sys
+import os
+import json
 import math
 import time
 from datetime import datetime
 
 import cv2
 import numpy as np
+from PIL import Image as PILImage, ImageDraw as PILDraw, ImageFont as PILFont
+
+NANUM_FONT_PATH = None
+for _font_candidate in [
+    '/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf',
+    '/usr/share/fonts/truetype/nanum/NanumGothic.ttf',
+    '/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf'
+]:
+    if os.path.exists(_font_candidate):
+        NANUM_FONT_PATH = _font_candidate
+        break
 
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
@@ -32,7 +45,7 @@ from PyQt5.QtWidgets import (
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 from std_srvs.srv import Trigger
 from geometry_msgs.msg import Twist, TwistStamped
 from sensor_msgs.msg import CompressedImage, Image
@@ -80,15 +93,21 @@ class DockingGuiROSNode(Node):
             String, '/docking/status', self._status_callback, 10
         )
 
-        # Compressed Video Stream (Zero-lag over Wi-Fi)
+        # Qwen2.5-VL Visual Grounding Target BBox Subscriber
+        self.latest_qwen_box = None
+        self.latest_qwen_label = ""
+        self.latest_qwen_time = 0.0
+        self.sub_qwen_bbox = self.create_subscription(
+            String, '/qwen/target_bbox', self._qwen_bbox_callback, 10
+        )
+
+        # Primary Docking Video Streams
         self.sub_img_comp = self.create_subscription(
             CompressedImage,
             '/docking/debug_image/compressed',
             self._compressed_image_callback,
             qos_profile_sensor_data
         )
-
-        # Fallback Raw Video Stream
         self.sub_img_raw = self.create_subscription(
             Image,
             '/docking/debug_image',
@@ -96,8 +115,56 @@ class DockingGuiROSNode(Node):
             qos_profile_sensor_data
         )
 
-        # 2. Publishers (geometry_msgs/msg/TwistStamped for OpenCR turtlebot3_ros in ROS 2 Jazzy)
-        self.cmd_vel_pub = self.create_publisher(TwistStamped, '/cmd_vel', 10)
+        # Fallback 1: 3D Object Detector debug image
+        self.sub_obj_img = self.create_subscription(
+            Image,
+            '/docking/object_debug_image',
+            self._raw_image_callback,
+            qos_profile_sensor_data
+        )
+        self.sub_obj_comp = self.create_subscription(
+            CompressedImage,
+            '/docking/object_debug_image/compressed',
+            self._compressed_image_callback,
+            qos_profile_sensor_data
+        )
+
+        # Fallback 2: Camera Feed (Raw / Decompressed)
+        self.sub_cam_decomp = self.create_subscription(
+            Image,
+            '/camera/color/image_decompressed',
+            self._fallback_camera_callback,
+            qos_profile_sensor_data
+        )
+        self.sub_cam_raw = self.create_subscription(
+            Image,
+            '/camera/color/image_raw',
+            self._fallback_camera_callback,
+            qos_profile_sensor_data
+        )
+
+        # 2. Publishers (Twist / TwistStamped depending on enable_stamped_cmd_vel)
+        self.declare_parameter('enable_stamped_cmd_vel', True)
+        self.enable_stamped_cmd_vel = self.get_parameter('enable_stamped_cmd_vel').value
+        if self.enable_stamped_cmd_vel:
+            self.cmd_vel_pub = self.create_publisher(TwistStamped, '/cmd_vel', 10)
+        else:
+            self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.pub_software_stop = self.create_publisher(Bool, '/safety/software_stop', 10)
+
+        # Internal FSM state trackers to prevent idle ping-pong logs
+        self.docking_fsm_state = "NAV2_READY"
+        self.task_fsm_state = "IDLE"
+        self._last_logged_dock_state = "NAV2_READY"
+        self._last_logged_task_state = "IDLE"
+
+        # 3. Task Manager & E-STOP Integration Subscribers
+        self.sub_task_status = self.create_subscription(
+            String, '/task/status', self._task_status_callback, 10
+        )
+        self.sub_software_stop = self.create_subscription(
+            Bool, '/safety/software_stop', self._software_stop_callback, 10
+        )
 
         # 3. Service Clients
         self.cli_start_docking = self.create_client(Trigger, '/start_docking')
@@ -119,26 +186,40 @@ class DockingGuiROSNode(Node):
                 if len(kv) == 2:
                     k, v = kv[0].strip(), kv[1].strip()
                     if k == 'STATE':
-                        old_state = self.fsm_state
-                        self.fsm_state = v
-                        if old_state != v:
-                            STATE_DESC = {
-                                'NAV2_READY': '대기 모드 (자율주행 대기)',
-                                'CHECK_STAGING': '접근 시작 및 스테이징 거리/편차 평가',
-                                'STAGING_SETTLE': '후진 후 1초 정지 대기 (진동 소멸 및 마커 정적 계측)',
-                                'STAGING_AIM': '당근선(Carrot Vector) 방향 제자리 조향 조준',
-                                'CARROT_ALIGN': '당근점(Carrot) 기반 중심선 수렴 주행',
-                                'STANDOFF_SETTLE': '스탠드오프 정지 계측 (마커 방향 정렬 후 정적 판별)',
-                                'ALIGN_PARALLEL': '책상 정면 헤딩 평행 정렬',
-                                'CRAWL_CONTACT': '최종 접근 (범퍼 접촉 대기 직진 크롤)',
-                                'DOCKED': '도킹 완료 (모터 정지 및 락)',
-                                'BACKUP_STANDOFF': '안전 거리 확보 후진 (52cm 스테이징)',
-                                'BACKUP_RETRY': '재시도 후진 (12.5cm)',
-                                'SEARCH_MARKER': '마커 탐색 스위프 회전',
-                                'ABORT_TO_NAV2': '도킹 중단 및 24cm 안전 후진'
-                            }
-                            desc = STATE_DESC.get(v, v)
-                            self.bridge.log_msg.emit(f"🔄 [단계 전환] {old_state} ➜ {v} ({desc})")
+                        old_dock_state = self.docking_fsm_state
+                        self.docking_fsm_state = v
+
+                        ACTIVE_DOCKING_STATES = {
+                            'CHECK_STAGING', 'STAGING_SETTLE', 'STAGING_AIM', 'CARROT_ALIGN',
+                            'STANDOFF_SETTLE', 'ALIGN_PARALLEL', 'CRAWL_CONTACT', 'DOCKED',
+                            'BACKUP_STANDOFF', 'BACKUP_RETRY', 'SEARCH_MARKER', 'ABORT_TO_NAV2'
+                        }
+
+                        if v in ACTIVE_DOCKING_STATES:
+                            self.fsm_state = v
+                            if self._last_logged_dock_state != v:
+                                self._last_logged_dock_state = v
+                                STATE_DESC = {
+                                    'CHECK_STAGING': '접근 시작 및 스테이징 거리/편차 평가',
+                                    'STAGING_SETTLE': '후진 후 1초 정지 대기 (진동 소멸 및 마커 정적 계측)',
+                                    'STAGING_AIM': '당근선(Carrot Vector) 방향 제자리 조향 조준',
+                                    'CARROT_ALIGN': '당근점(Carrot) 기반 중심선 수렴 주행',
+                                    'STANDOFF_SETTLE': '스탠드오프 정지 계측 (마커 방향 정렬 후 정적 판별)',
+                                    'ALIGN_PARALLEL': '책상 정면 헤딩 평행 정렬',
+                                    'CRAWL_CONTACT': '최종 접근 (범퍼 접촉 대기 직진 크롤)',
+                                    'DOCKED': '도킹 완료 (모터 정지 및 락)',
+                                    'BACKUP_STANDOFF': '안전 거리 확보 후진 (52cm 스테이징)',
+                                    'BACKUP_RETRY': '재시도 후진 (12.5cm)',
+                                    'SEARCH_MARKER': '마커 탐색 스위프 회전',
+                                    'ABORT_TO_NAV2': '도킹 중단 및 24cm 안전 후진'
+                                }
+                                desc = STATE_DESC.get(v, v)
+                                self.bridge.log_msg.emit(f"🔄 [도킹 단계] {old_dock_state} ➜ {v} ({desc})")
+                        else:
+                            # Standby / idle state from docker node
+                            if self.task_fsm_state in ('IDLE', 'STANDBY', 'NAV2_READY', 'INIT', ''):
+                                self.fsm_state = 'NAV2_READY'
+                                self._last_logged_dock_state = 'NAV2_READY'
 
                         if v in ('CHECK_STAGING', 'STAGING_SETTLE', 'STAGING_AIM', 'BACKUP_STANDOFF', 'BACKUP_PREPARE',
                                  'CARROT_ALIGN', 'STANDOFF_SETTLE', 'BACKUP_RETRY', 'CRAWL_CONTACT'):
@@ -179,6 +260,58 @@ class DockingGuiROSNode(Node):
         except Exception:
             pass
 
+    def _task_status_callback(self, msg: String):
+        try:
+            tokens = msg.data.split(',')
+            state_val = None
+            task_val = "NONE"
+            target_val = ""
+            for token in tokens:
+                kv = token.strip().split('=')
+                if len(kv) == 2:
+                    k, v = kv[0].strip(), kv[1].strip()
+                    if k == 'STATE':
+                        state_val = v
+                    elif k == 'task':
+                        task_val = v
+                    elif k == 'target':
+                        target_val = v
+
+            if state_val:
+                self.task_fsm_state = state_val
+                TASK_STATE_MAP = {
+                    'NAVIGATING': f'NAVIGATING ({task_val})',
+                    'ACQUIRING': 'ACQUIRING (시각 락온)',
+                    'ALIGNING': 'ALIGNING (헤딩 정렬)',
+                    'APPROACHING': 'APPROACHING (정밀 접근)',
+                    'DOCKING': 'DOCKING (범퍼 밀착)',
+                    'VERIFYING': 'VERIFYING (도킹 검증)',
+                    'SUCCESS': 'DOCK_SUCCESS (완료)',
+                    'ABORTED': 'ABORTED (정지됨)',
+                    'RECOVERY': 'RECOVERY (회복 대기)'
+                }
+
+                ACTIVE_TASK_STATES = {'NAVIGATING', 'ACQUIRING', 'ALIGNING', 'APPROACHING', 'DOCKING', 'VERIFYING', 'SUCCESS', 'ABORTED', 'RECOVERY'}
+                if state_val in ACTIVE_TASK_STATES:
+                    gui_state_name = TASK_STATE_MAP.get(state_val, state_val)
+                    self.fsm_state = gui_state_name
+                    if self._last_logged_task_state != gui_state_name:
+                        self._last_logged_task_state = gui_state_name
+                        info = f" [타겟: {target_val}]" if target_val else ""
+                        self.bridge.log_msg.emit(f"📋 [Task Manager] {gui_state_name}{info}")
+                else:
+                    # Idle state from task manager: only update fsm_state if docker is also standby
+                    self._last_logged_task_state = 'IDLE'
+                    if self.docking_fsm_state in ('NAV2_READY', 'INIT', 'UNKNOWN', 'IDLE', ''):
+                        self.fsm_state = 'NAV2_READY'
+        except Exception:
+            pass
+
+    def _software_stop_callback(self, msg: Bool):
+        if msg.data:
+            self.fsm_state = "E-STOPPED"
+            self.bridge.log_msg.emit("🛑 [비상 정지] 음성/소프트웨어 비상 정지 수신 (모터 차단 완료)")
+
     def _compressed_image_callback(self, msg: CompressedImage):
         try:
             np_arr = np.frombuffer(msg.data, np.uint8)
@@ -196,7 +329,33 @@ class DockingGuiROSNode(Node):
         try:
             h, w = msg.height, msg.width
             if msg.encoding in ('bgr8', 'rgb8'):
-                img = np.frombuffer(msg.data, dtype=np.uint8).reshape((h, w, 3))
+                img = np.frombuffer(msg.data, dtype=np.uint8).reshape((h, w, 3)).copy()
+                if msg.encoding == 'rgb8':
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                self._update_fps()
+                self.bridge.new_frame.emit(img)
+        except Exception:
+            pass
+
+    def _qwen_bbox_callback(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+            if data.get("target_found", False) and data.get("pixel_box"):
+                self.latest_qwen_box = data["pixel_box"]
+                self.latest_qwen_label = data.get("label", "target")
+                self.latest_qwen_time = time.time()
+                self.bridge.log_msg.emit(f"👁️ [QWEN VLM] 물체 감지: '{self.latest_qwen_label}' at {self.latest_qwen_box}")
+        except Exception:
+            pass
+
+    def _fallback_camera_callback(self, msg: Image):
+        # Only use raw camera if no debug stream has arrived in >1.0s
+        if self.last_frame_time is not None and (time.time() - self.last_frame_time) < 1.0:
+            return
+        try:
+            h, w = msg.height, msg.width
+            if msg.encoding in ('bgr8', 'rgb8'):
+                img = np.frombuffer(msg.data, dtype=np.uint8).reshape((h, w, 3)).copy()
                 if msg.encoding == 'rgb8':
                     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
                 self._update_fps()
@@ -245,14 +404,26 @@ class DockingGuiROSNode(Node):
         elif self.cli_abort.service_is_ready():
             self.cli_abort.call_async(Trigger.Request())
 
-        # 2. Publish 0-velocity directly to OpenCR /cmd_vel (TwistStamped)
-        msg = TwistStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'base_footprint'
-        msg.twist.linear.x = 0.0
-        msg.twist.angular.z = 0.0
+        # 2. Publish 0-velocity directly to /cmd_vel
+        if self.enable_stamped_cmd_vel:
+            msg = TwistStamped()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = 'base_footprint'
+            msg.twist.linear.x = 0.0
+            msg.twist.angular.z = 0.0
+        else:
+            msg = Twist()
+            msg.linear.x = 0.0
+            msg.angular.z = 0.0
         for _ in range(5):
             self.cmd_vel_pub.publish(msg)
+
+        # 3. Broadcast software stop to LLM Agent and Task Manager
+        stop_b = Bool()
+        stop_b.data = True
+        self.pub_software_stop.publish(stop_b)
+        self.fsm_state = "E-STOPPED"
+        self.bridge.log_msg.emit("🛑 [GUI E-STOP] 긴급 정지 발동! Task Manager 및 로봇 모터 0-정지 완료")
 
 
 class MainWindow(QMainWindow):
@@ -747,8 +918,72 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_new_frame(self, cv_bgr: np.ndarray):
-        """Renders incoming BGR frame directly to Qt Video Viewport."""
+        """Renders incoming BGR frame directly to Qt Video Viewport with Qwen BBox overlay."""
         try:
+            # 1. Overlay Qwen Bounding Box if detected recently (< 6.0 seconds)
+            now = time.time()
+            qwen_box = getattr(self.ros_node, 'latest_qwen_box', None)
+            qwen_time = getattr(self.ros_node, 'latest_qwen_time', 0.0)
+            qwen_label = getattr(self.ros_node, 'latest_qwen_label', 'Target')
+
+            if qwen_box is not None and (now - qwen_time) < 6.0:
+                xmin, ymin, xmax, ymax = qwen_box
+                ih, iw = cv_bgr.shape[:2]
+                xmin = max(0, min(iw - 1, int(xmin)))
+                ymin = max(0, min(ih - 1, int(ymin)))
+                xmax = max(0, min(iw - 1, int(xmax)))
+                ymax = max(0, min(ih - 1, int(ymax)))
+
+                if xmax > xmin and ymax > ymin:
+                    # Main Neon Emerald Green Box
+                    cv2.rectangle(cv_bgr, (xmin, ymin), (xmax, ymax), (0, 255, 128), 2)
+
+                    # Tech Corner Accent Brackets (Length 12px or 25% of side)
+                    cl = min(14, max(5, int(min(xmax - xmin, ymax - ymin) * 0.25)))
+                    cv2.line(cv_bgr, (xmin, ymin), (xmin + cl, ymin), (0, 255, 255), 3)
+                    cv2.line(cv_bgr, (xmin, ymin), (xmin, ymin + cl), (0, 255, 255), 3)
+                    cv2.line(cv_bgr, (xmax, ymin), (xmax - cl, ymin), (0, 255, 255), 3)
+                    cv2.line(cv_bgr, (xmax, ymin), (xmax, ymin + cl), (0, 255, 255), 3)
+                    cv2.line(cv_bgr, (xmin, ymax), (xmin + cl, ymax), (0, 255, 255), 3)
+                    cv2.line(cv_bgr, (xmin, ymax), (xmin, ymax - cl), (0, 255, 255), 3)
+                    cv2.line(cv_bgr, (xmax, ymax), (xmax - cl, ymax), (0, 255, 255), 3)
+                    cv2.line(cv_bgr, (xmax, ymax), (xmax, ymax - cl), (0, 255, 255), 3)
+
+                    # Center Crosshair
+                    cx, cy = (xmin + xmax) // 2, (ymin + ymax) // 2
+                    cv2.drawMarker(cv_bgr, (cx, cy), (0, 0, 255), markerType=cv2.MARKER_CROSS, markerSize=10, thickness=2)
+
+                    # Badge Header with Label (Supports Korean & UTF-8 via PIL)
+                    badge_text = f"QWEN: {qwen_label}"
+                    if NANUM_FONT_PATH:
+                        try:
+                            font = PILFont.truetype(NANUM_FONT_PATH, 13)
+                            tbox = font.getbbox(badge_text)
+                            tw = tbox[2] - tbox[0]
+                            th = tbox[3] - tbox[1]
+                            by1 = max(0, ymin - th - 10)
+                            by2 = max(th + 10, ymin)
+                            cv2.rectangle(cv_bgr, (xmin, by1), (xmin + tw + 14, by2), (0, 200, 100), -1)
+
+                            # Render Korean text with PIL
+                            img_rgb = cv2.cvtColor(cv_bgr, cv2.COLOR_BGR2RGB)
+                            pil_img = PILImage.fromarray(img_rgb)
+                            draw = PILDraw.Draw(pil_img)
+                            draw.text((xmin + 7, by1 + 4), badge_text, font=font, fill=(0, 0, 0))
+                            cv_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+                        except Exception:
+                            (tw, th), _ = cv2.getTextSize(badge_text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                            by1 = max(0, ymin - th - 8)
+                            by2 = max(th + 8, ymin)
+                            cv2.rectangle(cv_bgr, (xmin, by1), (xmin + tw + 10, by2), (0, 200, 100), -1)
+                            cv2.putText(cv_bgr, badge_text, (xmin + 5, by2 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+                    else:
+                        (tw, th), _ = cv2.getTextSize(badge_text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                        by1 = max(0, ymin - th - 8)
+                        by2 = max(th + 8, ymin)
+                        cv2.rectangle(cv_bgr, (xmin, by1), (xmin + tw + 10, by2), (0, 200, 100), -1)
+                        cv2.putText(cv_bgr, badge_text, (xmin + 5, by2 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+
             rgb = cv2.cvtColor(cv_bgr, cv2.COLOR_BGR2RGB)
             rgb = np.ascontiguousarray(rgb)
             h, w, ch = rgb.shape
@@ -764,7 +999,8 @@ class MainWindow(QMainWindow):
             self.lbl_video.setPixmap(pixmap)
 
             # Update FPS bar
-            self.lbl_video_info.setText(f"FPS: {self.ros_node.fps:4.1f} Hz | Res: {w}x{h} | Stream: Compressed JPEG")
+            status_desc = f"Qwen Target: '{qwen_label}' Active" if (qwen_box and now - qwen_time < 6.0) else "Live Video"
+            self.lbl_video_info.setText(f"FPS: {self.ros_node.fps:4.1f} Hz | Res: {w}x{h} | {status_desc}")
         except Exception:
             pass
 
@@ -781,39 +1017,54 @@ class MainWindow(QMainWindow):
             self.lbl_stream_badge.setStyleSheet("background-color: #064E3B; color: #34D399; font-weight: bold; border-radius: 6px; padding: 4px 10px; border: 1px solid #059669;")
 
         # Update Mode Highlights based on FSM State
-        is_nav2 = (fsm in ('NAV2_READY', 'INIT', 'WAIT_NAV2'))
-        if is_nav2:
-            self.btn_nav2.setStyleSheet("background: #0F172A; border: 2px solid #0284C7; border-radius: 8px;")
-            self.lbl_nav2_badge.setText("● ACTIVE (자율주행 대기)")
-            self.lbl_nav2_badge.setStyleSheet("background-color: #0284C7; color: #FFFFFF; font-weight: bold; border-radius: 4px; padding: 3px 6px;")
+        is_estop = any(kw in fsm for kw in ('E-STOP', 'ABORT', 'FAILSAFE'))
+        is_docking = any(kw in fsm for kw in ('DOCK', 'ACQUIR', 'ALIGN', 'APPROACH', 'CRAWL', 'STANDOFF', 'CARROT', 'CHECK_STAGING'))
+
+        if is_estop:
+            self.btn_nav2.setStyleSheet("background: #161922; border: 2px solid #232838; border-radius: 8px;")
+            self.lbl_nav2_badge.setText("● STOPPED")
+            self.lbl_nav2_badge.setStyleSheet("background-color: #7F1D1D; color: #FCA5A5; font-weight: bold; border-radius: 4px; padding: 3px 6px;")
 
             self.btn_docking.setStyleSheet("background: #161922; border: 2px solid #232838; border-radius: 8px;")
-            self.lbl_dock_badge.setText("● STANDBY")
-            self.lbl_dock_badge.setStyleSheet("background-color: #232838; color: #94A3B8; font-weight: bold; border-radius: 4px; padding: 3px 6px;")
-        else:
+            self.lbl_dock_badge.setText("● STOPPED")
+            self.lbl_dock_badge.setStyleSheet("background-color: #7F1D1D; color: #FCA5A5; font-weight: bold; border-radius: 4px; padding: 3px 6px;")
+        elif is_docking:
             self.btn_docking.setStyleSheet("background: #1C1917; border: 2px solid #D97706; border-radius: 8px;")
-            if fsm == 'DOCKED':
+            if 'SUCCESS' in fsm or fsm == 'DOCKED':
                 self.lbl_dock_badge.setText("✔ DOCKED (도킹 완료)")
                 self.lbl_dock_badge.setStyleSheet("background-color: #059669; color: #FFFFFF; font-weight: bold; border-radius: 4px; padding: 3px 6px;")
             else:
-                self.lbl_dock_badge.setText(f"● DOCKING IN PROGRESS ({fsm})")
+                self.lbl_dock_badge.setText(f"● DOCKING ({fsm})")
                 self.lbl_dock_badge.setStyleSheet("background-color: #D97706; color: #FFFFFF; font-weight: bold; border-radius: 4px; padding: 3px 6px;")
 
             self.btn_nav2.setStyleSheet("background: #161922; border: 2px solid #232838; border-radius: 8px;")
             self.lbl_nav2_badge.setText("● STANDBY")
             self.lbl_nav2_badge.setStyleSheet("background-color: #232838; color: #94A3B8; font-weight: bold; border-radius: 4px; padding: 3px 6px;")
+        else:
+            self.btn_nav2.setStyleSheet("background: #0F172A; border: 2px solid #0284C7; border-radius: 8px;")
+            if 'NAVIGAT' in fsm:
+                self.lbl_nav2_badge.setText(f"● {fsm}")
+            else:
+                self.lbl_nav2_badge.setText("● ACTIVE (자율주행 대기)")
+            self.lbl_nav2_badge.setStyleSheet("background-color: #0284C7; color: #FFFFFF; font-weight: bold; border-radius: 4px; padding: 3px 6px;")
+
+            self.btn_docking.setStyleSheet("background: #161922; border: 2px solid #232838; border-radius: 8px;")
+            self.lbl_dock_badge.setText("● STANDBY")
+            self.lbl_dock_badge.setStyleSheet("background-color: #232838; color: #94A3B8; font-weight: bold; border-radius: 4px; padding: 3px 6px;")
 
         # Update FSM State Pill
         self.val_fsm_state.setText(fsm)
-        if fsm == 'DOCKED':
+        if 'DOCKED' in fsm or 'SUCCESS' in fsm:
             self.val_fsm_state.setStyleSheet("background-color: #065F46; color: #34D399; border: 1px solid #10B981;")
-        elif 'TURN' in fsm or 'CRUISE' in fsm:
+        elif 'TURN' in fsm or 'CRUISE' in fsm or 'ACQUIR' in fsm:
             self.val_fsm_state.setStyleSheet("background-color: #581C87; color: #E9D5FF; border: 1px solid #A855F7;")
         elif 'ALIGN' in fsm:
             self.val_fsm_state.setStyleSheet("background-color: #78350F; color: #FCD34D; border: 1px solid #F59E0B;")
         elif 'CRAWL' in fsm or 'APPROACH' in fsm:
             self.val_fsm_state.setStyleSheet("background-color: #1E3A8A; color: #60A5FA; border: 1px solid #3B82F6;")
-        elif fsm in ('ABORT_TO_NAV2', 'FAILSAFE'):
+        elif 'NAVIGAT' in fsm:
+            self.val_fsm_state.setStyleSheet("background-color: #0F172A; color: #38BDF8; border: 1px solid #0284C7;")
+        elif is_estop:
             self.val_fsm_state.setStyleSheet("background-color: #7F1D1D; color: #FCA5A5; border: 1px solid #EF4444;")
         else:
             self.val_fsm_state.setStyleSheet("background-color: #161922; color: #CBD5E1; border: 1px solid #3B4252;")

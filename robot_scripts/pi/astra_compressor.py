@@ -88,9 +88,9 @@ class ZeroLagCompressor(Node):
 
     def depth_cb(self, msg: Image):
         now = time.time()
-        # In DOCKING mode: throttle to ~4 FPS (0.250s) for 3D box plane fitting while keeping Pi CPU < 20%
-        # In NAV2 mode: throttle to ~6 FPS (0.166s) for RTAB-Map 3D SLAM while cutting CPU load by 40%
-        throttle_interval = 0.250 if self.current_mode == 'DOCKING' else 0.166
+        # In DOCKING mode: throttle to ~3.0 FPS (0.333s) for 3D box plane fitting while keeping Pi CPU < 20%
+        # In NAV2 mode: throttle to ~3.3 FPS (0.300s) for RTAB-Map 3D SLAM while cutting CPU load by 60%
+        throttle_interval = 0.333 if self.current_mode == "DOCKING" else 0.300
         if now - self.last_dep_time < throttle_interval:
             return
         self.last_dep_time = now

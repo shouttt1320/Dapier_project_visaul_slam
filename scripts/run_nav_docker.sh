@@ -1,0 +1,1 @@
+/home/jjj/Documents/Dapier/Project/3_start_nav_docker.sh

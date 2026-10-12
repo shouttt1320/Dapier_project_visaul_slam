@@ -1,0 +1,114 @@
+# ==============================================================================
+# Docking Profiles for TurtleBot3 Precision Autonomous Docking System (v3.3)
+# Decouples high-level intent from low-level physical control parameters
+# Supports: ArUco Marker, 2-Stage Anchor-Guided Plane, and Direct Dominant Plane
+# ==============================================================================
+
+docking_profiles:
+  marker_box:
+    description: "ArUco Marker-based Box Docking (Front Astra S solvePnP + 4-Corner Depth)"
+    perception_type: "aruco"
+    marker_id: 2
+    support_surface: "box"
+    target_structure: "box"
+    anchor_cue: "marker"
+    default_face: "front"
+    staging_waypoint: "box_staging"
+    clearance_reference: "front_bumper"   # Physical measurement reference: front bumper tip
+    final_clearance: 0.05                 # 50mm (5cm) clearance from bumper to target face
+    coarse_speed: 0.040                   # Initial approach speed (m/s)
+    fine_speed: 0.020                     # Alignment approach speed (m/s)
+    final_crawl_speed: 0.010              # Final terminal approach speed (m/s)
+    visual_lock_distance: 0.38            # Optical visibility transition threshold (m)
+    contact_mode: "bumper"                # Terminal stop condition: physical bumper micro-switch
+    timeout_sec: 75.0
+
+  desk_red_object:
+    description: "2-Stage Anchor-Guided Surface Docking (HSV Red Anchor X + Desk Plane Normal)"
+    perception_type: "anchor_guided_plane"
+    primary_detector: "yolo_world"
+    fallback_detector: "hsv_red"
+    target_structure: "desk"
+    anchor_cue: "red_object"
+    default_face: "front"
+    staging_waypoint: "desk_staging"
+    
+    # 2-Stage Plane Extraction Parameters
+    structure_plane:
+      roi_vertical_offset_px: 15          # Sample desk front 15px below red anchor bbox
+      roi_width_multiplier: 3.5           # Expand horizontal ROI to 3.5x anchor width
+      roi_height_px: 40                   # Vertical 40px band for desk front edge/panel
+      min_inlier_points: 300              # Minimum valid depth points required
+      max_plane_residual_m: 0.015         # Maximum allowable plane fitting residual (1.5cm)
+
+    clearance_reference: "front_bumper"   # Physical measurement reference: front bumper tip
+    final_clearance: 0.05                 # 50mm (5cm) clearance from bumper to desk front edge
+    coarse_speed: 0.035                   # Initial approach speed (m/s)
+    fine_speed: 0.020                     # Alignment approach speed (m/s)
+    final_crawl_speed: 0.010              # Final terminal approach speed (m/s)
+    visual_lock_distance: 0.35            # Object tracking optical transition threshold (m)
+    contact_mode: "bumper"                # Terminal stop condition: physical bumper micro-switch
+    timeout_sec: 75.0
+
+  desk_direct:
+    description: "Direct Dominant Desk Plane Docking (No Anchor: RANSAC Vertical/Horizontal Plane)"
+    perception_type: "dominant_plane"
+    anchor_detector: "none"
+    target_structure: "desk"
+    anchor_cue: null
+    default_face: "front"
+    staging_waypoint: "desk_staging"
+
+    # Direct Dominant Plane Extraction Parameters
+    structure_plane:
+      ground_filter_height_m: -0.15       # Filter ground points Y <= -0.15m from camera
+      min_depth_m: 0.45                   # Minimum depth for desk front
+      max_depth_m: 1.80                   # Maximum depth for desk front
+      min_inlier_points: 500              # Minimum depth points for dominant plane
+      max_plane_residual_m: 0.020         # Maximum allowable plane fitting residual (2.0cm)
+
+    clearance_reference: "front_bumper"
+    final_clearance: 0.05
+    coarse_speed: 0.035
+    fine_speed: 0.020
+    final_crawl_speed: 0.010
+    visual_lock_distance: 0.35
+    contact_mode: "bumper"
+    timeout_sec: 75.0
+
+  charger_station:
+    description: "Charging Station Docking (Dual / Single ArUco Marker ID 1)"
+    perception_type: "aruco"
+    marker_id: 1
+    support_surface: "charger"
+    target_structure: "charger"
+    anchor_cue: "marker"
+    default_face: "front"
+    staging_waypoint: "charger_staging"
+    clearance_reference: "front_bumper"
+    final_clearance: 0.05
+    coarse_speed: 0.040
+    fine_speed: 0.020
+    final_crawl_speed: 0.010
+    visual_lock_distance: 0.38
+    contact_mode: "bumper"
+    timeout_sec: 75.0
+
+  pcd_icp_station:
+    description: "Taught Point Cloud Template ICP Docking (Coarse Nav2 Standoff + Point-to-Plane ICP Fine Alignment)"
+    perception_type: "pcd_icp"
+    clearance_reference: "front_bumper"
+    final_clearance: 0.05                 # 50mm (5cm) clearance from bumper to target face
+    coarse_speed: 0.035
+    fine_speed: 0.020
+    final_crawl_speed: 0.010
+    visual_lock_distance: 0.38
+    contact_mode: "bumper"                # Terminal stop condition: physical bumper or stall
+    timeout_sec: 90.0
+    icp_settings:
+      min_fitness: 0.65
+      max_rmse: 0.025
+      max_allowable_dx: 0.15
+      max_allowable_dy: 0.10
+      max_allowable_dyaw_deg: 15.0
+      required_stable_frames: 3

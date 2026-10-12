@@ -28,8 +28,8 @@ HELP_MSG = """
   [Controls]
       ↑ / w  : 전진 (Forward, 기본 0.15 m/s)
       ↓ / x  : 후진 (Reverse, 기본 -0.15 m/s)
-      ← / a  : 좌회전 (Turn Left, 기본 0.4 rad/s)
-      → / d  : 우회전 (Turn Right, 기본 -0.4 rad/s)
+      ← / a  : 좌회전 (Turn Left, 기본 0.20 rad/s)
+      → / d  : 우회전 (Turn Right, 기본 -0.20 rad/s)
    스페이스 / s: 즉시 정지 (Full Stop)
 
       + / -  : 속도 증가 / 감소
@@ -48,7 +48,7 @@ class ResponsiveTeleop(Node):
         self.target_wz = 0.0
         
         self.speed_step_vx = 0.15
-        self.speed_step_wz = 0.40
+        self.speed_step_wz = 0.20
         self.max_vx = 0.26
         self.max_wz = 1.80
 
@@ -128,12 +128,12 @@ def main():
             # Increase Speed
             elif key in ('+', '='):
                 node.speed_step_vx = min(node.max_vx, node.speed_step_vx + 0.03)
-                node.speed_step_wz = min(node.max_wz, node.speed_step_wz + 0.10)
+                node.speed_step_wz = min(node.max_wz, node.speed_step_wz + 0.05)
                 print(f"\n>> 속도 증가: 기준 속도 {node.speed_step_vx:.2f} m/s, 회전 {node.speed_step_wz:.2f} rad/s")
             # Decrease Speed
             elif key in ('-', '_'):
                 node.speed_step_vx = max(0.06, node.speed_step_vx - 0.03)
-                node.speed_step_wz = max(0.15, node.speed_step_wz - 0.10)
+                node.speed_step_wz = max(0.10, node.speed_step_wz - 0.05)
                 print(f"\n>> 속도 감소: 기준 속도 {node.speed_step_vx:.2f} m/s, 회전 {node.speed_step_wz:.2f} rad/s")
             # Quit
             elif key in ('q', 'Q', '\x03'):

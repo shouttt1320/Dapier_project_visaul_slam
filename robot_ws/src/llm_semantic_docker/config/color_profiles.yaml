@@ -1,0 +1,45 @@
+# ==============================================================================
+# Color Profiles for Visual Grounding (Anchor Detection)
+# HSV Color Ranges for OpenCV (H: 0-180, S: 0-255, V: 0-255)
+# ==============================================================================
+
+colors:
+  red:
+    description: "Standard red objects / markers (Dual-band due to HSV red wrap-around)"
+    lower1: [0, 100, 70]
+    upper1: [10, 255, 255]
+    lower2: [170, 100, 70]
+    upper2: [180, 255, 255]
+    aliases: ["red", "빨강", "빨간색", "빨간물체", "빨간상자", "red_box", "red_object"]
+
+  blue:
+    description: "Blue objects / markers"
+    lower1: [100, 100, 70]
+    upper1: [130, 255, 255]
+    lower2: null
+    upper2: null
+    aliases: ["blue", "파랑", "파란색", "파란물체", "파란컵", "blue_cup", "blue_box"]
+
+  green:
+    description: "Green objects / tape"
+    lower1: [40, 80, 70]
+    upper1: [85, 255, 255]
+    lower2: null
+    upper2: null
+    aliases: ["green", "초록", "초록색", "녹색", "green_object"]
+
+  yellow:
+    description: "Yellow objects / containers"
+    lower1: [20, 100, 100]
+    upper1: [35, 255, 255]
+    lower2: null
+    upper2: null
+    aliases: ["yellow", "노랑", "노란색", "노란물체", "yellow_cup", "yellow_box"]
+
+  orange:
+    description: "Orange cones / markers"
+    lower1: [11, 100, 100]
+    upper1: [19, 255, 255]
+    lower2: null
+    upper2: null
+    aliases: ["orange", "주황", "주황색", "orange_box"]

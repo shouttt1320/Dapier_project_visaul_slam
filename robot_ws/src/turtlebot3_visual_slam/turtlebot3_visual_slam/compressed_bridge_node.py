@@ -9,6 +9,7 @@ and republishes clean uncompressed Image & CameraInfo topics for RTAB-Map & RViz
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.executors import MultiThreadedExecutor, ExternalShutdownException
 from sensor_msgs.msg import CompressedImage, Image, CameraInfo
 from cv_bridge import CvBridge
 import cv2
@@ -23,16 +24,16 @@ class CompressedBridgeNode(Node):
         super().__init__('compressed_bridge_node')
         self.bridge = CvBridge()
 
-        # QoS for receiving from Wi-Fi (sensor_data / BEST_EFFORT, depth=1)
+        # QoS for receiving from Wi-Fi (sensor_data / BEST_EFFORT, depth=10)
         qos_sub = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
-            depth=1
+            depth=10
         )
         qos_info_sub = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
-            depth=5
+            depth=10
         )
 
         # QoS for publishing locally to RTAB-Map (RELIABLE, depth=10)
@@ -95,6 +96,7 @@ class CompressedBridgeNode(Node):
 
         self.latest_color = None
         self.latest_depth = None
+        self.latest_depth_msg = None
 
         # Pre-initialize bootstrap CameraInfo for Astra S 320x240 to eliminate 10s wait
         self.latest_info = CameraInfo()
@@ -106,10 +108,7 @@ class CompressedBridgeNode(Node):
         self.latest_info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
         self.latest_info.p = [285.17, 0.0, 159.5, 0.0, 0.0, 285.17, 119.5, 0.0, 0.0, 0.0, 1.0, 0.0]
 
-        # Synchronized dispatch timer at 15 Hz
-        self.timer = self.create_timer(1.0 / 15.0, self.dispatch_sync_pair)
-
-        self.get_logger().info('Compressed Bridge Node active: receiving compressed Wi-Fi, publishing synchronized decompressed images locally.')
+        self.get_logger().info('Compressed Bridge Node active: event-driven Wi-Fi decompress & sync bridge.')
 
     def mode_cb(self, msg: String):
         mode_val = msg.data.strip().upper()
@@ -128,6 +127,8 @@ class CompressedBridgeNode(Node):
                 # Convert BGR to RGB for ROS 2 standard
                 img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 self.latest_color = (img_rgb, msg.header)
+                # Dispatch immediately upon new frame arrival (Zero-lag event driven)
+                self.dispatch_sync_pair()
         except Exception as e:
             self.get_logger().error(f'Color decompress error: {e}')
 
@@ -137,6 +138,10 @@ class CompressedBridgeNode(Node):
             depth = cv2.imdecode(np_arr, cv2.IMREAD_UNCHANGED)
             if depth is not None:
                 self.latest_depth = (depth, msg.header)
+                # Pre-convert to ROS Image once upon arrival
+                msg_d = self.bridge.cv2_to_imgmsg(depth, encoding='16UC1')
+                msg_d.header.frame_id = 'camera_color_optical_frame'
+                self.latest_depth_msg = msg_d
         except Exception as e:
             self.get_logger().error(f'Depth decompress error: {e}')
 
@@ -173,60 +178,34 @@ class CompressedBridgeNode(Node):
         if self.latest_color is None or self.latest_info is None:
             return
 
-        stamp = self.get_clock().now().to_msg()
+        img_rgb, col_hdr = self.latest_color
+        # Preserve original camera timestamp if set, otherwise fallback to local time
+        stamp = col_hdr.stamp if (col_hdr.stamp.sec > 0 or col_hdr.stamp.nanosec > 0) else self.get_clock().now().to_msg()
         frame_id = 'camera_color_optical_frame'
 
-        # Case A: DOCKING Mode -> Dispatch Color & Info immediately (Zero waiting for depth!), and Depth if available
-        if self.current_mode == 'DOCKING':
-            img_rgb, _ = self.latest_color
-            msg_c = self.bridge.cv2_to_imgmsg(img_rgb, encoding='rgb8')
-            msg_c.header.stamp = stamp
-            msg_c.header.frame_id = frame_id
-            self.pub_color.publish(msg_c)
-
-            msg_i = self._create_info_msg(stamp, frame_id)
-            self.pub_info.publish(msg_i)
-
-            if self.latest_depth is not None:
-                img_depth, _ = self.latest_depth
-                msg_d = self.bridge.cv2_to_imgmsg(img_depth, encoding='16UC1')
-                msg_d.header.stamp = stamp
-                msg_d.header.frame_id = frame_id
-                self.pub_depth.publish(msg_d)
-            return
-
-        # Case B: NAV2 Mode -> Dispatch synchronized RGB-D pair for RTAB-Map SLAM
-        if self.latest_depth is None:
-            return
-
-        img_rgb, _ = self.latest_color
-        img_depth, _ = self.latest_depth
-
-        # 1. Color Image
+        # 1. Color Image (published immediately at native rate)
         msg_c = self.bridge.cv2_to_imgmsg(img_rgb, encoding='rgb8')
         msg_c.header.stamp = stamp
         msg_c.header.frame_id = frame_id
         self.pub_color.publish(msg_c)
 
-        # 2. Depth Image (16UC1 mm uint16)
-        msg_d = self.bridge.cv2_to_imgmsg(img_depth, encoding='16UC1')
-        msg_d.header.stamp = stamp
-        msg_d.header.frame_id = frame_id
-        self.pub_depth.publish(msg_d)
-
-        # 3. Camera Info
+        # 2. Camera Info (synchronized with color timestamp)
         msg_i = self._create_info_msg(stamp, frame_id)
         self.pub_info.publish(msg_i)
 
-
-from rclpy.executors import ExternalShutdownException
+        # 3. Depth Image (synchronized with color timestamp)
+        if self.latest_depth_msg is not None:
+            self.latest_depth_msg.header.stamp = stamp
+            self.pub_depth.publish(self.latest_depth_msg)
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = CompressedBridgeNode()
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
