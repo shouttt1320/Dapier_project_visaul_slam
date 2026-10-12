@@ -65,8 +65,11 @@ weights/
 *.pt
 *.ply
 
-# External vendor drivers
+# External vendor drivers & unused hardware packages
 robot_ws/src/ros2_astra_camera/
+robot_ws/src/so101_moveit_config
+robot_ws/src/turtlebot3_dual_so101/
 
 # Local agent artifacts
 .agents/
+
