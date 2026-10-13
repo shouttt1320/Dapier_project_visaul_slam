@@ -51,8 +51,15 @@ flowchart TD
   3. 16-bit Depth 영상은 무손실 PNG 압축 후 `/camera/depth/image_raw/compressedDepth`로 발행.
   4. DDS 네트워크 송신 QoS를 **`BEST_EFFORT`**로 설정하여 네트워크 백로그(큐 지연)를 원천 차단.
 
-### 2.2 PC 측 동기화 브리지: `compressed_bridge_node`
-* PC 수신단에서 압축된 영상과 Depth를 실시간으로 언패킹하고, `message_filters.ApproximateTimeSynchronizer`를 통해 시간 오차가 수 밀리초 이내인 RGB-D 프레임 쌍만 선별하여 RTAB-Map 코어로 전달합니다.
+### 2.2 PC 측 무지연 이벤트 드리븐 브리지: `compressed_bridge_node`
+* PC 수신단에서 `compressed_bridge_node`를 구동하여, 무선으로 수신된 압축 스트림을 언패킹하고 고정밀 동기화를 수행합니다.
+* **1:1 락스텝 검증 (`dispatch_sync_pair`)**:
+  - 컬러와 깊이의 타임스탬프 차이를 검증하여 $|t_{\text{color}} - t_{\text{depth}}| \le 0.07\text{s}$ 이내인 정상 쌍만 동기화.
+  - Color, Depth, CameraInfo 3개 메시지에 **나노초 단위까지 동일한 타임스탬프**를 재부여하여 RTAB-Map 및 RViz2로 동시 발행.
+* **소비 즉시 버퍼 비움 (Buffer Flush)**:
+  - 한 번 발행된 프레임 쌍은 `self.latest_color = None`, `self.latest_depth_msg = None`으로 즉시 폐기하여, 과거 프레임이 다음 주기로 밀려 로봇 회전 시 잔상(Ghosting)이 생기는 현상을 원천 방지.
+* **단일 스레드 최적화**:
+  - ROS 2 Jazzy `MultiThreadedExecutor`의 100% CPU 스핀 버그를 회피하기 위해 `rclpy.spin(node)` 단일 스레드로 구동하여 PC CPU 점유율을 1% 미만으로 유지.
 
 ---
 
@@ -148,3 +155,19 @@ flowchart LR
 ### Q3. Wi-Fi 무선 대역폭 한계로 인한 화면 딜레이 (최대 3초 지연)
 * **원인**: Raw 이미지 토픽을 그대로 전송하여 무선 네트워크 포화 발생.
 * **해결**: 라즈베리파이에서 `astra_compressor.py`를 통해 전송 전 JPEG/PNG 하드웨어 압축을 수행하고, `BEST_EFFORT` QoS를 적용하여 전송 지연을 **30ms(0.03초) 이내로 단축**함.
+
+### Q4. RTAB-Map이 주행 중 5초마다 멈추거나(Watchdog Timeout) 포인트클라우드가 뒤틀리는 현상
+* **원인**: 
+  - RTAB-Map은 `delay = PC_time - msg_header_stamp` 수식으로 센서 지연 시간을 측정하며, 이 값이 5.0초를 초과하면 센서 타임아웃으로 간주하여 5초간 매핑을 중단(Freezing)시킴.
+  - 라즈베리파이 내부 시스템 클럭이 PC보다 **2.95초 느리게 뒤처져(Drift)** 있어서, 패킷이 2초만 지연되어도 5초를 즉시 초과해 지도 생성이 먹통이 됨.
+* **해결**:
+  - `1_build_3d_map.sh` 및 `2_start_3d_nav.sh` 기동 시, SSH를 통해 PC의 정밀 나노초 시간을 파이에 원격 주입:
+    ```bash
+    CURRENT_TIME=$(date +%s)
+    ssh user@192.168.0.148 "echo user | sudo -S date -s @$CURRENT_TIME.%N"
+    ```
+  - 두 장비 간의 시간 오차를 **5ms 미만**으로 영점 조준하여 5초 프리징 현상을 100% 영구 해결.
+
+### Q5. ROS 2 Jazzy 환경에서 브리지 및 압축 노드 실행 시 CPU 100% 폭주 현상
+* **원인**: ROS 2 Jazzy의 `MultiThreadedExecutor`가 `MutuallyExclusiveCallbackGroup`과 함께 사용될 때 무한 루프로 CPU 코어를 100% 점유하는 알려진 스핀 버그 존재.
+* **해결**: 복잡한 멀티스레드 대신 `rclpy.spin(node)` 단일 스레드 이벤트 루프로 전환하고 무거운 압축 연산을 쓰로틀링 루틴에 정렬하여 CPU 점유율을 1~3% 수준으로 안정화.

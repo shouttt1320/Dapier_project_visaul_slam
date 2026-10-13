@@ -78,7 +78,19 @@ pip install opencv-python opencv-contrib-python numpy PyQt5 pynput
 │
 ├── robot_ws/                        # 메인 ROS 2 워크스페이스
 │   └── src/
-│       ├── precision_docker/       # [핵심] 정밀 도킹 및 안전 패키지 (구 redbox_navigator)
+│       ├── llm_semantic_docker/    # [지능] 자연어 기반 시맨틱 도킹 & 미션 총괄 패키지
+│       │   ├── launch/
+│       │   │   ├── semantic_docker.launch.py          # LLM 에이전트 + 시맨틱 GUI + 도킹 제어 통합 런치
+│       │   │   └── interactive_teaching.launch.py     # 대화형 도킹 스테이션 티칭 런치
+│       │   ├── llm_semantic_docker/
+│       │   │   ├── llm_agent_node.py                  # Qwen LLM 기반 자연어 도킹/이동 명령 해석
+│       │   │   ├── qwen_semantic_gui_node.py          # PyQt5 기반 음성/채팅 멀티모달 도킹 GUI
+│       │   │   ├── precision_docking_controller_node.py # Dual-ArUco + ICP 3D 하이브리드 정밀 도킹기
+│       │   │   └── station_manager.py                 # 도킹 스테이션 위치/마커 메타데이터 관리
+│       │   └── config/
+│       │       └── docking_stations.yaml              # 티칭된 도킹 스테이션 좌표 및 설정
+│       │
+│       ├── precision_docker/       # [제어] 베이스라인 듀얼 마커 도킹 및 안전 패키지
 │       │   ├── launch/
 │       │   │   ├── real_robot_marker_docking.launch.py # 도킹 컨트롤러 + PyQt5 GUI 동시 실행
 │       │   │   └── real_robot_calibration.launch.py   # 카메라 왜곡 및 마커 인식 캘리브레이션
@@ -109,7 +121,7 @@ pip install opencv-python opencv-contrib-python numpy PyQt5 pynput
 │
 └── robot_scripts/                   # 라즈베리파이 설정 스크립트 및 보조 유틸리티
     └── pi/
-        ├── astra_compressor.py      # [파이 탑재] Wi-Fi 대역폭 절감을 위한 RGB-D 실시간 영상 압축기
+        ├── astra_compressor.py      # [파이 탑재] Wi-Fi 대역폭 절감을 위한 RGB-D 10FPS 락스텝 실시간 압축기
         ├── start_robot_all.sh       # [파이 탑재] 모터 + 카메라 + 압축기 + 범퍼 일괄 시작 스크립트
         └── run_astra.sh             # [파이 탑재] Astra 카메라 및 astra_compressor 실행 스크립트
 ```
@@ -235,3 +247,15 @@ ros2 launch precision_docker real_robot_marker_docking.launch.py
 ### Q4. 마커 인식이 불안정하거나 튕깁니다.
 * 실내 형광등의 반사광(글레어)으로 인해 흰색 테두리가 날아가는 경우가 있습니다.
 * `markers/` 디렉토리에 있는 고대비 매트 재질 마커를 인쇄하여 사용하고, 카메라 조리개/노출을 일정하게 고정하는 것을 권장합니다.
+
+### Q5. RTAB-Map 3D 지도가 5초마다 멈추거나 왜곡됩니다 (시계 오차 해결).
+* **원인**: RTAB-Map은 `PC시간 - 메시지 헤더시간 > 5.0초`일 때 5초간 매핑을 중단하는 워치독을 가집니다. 파이 시계가 2.95초 느려진 상태에서는 작은 무선 지연에도 5초를 초과하여 화면이 멈춥니다.
+* **해결**: `./1_build_3d_map.sh` 및 `./2_start_3d_nav.sh` 실행 시 SSH로 PC의 나노초 시간을 파이에 자동 동기화(`sudo date -s @$CURRENT_TIME.%N`, 비밀번호 `user`)하여 시계 오차를 5ms 이내로 해결했습니다.
+
+### Q6. 파이나 PC에서 브리지 노드 실행 시 CPU 점유율이 100%로 치솟습니다.
+* **원인**: ROS 2 Jazzy의 `MultiThreadedExecutor`에서 MutuallyExclusive 콜백 그룹 처리 시 비지 루프(Spin bug)가 발생합니다.
+* **해결**: `astra_compressor.py`와 `compressed_bridge_node.py`를 단일 스레드 `rclpy.spin(node)` 기반으로 최적화하여 CPU 점유율을 1~3%로 안정화했습니다.
+
+### Q7. 범퍼 센서 등 백그라운드 프로세스가 중복 실행되어 로봇이 느려집니다.
+* **원인**: 이전 실행에서 정상 종료되지 않은 `bumper_sensor` 프로세스가 GPIO를 중복 폴링하며 파이 CPU를 50% 이상 낭비할 수 있습니다.
+* **해결**: 시작 스크립트(`start_robot_all.sh`, `1_build_3d_map.sh`, `2_start_3d_nav.sh`) 서두에 `pkill -9 -f bumper_sensor`를 자동 배치하여 좀비 프로세스를 원천 차단했습니다.

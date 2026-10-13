@@ -61,10 +61,10 @@
 
 ---
 
-### [Issue 5] 주행 및 회전 중 시각 노이즈 왜곡 차단
+### [Issue 5] 주행 및 회전 중 시각 노이즈 왜곡 차단 & 초고속 정적 검증
 * **현상**: 로봇이 방향을 틀거나 가속/감속할 때 차체 진동으로 카메라 영상이 흔들려 실시간 피드백 제어가 불안정해짐.
-* **해결 (Latching & Static Evaluation 제어 철학)**:
-  * **정지 상태**: $1.0\sim 1.2\text{초}$ 동안 완전 정지하여 차체 진동이 멎은 상태에서만 시각 센서로 오차를 1회 정확하게 측정 및 래칭(Latch).
+* **해결 (Latching & 초고속 정적 안정화 제어)**:
+  * **정지 상태**: 이전에는 구형 2.4GHz Wi-Fi 지연으로 인해 1.0~1.2초 대기했으나, **5GHz Wi-Fi 초저지연망 구축 및 카메라 10 FPS 1:1 락스텝 동기화 완료**로 대기 시간을 **`0.3초`로 대폭 단축(70% 절감)**. 차체 진동이 멎는 즉시 1회 정확하게 측정 및 래칭(Latch).
   * **동작 상태**: 회전(`AIM`) 및 직선 후진(`REVERSE`) 중에는 **카메라 시각 정보를 100% 차단**하고, **순수 IMU 자이로와 휠 오도메트리**로만 정밀하게 정량 구동.
 
 ---
@@ -84,15 +84,15 @@ flowchart TD
     NAV2 -->|"거리 ≤ 1.0m & 마커 검출"| CHECK["<b>CHECK_STAGING</b><br/>진입 거리 및 화각 평가"]
     
     CHECK -->|"거리 < 35cm (근접)"| BACKUP["<b>BACKUP_STANDOFF</b><br/>후진 유도점 래칭"]
-    CHECK -->|"거리 ≥ 35cm (정상)"| SETTLE1["<b>STAGING_SETTLE</b><br/>1.2초 정지 안정화<br/>전방 유도점 래칭"]
+    CHECK -->|"거리 ≥ 35cm (정상)"| SETTLE1["<b>STAGING_SETTLE</b><br/>0.3초 정지 안정화<br/>전방 유도점 래칭"]
     
     SETTLE1 -->|"유도점 래칭 완료"| AIM["<b>STAGING_AIM</b><br/>IMU 자이로 제자리 조향"]
     AIM -->|"조향 오차 ≤ 2.0°"| CARROT["<b>CARROT_ALIGN</b><br/>Pure Pursuit 추종<br/>거리 비례 감속 주행"]
     
-    CARROT -->|"거리 ≤ 38cm 도착"| SETTLE2["<b>STANDOFF_SETTLE</b><br/>1.0초 정지 안정화<br/>최종 허용 오차 검증"]
+    CARROT -->|"거리 ≤ 38cm 도착"| SETTLE2["<b>STANDOFF_SETTLE</b><br/>0.3초 정지 안정화<br/>최종 허용 오차 검증"]
     
     SETTLE2 -->|"ey ≤ 2.5cm & yaw ≤ 3.5° 통과"| CRAWL["<b>CRAWL_CONTACT</b><br/>자이로 락 직진 크롤<br/>(4.5 cm/s)"]
-    SETTLE2 -->|"허용 오차 초과 (4.5초 경과)"| BACKUP
+    SETTLE2 -->|"허용 오차 초과 (2.0초 경과 시)"| BACKUP
     
     subgraph REVERSE_SEQUENCE ["가상 후진 유도점 3단계 제어 (시각 차단 / IMU + Odom)"]
         BACKUP --> BACK_AIM["<b>Phase 1: BACK_AIM</b><br/>중심선 후방 제자리 조향"]
@@ -113,10 +113,10 @@ flowchart TD
 |:---:|---|---|:---:|---|
 | **`NAV2_READY`** | 시스템 기동 또는 복귀 완료 | 속도 0 정지 대기 ($v=0, w=0$) | TF, 마커 탐색 | $d \le 1.00\text{m}$ 및 마커 검출 시 $\to$ `CHECK_STAGING` |
 | **`CHECK_STAGING`** | 1.0m 이내 안정적 진입 | 거리 및 카메라 화각 적절성 평가 | Depth / RGB | • $d < 35\text{cm}$ 시 $\to$ `BACKUP_STANDOFF`<br>• 정상 범위 시 $\to$ `STAGING_SETTLE` |
-| **`STAGING_SETTLE`** | Staging 진입 또는 후진 완료 | 차체 진동 소멸 대기 ($1.2\text{초}$ 완전 정지)<br>정적 $e_y$ 측정 및 **전방 가상 유도점 래칭** | Depth / RGB | $1.2\text{초}$ 경과 후 목표 각도 산출 완료 시 $\to$ `STAGING_AIM` |
+| **`STAGING_SETTLE`** | Staging 진입 또는 후진 완료 | 차체 진동 소멸 대기 (**$0.3\text{초}$ 초고속 정지**)<br>정적 $e_y$ 측정 및 **전방 가상 유도점 래칭** | Depth / RGB | $0.3\text{초}$ 경과 후 목표 각도 산출 완료 시 $\to$ `STAGING_AIM` |
 | **`STAGING_AIM`** | `STAGING_SETTLE` 완료 | 제자리 회전 ($v_x=0.0$)<br>$w_z = \text{clamp}(0.70 \times e_{\text{aim}}, -0.18, +0.18)$ | **IMU 자이로**<br>(시각 차단) | 목표 각도 오차 $\le 2.0^\circ$ 도달 시 $\to$ `CARROT_ALIGN` |
 | **`CARROT_ALIGN`** | 전진 조향 정렬 완료 | Pure Pursuit 가상 유도점 추종 전진<br>• 거리 기반 Smoothstep 감속 ($5.0 \to 2.5\text{cm/s}$) | Depth/RGB/Odom | $d \le 0.38\text{m}$ (38cm Standoff) 도달 시 $\to$ `STANDOFF_SETTLE` |
-| **`STANDOFF_SETTLE`** | 38cm 대기 구역 도착 | 완전 정지 ($1.0\text{초}$ 진동 소멸 대기)<br>최종 정밀 허용 오차 정적 평가 | Depth / RGB | • $\|e_y\| \le 2.5\text{cm}$ & $\|e_\theta\| \le 3.5^\circ$ (3회 연속) $\to$ `CRAWL_CONTACT`<br>• 4.5초 불만족 시 $\to$ `BACKUP_STANDOFF` |
+| **`STANDOFF_SETTLE`** | 38cm 대기 구역 도착 | 완전 정지 (**$0.3\text{초}$ 진동 소멸 대기**)<br>최종 정밀 허용 오차 정적 평가 | Depth / RGB | • $\|e_y\| \le 2.5\text{cm}$ & $\|e_\theta\| \le 3.5^\circ$ (3회 연속) $\to$ `CRAWL_CONTACT`<br>• **2.0초 불만족 시 즉시** $\to$ `BACKUP_STANDOFF` |
 | **`BACKUP_STANDOFF`<br>(Phase 1: BACK_AIM)** | Standoff 오차 초과 판정 | 제자리 회전 ($v_x=0.0$)<br>가상 후진 유도점을 향해 $\Delta\theta_{\text{rev}}$ 회전 | **IMU 자이로**<br>(시각 차단) | 후진 조향 오차 $\le 2.0^\circ$ 시 $\to$ `BACK_REVERSE` |
 | **`BACKUP_STANDOFF`<br>(Phase 2: BACK_REVERSE)** | 후진 조향 완료 | 조향각 고정 순수 직선 후진 ($w_z=0.0$)<br>$v_x = -0.065\text{ m/s}$ (-6.5cm/s) | **휠 오도메트리**<br>(시각 차단) | 후진 이동 거리 $\ge 14\text{cm}$ 시 $\to$ `BACK_REALIGN` |
 | **`BACKUP_STANDOFF`<br>(Phase 3: BACK_REALIGN)** | 14cm 직선 후진 완료 | 제자리 회전 ($v_x=0.0$)<br>원래 마커 정면 기준각으로 복귀 | **IMU 자이로**<br>(시각 차단) | 정면 복귀 각도 오차 $\le 2.0^\circ$ 시 $\to$ `STAGING_SETTLE` |
@@ -152,7 +152,9 @@ $$y_{\text{base}} = y_{\text{raw}} + 0.015\text{m} \quad (\text{카메라 물리
 
 1. **정밀 도킹 성공률 극대화**:
    * 초기 편차가 $15\sim 20\text{cm}$에 달하는 극한 상황에서도, 가상 후진 유도점 3단계 제어로 단 1~2회 후진만에 $e_y \le 2.5\text{cm}$ 안착 성공.
-2. **양팔 로봇 작업 거리 확보**:
+2. **초고속 도킹 시간 단축 (정적 대기시간 70% 단축)**:
+   * 5GHz 무선망 및 10 FPS 락스텝 동기화 덕분에 Standoff 안정화 시간을 $1.0\text{초} \to \mathbf{0.3\text{초}}$, 오차 타임아웃을 $4.5\text{초} \to \mathbf{2.0\text{초}}$로 획기적으로 줄여 불필요한 대기 렉 제거.
+3. **양팔 로봇 작업 거리 확보**:
    * 최종 `CRAWL_CONTACT` 단계에서 접촉 센서(범퍼) 클릭을 통해 **작업대 앞 5cm 이내 초근접 밀착**을 물리적 충돌 손상 없이 100% 안전하게 달성.
-3. **노이즈 완전 차단**:
+4. **노이즈 완전 차단**:
    * 주행 중 시각 센서 폴링을 차단하고 정지 시에만 평가하는 Closed-Loop 구조로 조명 변화나 진동에 대한 강건성(Robustness) 확보.

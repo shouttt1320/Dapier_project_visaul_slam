@@ -40,6 +40,8 @@ test_cmd_vel.py
 test_dual_marker.py
 test_marker_accuracy.py
 run_pi_hardware_test.sh
+so101_interactive_ik.py
+so101_pick_and_place_demo.py
 
 # Unused Drivers, Simulation & Legacy Code
 unused_drivers/
@@ -69,6 +71,7 @@ weights/
 robot_ws/src/ros2_astra_camera/
 robot_ws/src/so101_moveit_config
 robot_ws/src/turtlebot3_dual_so101/
+OtherProjects/
 
 # Local agent artifacts
 .agents/
