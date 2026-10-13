@@ -20,8 +20,8 @@ sleep 1
 echo "=================================================================="
 echo " [Step 1] Synchronizing time & Starting Robot on Raspberry Pi..."
 echo "=================================================================="
-CURRENT_TIME=$(date +%s)
-ssh user@192.168.0.148 "echo turtlebot | sudo -S date -s @$CURRENT_TIME; echo user | sudo -S iwconfig wlan0 power off 2>/dev/null || true" > /dev/null 2>&1 || true
+CURRENT_TIME=$(date +%s.%N)
+ssh user@192.168.0.148 "echo user | sudo -S timedatectl set-ntp false 2>/dev/null; echo user | sudo -S date -s @$CURRENT_TIME; echo user | sudo -S iwconfig wlan0 power off 2>/dev/null || true" > /dev/null 2>&1 || true
 ssh user@192.168.0.148 "nohup ~/start_robot_all.sh > /tmp/start_all.log 2>&1 &" || true
 
 echo "Waiting 6 seconds for robot topics & gyro calibration to initialize..."

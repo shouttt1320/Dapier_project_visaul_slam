@@ -24,7 +24,6 @@ from interactive_markers.interactive_marker_server import InteractiveMarkerServe
 from interactive_markers.menu_handler import MenuHandler
 
 from llm_semantic_docker.station_manager import StationManager
-from llm_semantic_docker.pointcloud_icp_matcher import PointCloudICPMatcher
 
 
 class InteractiveDockingTeacherNode(Node):
@@ -58,7 +57,6 @@ class InteractiveDockingTeacherNode(Node):
 
         # Managers
         self.station_manager = StationManager()
-        self.matcher = PointCloudICPMatcher(voxel_size=0.01)
 
         # Interactive Marker Server
         self.server = InteractiveMarkerServer(self, "docking_teacher_gizmo")
@@ -151,7 +149,7 @@ class InteractiveDockingTeacherNode(Node):
 
         # Menu Handler
         self.menu_handler = MenuHandler()
-        self.menu_handler.insert("💾 Save Station (PCD + YAML)", callback=self._menu_save_callback)
+        self.menu_handler.insert("💾 Save Station (YAML)", callback=self._menu_save_callback)
 
         # Submenu for Dynamic Box Size Adjustment
         sub_size = self.menu_handler.insert("📐 Adjust Box Dimensions")
@@ -592,39 +590,8 @@ class InteractiveDockingTeacherNode(Node):
 
     def save_station_template(self) -> Tuple[bool, str]:
         """
-        Crops point cloud inside gizmo box, transforms to Station Local frame,
-        and saves template PCD + YAML config.
+        Saves station pose, bounding box size, and approach heading to docking_stations.yaml.
         """
-        if self.cached_points.shape[0] == 0:
-            return False, "No point cloud available to crop. Ensure /rtabmap/cloud_map is published."
-
-        R_yaw = StationManager.rotation_matrix_from_yaw(self.gizmo_yaw)
-
-        # 1. Transform entire cached points to Station Local Frame: p_local = R^T * (p_map - center)
-        pts_local = StationManager.transform_to_station_local(
-            self.cached_points, self.gizmo_pos, R_yaw
-        )
-
-        # 2. Crop by Oriented Bounding Box (OBB) in Local Frame
-        # Gizmo box centered at local origin (0, 0, 0)
-        half_x = self.box_size[0] / 2.0
-        half_y = self.box_size[1] / 2.0
-        half_z = self.box_size[2] / 2.0
-
-        mask = (
-            (np.abs(pts_local[:, 0]) <= half_x) &
-            (np.abs(pts_local[:, 1]) <= half_y) &
-            (np.abs(pts_local[:, 2]) <= half_z)
-        )
-        cropped_local = pts_local[mask]
-
-        if cropped_local.shape[0] < 20:
-            return False, f"Cropped points too sparse ({cropped_local.shape[0]} points). Expand box or verify cloud."
-
-        # 3. Preprocess / Voxel Downsample
-        filtered_local, _ = self.matcher.preprocess_cloud(cropped_local)
-
-        # 4. Save via StationManager
         # Approach direction: Facing into the box front face from robot perspective
         # If gizmo arrow points towards robot (+X in local), robot approach yaw is opposite (+pi)
         approach_yaw = (self.gizmo_yaw + math.pi) % (2.0 * math.pi)
@@ -634,14 +601,15 @@ class InteractiveDockingTeacherNode(Node):
             center=list(self.gizmo_pos),
             size=list(self.box_size),
             approach_yaw=approach_yaw,
-            points_local=filtered_local,
+            points_local=None,
             description=f"Taught station {self.station_name} via RViz Gizmo",
             standoff_distance=self.standoff_distance
         )
 
         if success:
-            msg = (f"Successfully saved station '{self.station_name}' with "
-                   f"{filtered_local.shape[0]} template points to docking_stations.yaml.")
+            msg = (f"Successfully saved station '{self.station_name}' "
+                   f"(Pos: [{self.gizmo_pos[0]:.3f}, {self.gizmo_pos[1]:.3f}, {self.gizmo_pos[2]:.3f}], "
+                   f"Yaw: {math.degrees(approach_yaw):.1f}°) to docking_stations.yaml.")
             return True, msg
         else:
             return False, "Failed to write station configuration to disk."

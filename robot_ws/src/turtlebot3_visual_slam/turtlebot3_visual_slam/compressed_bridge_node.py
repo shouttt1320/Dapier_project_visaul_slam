@@ -97,6 +97,9 @@ class CompressedBridgeNode(Node):
         self.latest_color = None
         self.latest_depth = None
         self.latest_depth_msg = None
+        self.latest_depth_header = None
+        self.latest_color_time = None
+        self.latest_depth_time = None
 
         # Pre-initialize bootstrap CameraInfo for Astra S 320x240 to eliminate 10s wait
         self.latest_info = CameraInfo()
@@ -127,6 +130,7 @@ class CompressedBridgeNode(Node):
                 # Convert BGR to RGB for ROS 2 standard
                 img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 self.latest_color = (img_rgb, msg.header)
+                self.latest_color_time = self.get_clock().now()
                 # Dispatch immediately upon new frame arrival (Zero-lag event driven)
                 self.dispatch_sync_pair()
         except Exception as e:
@@ -142,6 +146,10 @@ class CompressedBridgeNode(Node):
                 msg_d = self.bridge.cv2_to_imgmsg(depth, encoding='16UC1')
                 msg_d.header.frame_id = 'camera_color_optical_frame'
                 self.latest_depth_msg = msg_d
+                self.latest_depth_header = msg.header
+                self.latest_depth_time = self.get_clock().now()
+                # Dispatch immediately when both color and fresh depth pair are available
+                self.dispatch_sync_pair()
         except Exception as e:
             self.get_logger().error(f'Depth decompress error: {e}')
 
@@ -175,37 +183,57 @@ class CompressedBridgeNode(Node):
         return msg_i
 
     def dispatch_sync_pair(self):
-        if self.latest_color is None or self.latest_info is None:
+        if self.latest_color is None or self.latest_info is None or self.latest_depth_msg is None:
             return
 
+        now_t = self.get_clock().now()
         img_rgb, col_hdr = self.latest_color
-        # Preserve original camera timestamp if set, otherwise fallback to local time
-        stamp = col_hdr.stamp if (col_hdr.stamp.sec > 0 or col_hdr.stamp.nanosec > 0) else self.get_clock().now().to_msg()
+        dep_hdr = self.latest_depth_header
+
+        # Check timestamp alignment if available
+        t_col = col_hdr.stamp.sec + col_hdr.stamp.nanosec * 1e-9
+        t_dep = dep_hdr.stamp.sec + dep_hdr.stamp.nanosec * 1e-9
+
+        # If timestamps are populated, ensure they match the same capture cycle (<0.07s apart for 10 FPS)
+        if t_col > 0 and t_dep > 0:
+            diff = t_col - t_dep
+            if diff < -0.07:
+                # Color is older than depth -> drop stale color and wait for new color
+                self.latest_color = None
+                return
+            elif diff > 0.07:
+                # Depth is older than color -> drop stale depth and wait for new depth
+                self.latest_depth_msg = None
+                return
+
+        # Synchronized timestamp for this pair
+        stamp = col_hdr.stamp if (col_hdr.stamp.sec > 0 or col_hdr.stamp.nanosec > 0) else now_t.to_msg()
         frame_id = 'camera_color_optical_frame'
 
-        # 1. Color Image (published immediately at native rate)
+        # 1. Color Image
         msg_c = self.bridge.cv2_to_imgmsg(img_rgb, encoding='rgb8')
         msg_c.header.stamp = stamp
         msg_c.header.frame_id = frame_id
         self.pub_color.publish(msg_c)
 
-        # 2. Camera Info (synchronized with color timestamp)
+        # 2. Camera Info
         msg_i = self._create_info_msg(stamp, frame_id)
         self.pub_info.publish(msg_i)
 
-        # 3. Depth Image (synchronized with color timestamp)
-        if self.latest_depth_msg is not None:
-            self.latest_depth_msg.header.stamp = stamp
-            self.pub_depth.publish(self.latest_depth_msg)
+        # 3. Depth Image (lockstep pair with exact same timestamp)
+        self.latest_depth_msg.header.stamp = stamp
+        self.pub_depth.publish(self.latest_depth_msg)
+
+        # Consume pair completely so neither can linger into the next cycle
+        self.latest_color = None
+        self.latest_depth_msg = None
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = CompressedBridgeNode()
-    executor = MultiThreadedExecutor(num_threads=2)
-    executor.add_node(node)
     try:
-        executor.spin()
+        rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:

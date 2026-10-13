@@ -1651,25 +1651,25 @@ class PrecisionApproacherNode(Node):
             # BEFORE evaluating lateral error, we must align heading so camera lever-arm distortion is eliminated!
             if self.settle_substate == 'FINE_ROTATE':
                 rotate_elapsed = (now - self.settle_rotate_start_time).nanoseconds / 1e9 if self.settle_rotate_start_time else elapsed
-                if abs(e_theta) > math.radians(3.5) and rotate_elapsed < 4.5:
+                if abs(e_theta) > math.radians(3.5) and rotate_elapsed < 2.5:
                     w_z = math.copysign(min(0.18, max(0.05, 0.60 * abs(e_theta))), e_theta)
                     twist.angular.z = float(w_z)
                     self.settle_stop_start_time = None
                     self.get_logger().info(
-                        f">>> [STANDOFF_SETTLE] Fine rotating heading to marker normal: yaw_err={math.degrees(e_theta):+.1f}°, wz={w_z:+.2f}rad/s ({rotate_elapsed:.1f}s/4.5s)",
+                        f">>> [STANDOFF_SETTLE] Fine rotating heading to marker normal: yaw_err={math.degrees(e_theta):+.1f}°, wz={w_z:+.2f}rad/s ({rotate_elapsed:.1f}s/2.5s)",
                         throttle_duration_sec=0.4
                     )
                 else:
-                    # Heading aligned within 3.5 deg (or 4.5s budget reached) -> Full Stop and begin STATIC_WAIT
+                    # Heading aligned within 3.5 deg (or 2.5s budget reached) -> Full Stop and begin STATIC_WAIT
                     twist.angular.z = 0.0
                     self.stop_robot()
                     self.settle_substate = 'STATIC_WAIT'
                     self.settle_stop_start_time = now
                     self.dual_align_stable_count = 0
-                    self.get_logger().info(">>> [STANDOFF_SETTLE] Heading rotation finished. Halting all motors for 1.0s vibration settling & static evaluation...")
+                    self.get_logger().info(">>> [STANDOFF_SETTLE] Heading rotation finished. Halting all motors for 0.3s vibration settling & static evaluation...")
                     return
 
-            # Step 2: Stationary pause (>=1.0s) + Extended Static Verification Window (up to 4.5s)
+            # Step 2: Stationary pause (>=0.3s) + Extended Static Verification Window (up to 2.0s)
             elif self.settle_substate == 'STATIC_WAIT':
                 twist.angular.z = 0.0
                 twist.linear.x = 0.0
@@ -1680,15 +1680,15 @@ class PrecisionApproacherNode(Node):
 
                 stopped_elapsed = (now - self.settle_stop_start_time).nanoseconds / 1e9
 
-                # Mandatory stationary pause of at least 1.0 full second for camera/chassis settling
-                if stopped_elapsed < 1.0:
+                # Mandatory stationary pause of at least 0.3s for camera/chassis settling
+                if stopped_elapsed < 0.3:
                     self.get_logger().info(
-                        f">>> [STANDOFF_SETTLE] Stationary wait for rotation settling ({stopped_elapsed:.1f}s / 1.0s)...",
-                        throttle_duration_sec=0.3
+                        f">>> [STANDOFF_SETTLE] Stationary wait for rotation settling ({stopped_elapsed:.1f}s / 0.3s)...",
+                        throttle_duration_sec=0.2
                     )
                     return
 
-                # Statically evaluate error after >= 1.0s complete standstill with robot facing marker
+                # Statically evaluate error after >= 0.3s complete standstill with robot facing marker
                 aligned_ok = (abs(e_y) <= 0.028 and abs(e_theta) <= math.radians(3.5))
                 if aligned_ok:
                     self.dual_align_stable_count += 1
@@ -1705,9 +1705,9 @@ class PrecisionApproacherNode(Node):
                 else:
                     self.dual_align_stable_count = 0
 
-                # Generous evaluation window: Only abort after 4.5s standstill without passing consistency
-                if stopped_elapsed > 4.5:
-                    self.backup_reason = f"정지 계측(4.5초간 계측) 오차 초과 (ey={e_y*100:+.1f}cm > 2.8cm, yaw={math.degrees(e_theta):+.1f}° > 3.5°)"
+                # Fast evaluation window: Abort after 2.0s standstill without passing consistency
+                if stopped_elapsed > 2.0:
+                    self.backup_reason = f"정지 계측(2.0초간 계측) 오차 초과 (ey={e_y*100:+.1f}cm > 2.8cm, yaw={math.degrees(e_theta):+.1f}° > 3.5°)"
                     self.get_logger().warn(f">>> [STANDOFF_SETTLE] {self.backup_reason}. Backing up to standoff...")
                     self.stop_robot()
                     self.transition_to('BACKUP_STANDOFF')

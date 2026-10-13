@@ -167,12 +167,12 @@ class StationManager:
                          center: List[float],
                          size: List[float],
                          approach_yaw: float,
-                         points_local: np.ndarray,
+                         points_local: Optional[np.ndarray] = None,
                          description: str = "",
                          standoff_distance: float = 0.60,
                          verification_thresholds: Optional[Dict[str, Any]] = None) -> bool:
         """
-        Registers a new docking station, exports its local PCD template,
+        Registers a new docking station, optionally exports its local PCD template,
         and saves updated YAML config.
         """
         center_np = np.array(center, dtype=np.float64)
@@ -181,27 +181,17 @@ class StationManager:
         # 1. Calculate Standoff Pose
         sx, sy, syaw = self.calculate_standoff_pose(center_np, size_np, approach_yaw, standoff_distance)
         
-        # 2. Save Local PCD Template
-        pcd_filename = f"{station_name}_local.pcd"
-        pcd_path = os.path.join(self.templates_dir, pcd_filename)
-        self.save_pcd(pcd_path, points_local)
-        
-        rel_pcd_path = os.path.join("templates", pcd_filename)
-        
-        # 3. Default Verification Thresholds
-        if verification_thresholds is None:
-            verification_thresholds = {
-                'min_fitness': 0.65,
-                'max_rmse': 0.025,
-                'max_allowable_dx': 0.15,
-                'max_allowable_dy': 0.10,
-                'max_allowable_dyaw_deg': 15.0,
-                'required_stable_frames': 3
-            }
+        # 2. Save Local PCD Template (optional)
+        rel_pcd_path = None
+        if points_local is not None and getattr(points_local, 'shape', [0])[0] > 0:
+            pcd_filename = f"{station_name}_local.pcd"
+            pcd_path = os.path.join(self.templates_dir, pcd_filename)
+            self.save_pcd(pcd_path, points_local)
+            rel_pcd_path = os.path.join("templates", pcd_filename)
 
-        # 4. Update station record
+        # 3. Update station record
         approach_normal = [-float(np.cos(approach_yaw)), -float(np.sin(approach_yaw)), 0.0]
-        self.stations[station_name] = {
+        st_data: Dict[str, Any] = {
             'description': description or f"Taught station {station_name}",
             'frame': "map",
             'standoff': {
@@ -213,14 +203,17 @@ class StationManager:
                 'center': [float(round(float(c), 4)) for c in center],
                 'size': [float(round(float(s), 4)) for s in size],
                 'normal': [float(round(float(n), 4)) for n in approach_normal]
-            },
-            'template': {
+            }
+        }
+        if rel_pcd_path:
+            st_data['template'] = {
                 'pcd_file': rel_pcd_path,
                 'resolution_m': 0.01
-            },
-            'verification_thresholds': verification_thresholds
-        }
+            }
+        if verification_thresholds:
+            st_data['verification_thresholds'] = verification_thresholds
 
+        self.stations[station_name] = st_data
         return self.save_stations()
 
     @staticmethod

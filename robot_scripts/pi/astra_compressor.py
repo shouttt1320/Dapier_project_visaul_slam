@@ -22,7 +22,6 @@ class ZeroLagCompressor(Node):
     def __init__(self):
         super().__init__('astra_compressor')
         self.bridge = CvBridge()
-        self.cb_group = ReentrantCallbackGroup()
 
         # Local camera driver subscription QoS
         qos_sub = QoSProfile(
@@ -45,10 +44,10 @@ class ZeroLagCompressor(Node):
         )
 
         self.sub_color = self.create_subscription(
-            Image, '/camera/color/image_raw', self.color_cb, qos_sub, callback_group=self.cb_group
+            Image, '/camera/color/image_raw', self.color_cb, qos_sub
         )
         self.sub_depth = self.create_subscription(
-            Image, '/camera/depth/image_raw', self.depth_cb, qos_sub, callback_group=self.cb_group
+            Image, '/camera/depth/image_raw', self.depth_cb, qos_sub
         )
 
         # Listen to camera mode switcher (NAV2 vs DOCKING)
@@ -57,10 +56,10 @@ class ZeroLagCompressor(Node):
         )
         self.current_mode = 'NAV2'
 
+        self.latest_raw_depth = None
         self.last_col_time = 0.0
-        self.last_dep_time = 0.0
 
-        self.get_logger().info('Multi-threaded ZeroLagCompressor active (Lightweight Wi-Fi streaming).')
+        self.get_logger().info('ZeroLagCompressor active (10 FPS Lockstep Sync, CPU Optimized).')
 
     def mode_cb(self, msg: String):
         mode_val = msg.data.strip().upper()
@@ -68,12 +67,23 @@ class ZeroLagCompressor(Node):
             self.get_logger().info(f'Compressor mode switch: {self.current_mode} -> {mode_val}')
             self.current_mode = mode_val
 
+    def depth_cb(self, msg: Image):
+        # Store freshest raw depth frame reference (zero-copy pointer assignment, sub-microsecond)
+        self.latest_raw_depth = msg
+
     def color_cb(self, msg: Image):
         now = time.time()
-        if now - self.last_col_time < 0.080:  # ~12.5 FPS (Smooth & low bandwidth)
+        # 10 FPS cadence (0.100s period) - smooth visual mapping with minimal Pi CPU load (< 3%)
+        if now - self.last_col_time < 0.100:
             return
         self.last_col_time = now
 
+        # Ensure valid header timestamp
+        stamp = msg.header.stamp
+        if stamp.sec == 0 and stamp.nanosec == 0:
+            msg.header.stamp = self.get_clock().now().to_msg()
+
+        # 1. Compress & Publish Color (JPEG quality 55)
         try:
             cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             success, encoded = cv2.imencode('.jpg', cv_img, [cv2.IMWRITE_JPEG_QUALITY, 55])
@@ -86,35 +96,26 @@ class ZeroLagCompressor(Node):
         except Exception as e:
             self.get_logger().error(f'Color compress error: {e}')
 
-    def depth_cb(self, msg: Image):
-        now = time.time()
-        # In DOCKING mode: throttle to ~3.0 FPS (0.333s) for 3D box plane fitting while keeping Pi CPU < 20%
-        # In NAV2 mode: throttle to ~3.3 FPS (0.300s) for RTAB-Map 3D SLAM while cutting CPU load by 60%
-        throttle_interval = 0.333 if self.current_mode == "DOCKING" else 0.300
-        if now - self.last_dep_time < throttle_interval:
-            return
-        self.last_dep_time = now
-
-        try:
-            depth_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-            success, encoded = cv2.imencode('.png', depth_img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
-            if success:
-                comp_msg = CompressedImage()
-                comp_msg.header = msg.header
-                comp_msg.format = 'png'
-                comp_msg.data = encoded.tobytes()
-                self.pub_depth.publish(comp_msg)
-        except Exception as e:
-            self.get_logger().error(f'Depth compress error: {e}')
+        # 2. Compress & Publish Depth in 1:1 lockstep pair with exact same timestamp
+        if self.latest_raw_depth is not None:
+            try:
+                depth_img = self.bridge.imgmsg_to_cv2(self.latest_raw_depth, desired_encoding='passthrough')
+                success, encoded = cv2.imencode('.png', depth_img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+                if success:
+                    comp_msg = CompressedImage()
+                    comp_msg.header = msg.header  # Identical timestamp down to nanoseconds!
+                    comp_msg.format = 'png'
+                    comp_msg.data = encoded.tobytes()
+                    self.pub_depth.publish(comp_msg)
+            except Exception as e:
+                self.get_logger().error(f'Depth compress error: {e}')
 
 
 def main():
     rclpy.init()
     node = ZeroLagCompressor()
-    executor = MultiThreadedExecutor(num_threads=2)
-    executor.add_node(node)
     try:
-        executor.spin()
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:

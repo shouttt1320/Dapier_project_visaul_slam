@@ -200,6 +200,9 @@ class PrecisionDockingControllerNode(Node):
         self.latched_aim_delta_yaw: float = 0.0
         self.latched_aim_target_yaw: Optional[float] = None
         self.locked_docking_yaw: Optional[float] = None
+        self.target_carrot_dist: float = 0.0
+        self.carrot_start_odom_pose: Optional[Tuple[float, float, float]] = None
+        self.carrot_locked_yaw: Optional[float] = None
 
         # FSM State & Timing
         self.state: str = 'NAV2_READY'
@@ -958,6 +961,8 @@ class PrecisionDockingControllerNode(Node):
                         self.carrot_x_b = dist_to_c
                         self.carrot_y_b = e_y
 
+                    self.target_carrot_dist = max(0.12, dist_to_c)
+
                     curr_yaw = self.get_robot_yaw()
                     if curr_yaw is not None:
                         self.latched_aim_target_yaw = math.atan2(
@@ -969,10 +974,10 @@ class PrecisionDockingControllerNode(Node):
 
                     self.get_logger().info(
                         f">>> [STAGING_SETTLE] Settling complete! dist={self.desk_distance*100:.1f}cm, ey={e_y*100:+.1f}cm, yaw={math.degrees(e_theta):+.1f}°. "
-                        f"Aim Delta: {math.degrees(self.latched_aim_delta_yaw):+.1f}°. Transitioning to STAGING_AIM..."
+                        f"Carrot dist: {self.target_carrot_dist*100:.1f}cm, Aim Delta: {math.degrees(self.latched_aim_delta_yaw):+.1f}°. Transitioning to STAGING_AIM..."
                     )
                     self._report_gui(
-                        f"📍 [대기점 정지 완료] 마커 거리: {self.desk_distance*100:.1f}cm, 편차: {e_y*100:+.1f}cm ➔ 가상 당근점 조준 회전 시작"
+                        f"📍 [대기점 정지 완료] 마커 거리: {self.desk_distance*100:.1f}cm, 편차: {e_y*100:+.1f}cm ➔ 가상 당근점({self.target_carrot_dist*100:.0f}cm) 조준 시작"
                     )
                     self.transition_to('STAGING_AIM')
                     self._publish_carrot_marker()
@@ -1013,8 +1018,14 @@ class PrecisionDockingControllerNode(Node):
 
             if abs(aim_err) <= math.radians(2.0) or elapsed > 10.0:
                 self.stop_robot()
-                self.get_logger().info(f">>> [STAGING_AIM] Aim completed (aim_err={math.degrees(aim_err):+.1f}°). -> CARROT_ALIGN")
-                self._report_gui(f"✔ [당근점 조준 완료] 조준 오차: {math.degrees(aim_err):.1f}° ➔ 당근점 추종 주행 시작")
+                odom_p = self.get_robot_pose_in_odom()
+                self.carrot_start_odom_pose = odom_p if odom_p is not None else (0.0, 0.0, 0.0)
+                self.carrot_locked_yaw = curr_yaw if curr_yaw is not None else self.latched_aim_target_yaw
+                self.get_logger().info(
+                    f">>> [STAGING_AIM] Aim completed (aim_err={math.degrees(aim_err):+.1f}°). "
+                    f"Latched Carrot Dist: {self.target_carrot_dist*100:.1f}cm. -> CARROT_ALIGN"
+                )
+                self._report_gui(f"✔ [당근점 조준 완료] 조준 오차: {math.degrees(aim_err):.1f}° ➔ 당근점 직선 주행 시작({self.target_carrot_dist*100:.0f}cm)")
                 self.transition_to('CARROT_ALIGN')
                 return
             else:
@@ -1022,69 +1033,68 @@ class PrecisionDockingControllerNode(Node):
                 twist.angular.z = float(w_z)
 
         # ----------------------------------------------------------------------
-        # STATE: CARROT_ALIGN (Continuous Pure Pursuit without premature abort)
+        # STATE: CARROT_ALIGN (Straight drive toward latched carrot point)
         # ----------------------------------------------------------------------
         elif self.state == 'CARROT_ALIGN':
-            e_x, e_y, e_theta = self.compute_docking_errors()
-            if e_x is not None and e_y is not None:
-                if self.initial_ey is None:
-                    self.initial_ey = abs(e_y)
+            elapsed = (now - self.state_start_time).nanoseconds / 1e9
 
-                elapsed = (now - self.state_start_time).nanoseconds / 1e9
-                ey_diverge = max(0.180, self.initial_ey + 0.080)
-                if elapsed > 4.0 and abs(e_y) > ey_diverge:
-                    self.backup_reason = f"중심선 편차 발산 (현재:{e_y*100:+.1f}cm > 한계:{ey_diverge*100:.1f}cm)"
-                    self.get_logger().warn(f">>> [CARROT_ALIGN] {self.backup_reason} -> BACKUP_STANDOFF")
-                    self.stop_robot()
-                    self.transition_to('BACKUP_STANDOFF')
-                    return
-
-                # Standoff Zone Reached Gate (<= 38cm)
-                if self.desk_distance is not None and self.desk_distance <= 0.38:
-                    self.get_logger().info(f">>> [CARROT_ALIGN] Standoff zone reached ({self.desk_distance*100:.1f}cm <= 38cm). -> STANDOFF_SETTLE")
-                    self.stop_robot()
-                    self.dual_align_stable_count = 0
-                    self._report_gui(f"✔ [스탠드오프 도달] 거리 {self.desk_distance*100:.1f}cm ➔ 스탠드오프 정적 검증 시작")
-                    self.transition_to('STANDOFF_SETTLE')
-                    return
-
-                # Pure Pursuit on Virtual Carrot
-                d_ref = max(0.10, e_x if e_x is not None else (self.desk_distance if self.desk_distance is not None else 0.40))
-                L = float(np.clip(0.60 * d_ref, 0.14, 0.28))
-                c_pt = self.get_carrot_point_in_base(L)
-                if c_pt is not None:
-                    c_x, c_y = float(c_pt[0]), float(c_pt[1])
-                    dist_carrot = math.hypot(c_x, c_y)
-                    alpha_carrot = math.atan2(c_y, max(0.05, c_x))
-                    self.carrot_x_b, self.carrot_y_b = c_x, c_y
-                else:
-                    dist_carrot = max(0.15, d_ref - L)
-                    alpha_carrot = math.atan2(e_y, dist_carrot)
-                    self.carrot_x_b, self.carrot_y_b = dist_carrot, e_y
-
-                v_init, v_final = 0.050, 0.025
-                ratio = float(np.clip((dist_carrot - 0.15) / (0.40 - 0.15), 0.0, 1.0))
-                smooth_s = ratio * ratio * (3.0 - 2.0 * ratio)
-                v_x = float(v_final + (v_init - v_final) * smooth_s)
-
-                omega_pp = (2.0 * v_x * math.sin(alpha_carrot)) / max(0.15, dist_carrot)
-                w_z = float(np.clip(omega_pp, -0.22, 0.22))
-
-                twist.linear.x = v_x
-                twist.angular.z = w_z
-                self._publish_carrot_marker()
-                self.get_logger().info(
-                    f">>> [CARROT_ALIGN] Carrot: d={dist_carrot*100:.1f}cm, aim={math.degrees(alpha_carrot):+.1f}° | "
-                    f"Desk: d={self.desk_distance*100:.1f}cm, ey={e_y*100:+.1f}cm, yaw={math.degrees(e_theta):+.1f}°, "
-                    f"vx={v_x*100:.1f}cm/s, wz={w_z:+.2f}rad/s",
-                    throttle_duration_sec=0.8
+            # 1. 이동 거리 계산 (출발 오도메트리 기준)
+            curr_odom_p = self.get_robot_pose_in_odom()
+            if curr_odom_p is not None and self.carrot_start_odom_pose is not None:
+                dist_traveled = math.hypot(
+                    curr_odom_p[0] - self.carrot_start_odom_pose[0],
+                    curr_odom_p[1] - self.carrot_start_odom_pose[1]
                 )
-
             else:
-                elapsed = (now - self.state_start_time).nanoseconds / 1e9
-                if elapsed > 2.5:
-                    self.transition_to('SEARCH_MARKER')
-                    return
+                dist_traveled = 0.050 * elapsed
+
+            # 2. 도착 판정 (기억한 당근점 거리 도달 or 마커 앞 38cm 스탠드오프 존 진입)
+            reached_target = (dist_traveled >= max(0.10, self.target_carrot_dist))
+            reached_standoff_dist = (self.desk_distance is not None and self.desk_distance <= 0.38)
+
+            if reached_target or reached_standoff_dist:
+                self.stop_robot()
+                self.dual_align_stable_count = 0
+                self.get_logger().info(
+                    f">>> [CARROT_ALIGN] Standoff reached (traveled={dist_traveled*100:.1f}cm/{self.target_carrot_dist*100:.1f}cm, "
+                    f"desk={f'{self.desk_distance*100:.1f}cm' if self.desk_distance is not None else 'N/A'}). -> STANDOFF_SETTLE"
+                )
+                self._report_gui(f"✔ [당근점 직선 도착] 이동거리 {dist_traveled*100:.0f}cm ➔ 마커 정면 회전 및 정밀 오차 검증 시작")
+                self.transition_to('STANDOFF_SETTLE')
+                return
+
+            # 타임아웃 안전 가드
+            if elapsed > 30.0:
+                self.get_logger().warn(f">>> [CARROT_ALIGN] Straight drive timeout ({elapsed:.1f}s) -> STANDOFF_SETTLE")
+                self.stop_robot()
+                self.dual_align_stable_count = 0
+                self.transition_to('STANDOFF_SETTLE')
+                return
+
+            # 3. 속도 계산: 흔들림 없는 직선 주행 및 헤딩 락
+            rem_dist = max(0.0, self.target_carrot_dist - dist_traveled)
+            ratio = float(np.clip(rem_dist / max(0.10, self.target_carrot_dist), 0.0, 1.0))
+            v_x = float(0.025 + 0.025 * ratio)  # 0.050 m/s -> 0.025 m/s 부드러운 감속
+
+            # 헤딩 락: 조준해둔 당근점 방향 각도를 정밀 유지 (미세 자이로 P 제어)
+            curr_yaw = self.get_robot_yaw()
+            if curr_yaw is not None and self.carrot_locked_yaw is not None:
+                yaw_err = math.atan2(
+                    math.sin(self.carrot_locked_yaw - curr_yaw),
+                    math.cos(self.carrot_locked_yaw - curr_yaw)
+                )
+                w_z = float(np.clip(1.2 * yaw_err, -0.10, 0.10))
+            else:
+                w_z = 0.0
+
+            twist.linear.x = v_x
+            twist.angular.z = w_z
+            self._publish_carrot_marker()
+            self.get_logger().info(
+                f">>> [CARROT_ALIGN Straight] Traveled: {dist_traveled*100:.1f}/{self.target_carrot_dist*100:.1f}cm, "
+                f"vx={v_x*100:.1f}cm/s, wz={w_z:+.2f}rad/s",
+                throttle_duration_sec=0.8
+            )
 
         # ----------------------------------------------------------------------
         # STATE: STANDOFF_SETTLE
@@ -1103,7 +1113,7 @@ class PrecisionDockingControllerNode(Node):
             # Step 1: Fine rotate heading to marker normal
             if self.settle_substate == 'FINE_ROTATE':
                 rotate_elapsed = (now - self.settle_rotate_start_time).nanoseconds / 1e9 if self.settle_rotate_start_time else elapsed
-                if abs(e_theta) > math.radians(3.5) and rotate_elapsed < 6.0:
+                if abs(e_theta) > math.radians(3.5) and rotate_elapsed < 2.5:
                     # Positive feedback alignment: e_theta < 0 -> rotate CW (-wz), e_theta > 0 -> rotate CCW (+wz)
                     w_z = math.copysign(min(0.18, max(0.05, 0.60 * abs(e_theta))), e_theta)
                     twist.angular.z = float(w_z)
@@ -1115,7 +1125,7 @@ class PrecisionDockingControllerNode(Node):
                     self.dual_align_stable_count = 0
                     return
 
-            # Step 2: Stationary halt (>= 1.0s) & verify static error
+            # Step 2: Stationary halt (>= 0.3s) & verify static error
             elif self.settle_substate == 'STATIC_WAIT':
                 twist.angular.z = 0.0
                 twist.linear.x = 0.0
@@ -1125,7 +1135,7 @@ class PrecisionDockingControllerNode(Node):
                     return
 
                 stopped_elapsed = (now - self.settle_stop_start_time).nanoseconds / 1e9
-                if stopped_elapsed < 1.0:
+                if stopped_elapsed < 0.3:
                     return
 
                 aligned_ok = (abs(e_y) <= 0.028 and abs(e_theta) <= math.radians(3.5))
@@ -1140,7 +1150,7 @@ class PrecisionDockingControllerNode(Node):
                 else:
                     self.dual_align_stable_count = 0
 
-                if stopped_elapsed > 6.0:
+                if stopped_elapsed > 2.0:
                     self.backup_reason = f"정지 계측 오차 초과 (ey={e_y*100:+.1f}cm, yaw={math.degrees(e_theta):+.1f}°)"
                     self.get_logger().warn(f">>> [STANDOFF_SETTLE] {self.backup_reason} -> BACKUP_STANDOFF")
                     self.stop_robot()
