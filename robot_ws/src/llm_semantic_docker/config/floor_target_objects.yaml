@@ -1,0 +1,92 @@
+# ==============================================================================
+# Floor Target Objects Registry Configuration
+# - Declarative registry for custom and open-vocabulary floor target objects
+# - Automatically loaded by object_approaching_controller_node & llm_agent_node
+# - To add a new target object, simply add an entry below without modifying Python code!
+# ==============================================================================
+
+targets:
+  red_cube:
+    canonical_id: "red_cube"
+    display_name: "빨간 큐브"
+    aliases:
+      - "red_cube"
+      - "red cube"
+      - "red_cub"
+      - "redcub"
+      - "빨간 큐브"
+      - "빨간큐브"
+      - "빨간 큐브로"
+      - "빨간 큐브 앞으로"
+      - "빨간 상자"
+      - "빨간상자"
+      - "레드 큐브"
+      - "레드큐브"
+      - "빨간 블록"
+      - "빨간블록"
+      - "red box"
+      - "red block"
+    standoff_m: 0.25                # 렌즈 전방 기본 정지 거리 (25cm)
+    arm_reach_range_m: [0.18, 0.28]  # 로봇팔 작업 유효 거리 (18cm ~ 28cm)
+    expected_width_m: 0.045          # 물체 실제 폭 (4.5cm)
+    approach_speed_m_s: 0.065        # 순항 접근 속도 (m/s)
+
+  blue_ball:
+    canonical_id: "blue_ball"
+    display_name: "파란 공"
+    aliases:
+      - "blue_ball"
+      - "blue ball"
+      - "파란 공"
+      - "파란공"
+      - "파란색 공"
+      - "파란 공으로"
+      - "파란 공 앞으로"
+      - "블루 볼"
+      - "블루볼"
+      - "구슬"
+    standoff_m: 0.25
+    arm_reach_range_m: [0.18, 0.28]
+    expected_width_m: 0.055
+    approach_speed_m_s: 0.065
+
+  black_cube:
+    canonical_id: "black_cube"
+    display_name: "검은 큐브"
+    aliases:
+      - "black_cube"
+      - "black cube"
+      - "검은 큐브"
+      - "검은큐브"
+      - "검은 큐브로"
+      - "검은 큐브 앞으로"
+      - "검정큐브"
+      - "검정 큐브"
+    standoff_m: 0.25
+    arm_reach_range_m: [0.18, 0.28]
+    expected_width_m: 0.055
+    approach_speed_m_s: 0.065
+  
+  black_rod:
+    canonical_id: "black_rod"
+    display_name: "검은 막대"
+    aliases:
+      - "black_rod"
+      - "black rod"
+      - "검은 막대"
+      - "검은막대"
+      - "검은 막대로"
+      - "검은 막대 앞으로"
+      - "검정막대"
+      - "검정 막대"
+    standoff_m: 0.25
+    arm_reach_range_m: [0.18, 0.28]
+    expected_width_m: 0.055
+    approach_speed_m_s: 0.065
+
+# 기본 폴백 설정 (YAML에 등록되지 않은 신규 물체 접근 시 적용)
+default_profile:
+  standoff_m: 0.25
+  arm_reach_range_m: [0.18, 0.28]
+  expected_width_m: 0.050
+  approach_speed_m_s: 0.060

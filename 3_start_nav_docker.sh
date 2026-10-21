@@ -25,6 +25,7 @@ pkill -9 -f "compressed_bridge_node" 2>/dev/null || true
 pkill -9 -f "llm_agent_node" 2>/dev/null || true
 pkill -9 -f "task_manager_node" 2>/dev/null || true
 pkill -9 -f "precision_docking_controller_node" 2>/dev/null || true
+pkill -9 -f "object_approaching_controller_node" 2>/dev/null || true
 pkill -9 -f "object_detector_3d" 2>/dev/null || true
 pkill -9 -f "rtabmap" 2>/dev/null || true
 pkill -9 -f "controller_server" 2>/dev/null || true
@@ -80,6 +81,7 @@ cleanup() {
     fi
     pkill -9 -f "astra_camera_node" 2>/dev/null || true
     pkill -9 -f "precision_docking_controller_node" 2>/dev/null || true
+    pkill -9 -f "object_approaching_controller_node" 2>/dev/null || true
     pkill -9 -f "qwen_semantic_gui" 2>/dev/null || true
     pkill -9 -f "agent_cli.py" 2>/dev/null || true
 }

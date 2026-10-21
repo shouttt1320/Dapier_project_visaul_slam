@@ -52,6 +52,7 @@ class TargetSpec(BaseModel):
     # 4. 직시 도킹 / 바닥 물체 접근 지원 필드
     direct_visual: Optional[bool] = Field(default=False, description="Direct visual approach/docking bypassing Nav2 staging")
     perception_type: Optional[str] = Field(default=None, description="Perception backend (aruco, floor_object, etc.)")
+    target_name: Optional[str] = Field(default=None, description="Specific target name or canonical ID (e.g., red_cube, blue_ball)")
 
     @model_validator(mode='after')
     def sync_legacy_fields(self):
@@ -554,7 +555,9 @@ class CommandValidator:
             is_direct_visual = bool(getattr(target, 'direct_visual', False)) or any(
                 k in raw_target.lower() for k in ["marker", "마커", "aruco", "아루코", "직접", "직시", "보고도킹"]
             )
-            is_floor_object = any(k in raw_target.lower() for k in ["floor_object", "바닥물체", "물체", "바닥"])
+            is_floor_object = (getattr(target, 'perception_type', None) == "floor_object") or any(
+                k in raw_target.lower() for k in ["floor_object", "바닥물체", "물체", "바닥", "cube", "큐브", "ball", "공", "box", "상자"]
+            )
 
             # 0순위: 마커 직시 도킹 또는 바닥 물체 직시 접근 (Direct Visual Mode: Nav2 Staging Bypass)
             if is_direct_visual or is_floor_object:
@@ -601,13 +604,15 @@ class CommandValidator:
                     "yaw_deg": float(wp_info.get("yaw_deg", 0.0))
                 }
 
+            final_target_name = getattr(target, 'target_name', None) or raw_target
+
             return ValidationResult(
                 is_valid=True,
                 action=action,
                 resolved_task={
                     "action": "DOCK",
                     "target_structure": structure_type,
-                    "target_name": raw_target,
+                    "target_name": final_target_name,
                     "anchor_cue": target.anchor_cue,
                     "anchor_color_preset": detected_color,
                     "docking_face": docking_face,

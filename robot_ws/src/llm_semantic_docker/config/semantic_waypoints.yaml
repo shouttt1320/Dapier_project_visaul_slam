@@ -1,73 +1,9 @@
-# ==============================================================================
-# Semantic Waypoints & Physical Map Coordinates for TurtleBot3 (v3.3)
-# Frame: map (RTAB-Map Visual SLAM / Nav2 coordinate frame)
-# ==============================================================================
-
 waypoints:
-  # Staging Waypoints for Precision Docking
-  box_staging:
-    description: "1.0m Staging approach pose in front of ArUco marker box"
-    x: 1.25
-    y: 0.45
-    z: 0.0
-    yaw_deg: 0.0
-    docking_profile: "marker_box"
+  wp1:
+    description: Taught waypoint wp1 via RViz Gizmo
+    x: -0.0712
+    y: 1.2588
+    z: -0.0317
+    yaw_deg: 100.69
     aliases:
-      - "aruco_box"
-      - "마커상자"
-
-  desk_staging:
-    description: "1.0m Staging approach pose in front of office desk"
-    x: 2.80
-    y: -0.90
-    z: 0.0
-    yaw_deg: 90.0
-    docking_profile: "desk_red_object"
-    aliases:
-      - "desk"
-      - "책상"
-      - "테이블"
-      - "업무책상"
-      - "빨간물체책상"
-      - "연구실책상"
-      - "회의실책상"
-      - "desk_direct"
-
-  charger_staging:
-    description: "1.0m Staging approach pose in front of charging dock"
-    x: 0.50
-    y: 0.20
-    z: 0.0
-    yaw_deg: 180.0
-    docking_profile: "charger_station"
-    aliases:
-      - "charger"
-      - "충전기"
-      - "충전소"
-      - "충전스테이션"
-
-  # General Point-to-Point Navigation Waypoints
-  entrance:
-    description: "Office main entrance and departure point"
-    x: 0.00
-    y: 0.00
-    z: 0.0
-    yaw_deg: 0.0
-    aliases:
-      - "entrance"
-      - "출입구"
-      - "입구"
-      - "현관"
-      - "출발점"
-
-  meeting_room:
-    description: "Conference and meeting area"
-    x: 3.50
-    y: 1.20
-    z: 0.0
-    yaw_deg: 0.0
-    aliases:
-      - "meeting_room"
-      - "회의실"
-      - "미팅룸"
-      - "회의공간"
+    - wp1

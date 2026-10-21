@@ -33,6 +33,7 @@ setup(
             'object_detector_3d_node = llm_semantic_docker.object_detector_3d:main',
             'qwen_semantic_gui_node = llm_semantic_docker.qwen_semantic_gui_node:main',
             'precision_docking_controller_node = llm_semantic_docker.precision_docking_controller_node:main',
+            'object_approaching_controller_node = llm_semantic_docker.object_approaching_controller_node:main',
             'interactive_docking_teacher_node = llm_semantic_docker.interactive_docking_teacher:main',
             'standalone_map_server = llm_semantic_docker.standalone_map_server:main',
         ],

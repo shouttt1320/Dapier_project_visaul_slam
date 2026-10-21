@@ -1,0 +1,57 @@
+🤖 [터틀봇3 - 로봇팔(Manipulator) 연동 인터페이스 가이드]
+터틀봇이 바닥 물체(큐브/공 등) 전방 약 25cm에 접근을 완료하면, 로봇팔 제어 노트북에서 파지(Grasp) 가능 여부를 판단한 후 필요 시 터틀봇의 위치를 수 센티미터 단위로 미세 조정(Inching)할 수 있습니다.
+
+1. 사전 네트워크 환경 설정 (필수)
+두 노트북(터틀봇 제어 노트북과 로봇팔 노트북)이 ROS 2 통신을 하기 위해 아래 설정이 일치해야 합니다:
+
+동일한 Wi-Fi(공유기) 네트워크 연결
+동일한 ROS_DOMAIN_ID 지정:
+bash
+export ROS_DOMAIN_ID=101
+(~/.bashrc에 추가해두는 것을 권장합니다)
+2. 인터페이스 규격 요약
+구분	토픽명 (Topic)	메시지 타입 (Type)	설명
+명령 송신 (로봇팔 $\to$ 터틀봇)	/task/command	std_msgs/msg/String	미세 전진/후진/회전 명령 (JSON 포맷)
+상태 수신 (터틀봇 $\to$ 로봇팔)	/task/status	std_msgs/msg/String	물체 접근 완료 및 이동 상태 브로드캐스트
+3. 이동 명령 JSON 포맷 (/task/command)
+① 직관적인 미세 이동 (가장 추천하는 방식)
+로봇팔 알고리즘에서 부족한 오차만큼 즉각 이동시킬 때 가장 간단한 형식입니다.
+
+전진 (단위: 미터):
+json
+{"forward": 0.05}
+(예: 5cm 전진)
+후진 (단위: 미터):
+json
+{"backward": 0.02}
+(예: 2cm 후진)
+좌회전 (단위: 도 / Degree):
+json
+{"turn_left": 5.0}
+(예: 반시계 방향 5도 회전)
+우회전 (단위: 도 / Degree):
+json
+{"turn_right": 5.0}
+(예: 시계 방향 5도 회전)
+② 전진/회전 동시 지정 상대 이동
+거리와 각도를 한 번에 지정할 때 사용합니다:
+
+json
+{
+  "action": "NAVIGATE_RELATIVE",
+  "relative_x": 0.03,
+  "relative_y": 0.0,
+  "relative_yaw": 3.0
+}
+relative_x: 전진(+), 후진(-) [단위: m]
+relative_y: 0.0 (터틀봇3는 차동구동형이므로 좌/우 횡이동은 0)
+relative_yaw: 좌회전(+), 우회전(-) [단위: deg]
+③ 긴급 정지 명령 (E-STOP)
+json
+{"action": "STOP"}
+4. 터틀봇 접근 완료 확인 (/task/status)
+터틀봇이 물체 앞 지정 거리(약 25cm)에 도달해 최종 정지하면 /task/status로 다음 문자열이 수신됩니다:
+
+text
+INFO: 🎉 [접근 완료] red_cube 렌즈 전방 25.0cm 정지 완료! (로봇팔 작업 준비 완료)
+이 메시지가 오거나 로봇이 정지한 후 로봇팔 비전/IK 알고리즘을 수행하시면 됩니다.

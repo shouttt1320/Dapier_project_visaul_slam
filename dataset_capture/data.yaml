@@ -1,0 +1,10 @@
+# YOLOv8 / YOLO-World Fine-Tuning Dataset Configuration
+path: /home/jjj/Documents/Dapier/Project/dataset_capture
+train: images
+val: images
+
+names:
+  0: black_cube
+  1: black_rod
+  2: blue_ball
+  3: red_cube

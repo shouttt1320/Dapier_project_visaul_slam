@@ -19,6 +19,7 @@ def launch_setup(context, *args, **kwargs):
     pkg_vslam = get_package_share_directory('turtlebot3_visual_slam')
 
     station_name = LaunchConfiguration('station_name').perform(context)
+    waypoint_name = LaunchConfiguration('waypoint_name').perform(context)
     box_x = float(LaunchConfiguration('box_size_x').perform(context))
     box_y = float(LaunchConfiguration('box_size_y').perform(context))
     box_z = float(LaunchConfiguration('box_size_z').perform(context))
@@ -69,6 +70,7 @@ def launch_setup(context, *args, **kwargs):
         output='screen',
         parameters=[{
             'station_name': station_name,
+            'waypoint_name': waypoint_name,
             'standoff_distance': 0.60,
             'box_size_x': box_x,
             'box_size_y': box_y,
@@ -98,6 +100,11 @@ def generate_launch_description():
             'station_name',
             default_value='box_01',
             description='Name of the station to teach (e.g. box_01, desk_01)'
+        ),
+        DeclareLaunchArgument(
+            'waypoint_name',
+            default_value='waypoint_01',
+            description='Name of the waypoint to teach (e.g. my_desk, entrance)'
         ),
         DeclareLaunchArgument(
             'box_size_x',

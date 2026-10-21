@@ -8,8 +8,13 @@ crops the 3D Point Cloud within the gizmo, transforms it to Station Local frame,
 and saves the normalized template PCD along with Standoff pose in docking_stations.yaml.
 """
 
+import os
+import sys
+import time
+import threading
 import math
 from typing import Tuple, Dict, Any, List, Optional
+import yaml
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -26,14 +31,18 @@ from interactive_markers.menu_handler import MenuHandler
 from llm_semantic_docker.station_manager import StationManager
 
 
+WAYPOINTS_CONFIG_PATH = "/home/jjj/Documents/Dapier/Project/robot_ws/src/llm_semantic_docker/config/semantic_waypoints.yaml"
+
+
 class InteractiveDockingTeacherNode(Node):
-    """RViz Interactive Marker Gizmo Server for Docking Station Teaching."""
+    """RViz Interactive Marker Gizmo Server for Docking Station & Waypoint Teaching."""
 
     def __init__(self):
         super().__init__('interactive_docking_teacher')
 
         # Declare parameters
         self.declare_parameter('station_name', 'box_01')
+        self.declare_parameter('waypoint_name', 'waypoint_01')
         self.declare_parameter('standoff_distance', 0.60)
         self.declare_parameter('box_size_x', 0.35)
         self.declare_parameter('box_size_y', 0.40)
@@ -41,6 +50,7 @@ class InteractiveDockingTeacherNode(Node):
         self.declare_parameter('map_frame', 'map')
 
         self.station_name = self.get_parameter('station_name').value
+        self.waypoint_name = str(self.get_parameter('waypoint_name').value)
         self.standoff_distance = float(self.get_parameter('standoff_distance').value)
         self.box_size = np.array([
             float(self.get_parameter('box_size_x').value),
@@ -118,6 +128,11 @@ class InteractiveDockingTeacherNode(Node):
             QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         )
 
+        # Feedback state and publisher
+        self.feedback_status_text = ""
+        self.feedback_time = 0.0
+        self.feedback_pub = self.create_publisher(String, '/docking/teach_station_feedback', 10)
+
         # Command Subscriber & Trigger Service
         self.cmd_sub = self.create_subscription(
             String,
@@ -129,6 +144,11 @@ class InteractiveDockingTeacherNode(Node):
             Trigger,
             '/docking/save_current_station',
             self._save_service_callback
+        )
+        self.save_wp_srv = self.create_service(
+            Trigger,
+            '/docking/save_current_waypoint',
+            self._save_waypoint_service_callback
         )
 
         # Dynamic Box Size Subscription
@@ -149,7 +169,8 @@ class InteractiveDockingTeacherNode(Node):
 
         # Menu Handler
         self.menu_handler = MenuHandler()
-        self.menu_handler.insert("💾 Save Station (YAML)", callback=self._menu_save_callback)
+        self.menu_handler.insert("💾 Save Docking Station (docking_stations.yaml)", callback=self._menu_save_callback)
+        self.menu_handler.insert("📍 Save Waypoint (semantic_waypoints.yaml)", callback=self._menu_save_waypoint_callback)
 
         # Submenu for Dynamic Box Size Adjustment
         sub_size = self.menu_handler.insert("📐 Adjust Box Dimensions")
@@ -166,9 +187,41 @@ class InteractiveDockingTeacherNode(Node):
         # Initialize Marker
         self._init_interactive_marker()
         self.get_logger().info(
-            f"InteractiveDockingTeacher ready for station '{self.station_name}'. "
-            "Use RViz Interactive Markers to align the gizmo."
+            f"InteractiveDockingTeacher ready for station '{self.station_name}' & waypoint '{self.waypoint_name}'."
         )
+
+        # Interactive Console Thread (실행 중 실시간 이름 변경 및 저장 지원)
+        self.cli_thread = threading.Thread(target=self._cli_worker, daemon=True)
+        self.cli_thread.start()
+
+    def _cli_worker(self):
+        """Interactive console reader allowing dynamic station and waypoint name changing during runtime."""
+        time.sleep(1.2)
+        banner = f"""
+\033[1;36m────────────────────────────────────────────────────────────────────────
+ ⌨️  [기즈모 티칭 콘솔] 실행 중 실시간 이름 변경 및 즉시 저장 지원:
+  - 스테이션 이름 변경:   station <이름>    (예: station workplace2)
+  - 웨이포인트 이름 변경: wp <이름>         (예: wp my_desk)
+  - 현재 위치 즉시 저장:  save (스테이션)  / save_wp (웨이포인트)
+  - 현재 상태 확인:       status
+────────────────────────────────────────────────────────────────────────\033[0m
+"""
+        print(banner, flush=True)
+
+        while rclpy.ok():
+            try:
+                line = sys.stdin.readline()
+                if not line:
+                    break
+                line_str = line.strip()
+                if not line_str:
+                    continue
+                if line_str.lower() in ("help", "?"):
+                    print(banner, flush=True)
+                else:
+                    self._process_command_string(line_str)
+            except Exception:
+                pass
 
     def _cloud_callback(self, msg: PointCloud2):
         """Caches full RTAB-Map 3D point cloud."""
@@ -309,10 +362,16 @@ class InteractiveDockingTeacherNode(Node):
         self.server.applyChanges()
 
     def _menu_save_callback(self, feedback):
-        """Right-click menu save trigger."""
-        self.get_logger().info(f"🖱️ [Menu] Save Station triggered for '{self.station_name}'...")
+        """Right-click menu save trigger for docking station."""
+        self.get_logger().info(f"🖱️ [Menu] Save Docking Station triggered for '{self.station_name}'...")
         success, msg = self.save_station_template()
         self.get_logger().info(f"💾 Result: {msg}")
+
+    def _menu_save_waypoint_callback(self, feedback):
+        """Right-click menu save trigger for waypoint."""
+        self.get_logger().info(f"🖱️ [Menu] Save Waypoint triggered for '{self.waypoint_name}'...")
+        success, msg = self.save_waypoint()
+        self.get_logger().info(f"📍 Result: {msg}")
 
     def _menu_scale_up(self, feedback):
         self.set_box_size(self.box_size[0] * 1.10, self.box_size[1] * 1.10, self.box_size[2] * 1.10)
@@ -464,13 +523,16 @@ class InteractiveDockingTeacherNode(Node):
         m_text.action = Marker.ADD
         m_text.pose.position.x = float(self.gizmo_pos[0])
         m_text.pose.position.y = float(self.gizmo_pos[1])
-        m_text.pose.position.z = float(self.gizmo_pos[2] + self.box_size[2] / 2.0 + 0.15)
-        m_text.scale.z = 0.12 # text size
+        m_text.pose.position.z = float(self.gizmo_pos[2] + self.box_size[2] / 2.0 + 0.18)
+        m_text.scale.z = 0.13 # text size
         m_text.color.r = 1.0
         m_text.color.g = 1.0
         m_text.color.b = 1.0
         m_text.color.a = 0.95
-        m_text.text = f"{self.station_name} [{self.box_size[0]:.2f} x {self.box_size[1]:.2f} x {self.box_size[2]:.2f}m]"
+        label = f"🎯 Station: [{self.station_name}] | 📍 WP: [{self.waypoint_name}]"
+        if (time.time() - self.feedback_time < 6.0) and self.feedback_status_text:
+            label += f"\n✨ {self.feedback_status_text}"
+        m_text.text = label
         ma.markers.append(m_text)
 
         # 5. Display All Other Previously Saved Stations from YAML
@@ -572,6 +634,84 @@ class InteractiveDockingTeacherNode(Node):
 
             st_idx += 1
 
+        # 3. Saved Waypoints from semantic_waypoints.yaml (Golden Pin & Text)
+        if os.path.exists(WAYPOINTS_CONFIG_PATH):
+            try:
+                with open(WAYPOINTS_CONFIG_PATH, 'r', encoding='utf-8') as f:
+                    wp_data = yaml.safe_load(f) or {}
+                    wps = wp_data.get("waypoints", {})
+                    wp_idx = 0
+                    for wp_name, wp_info in wps.items():
+                        wx = float(wp_info.get("x", 0.0))
+                        wy = float(wp_info.get("y", 0.0))
+                        wz = float(wp_info.get("z", 0.0))
+                        wyaw = math.radians(float(wp_info.get("yaw_deg", 0.0)))
+                        w_q = self._yaw_to_quaternion(wyaw)
+
+                        # Cylinder Pin
+                        wp_cyl = Marker()
+                        wp_cyl.header.frame_id = self.map_frame
+                        wp_cyl.header.stamp = now
+                        wp_cyl.ns = "gizmo_preview"
+                        wp_cyl.id = 500 + wp_idx * 10
+                        wp_cyl.type = Marker.CYLINDER
+                        wp_cyl.action = Marker.ADD
+                        wp_cyl.pose.position.x = wx
+                        wp_cyl.pose.position.y = wy
+                        wp_cyl.pose.position.z = wz + 0.10
+                        wp_cyl.scale.x = 0.20
+                        wp_cyl.scale.y = 0.20
+                        wp_cyl.scale.z = 0.20
+                        wp_cyl.color.r = 1.0
+                        wp_cyl.color.g = 0.75
+                        wp_cyl.color.b = 0.0
+                        wp_cyl.color.a = 0.75
+                        ma.markers.append(wp_cyl)
+
+                        # Direction Arrow
+                        wp_arrow = Marker()
+                        wp_arrow.header.frame_id = self.map_frame
+                        wp_arrow.header.stamp = now
+                        wp_arrow.ns = "gizmo_preview"
+                        wp_arrow.id = 500 + wp_idx * 10 + 1
+                        wp_arrow.type = Marker.ARROW
+                        wp_arrow.action = Marker.ADD
+                        wp_arrow.pose.position.x = wx
+                        wp_arrow.pose.position.y = wy
+                        wp_arrow.pose.position.z = wz + 0.20
+                        wp_arrow.pose.orientation = w_q
+                        wp_arrow.scale.x = 0.35
+                        wp_arrow.scale.y = 0.04
+                        wp_arrow.scale.z = 0.04
+                        wp_arrow.color.r = 1.0
+                        wp_arrow.color.g = 0.85
+                        wp_arrow.color.b = 0.2
+                        wp_arrow.color.a = 0.90
+                        ma.markers.append(wp_arrow)
+
+                        # Text Label
+                        wp_txt = Marker()
+                        wp_txt.header.frame_id = self.map_frame
+                        wp_txt.header.stamp = now
+                        wp_txt.ns = "gizmo_preview"
+                        wp_txt.id = 500 + wp_idx * 10 + 2
+                        wp_txt.type = Marker.TEXT_VIEW_FACING
+                        wp_txt.action = Marker.ADD
+                        wp_txt.pose.position.x = wx
+                        wp_txt.pose.position.y = wy
+                        wp_txt.pose.position.z = wz + 0.35
+                        wp_txt.scale.z = 0.10
+                        wp_txt.color.r = 1.0
+                        wp_txt.color.g = 0.85
+                        wp_txt.color.b = 0.2
+                        wp_txt.color.a = 0.95
+                        wp_txt.text = f"📍 [WP] {wp_name}"
+                        ma.markers.append(wp_txt)
+
+                        wp_idx += 1
+            except Exception:
+                pass
+
         self.marker_pub.publish(ma)
 
     def _process_feedback(self, feedback: InteractiveMarkerFeedback):
@@ -614,24 +754,147 @@ class InteractiveDockingTeacherNode(Node):
         else:
             return False, "Failed to write station configuration to disk."
 
-    def _command_callback(self, msg: String):
-        """Processes string commands (e.g. 'save <name>' or 'set_size <x> <y> <z>')."""
-        cmd = msg.data.strip().split()
+    def save_waypoint(self, wp_name: Optional[str] = None) -> Tuple[bool, str]:
+        """
+        Saves waypoint position and yaw orientation directly to semantic_waypoints.yaml.
+        """
+        target_name = (wp_name or self.waypoint_name).strip()
+        if not target_name:
+            target_name = "waypoint_01"
+
+        data = {}
+        if os.path.exists(WAYPOINTS_CONFIG_PATH):
+            try:
+                with open(WAYPOINTS_CONFIG_PATH, 'r', encoding='utf-8') as f:
+                    data = yaml.safe_load(f) or {}
+            except Exception as e:
+                self.get_logger().warn(f"Failed to load existing semantic_waypoints.yaml: {e}")
+
+        if "waypoints" not in data or not isinstance(data["waypoints"], dict):
+            data["waypoints"] = {}
+
+        yaw_deg = round(float(math.degrees(self.gizmo_yaw)), 2)
+        data["waypoints"][target_name] = {
+            "description": f"Taught waypoint {target_name} via RViz Gizmo",
+            "x": round(float(self.gizmo_pos[0]), 4),
+            "y": round(float(self.gizmo_pos[1]), 4),
+            "z": round(float(self.gizmo_pos[2]), 4),
+            "yaw_deg": yaw_deg,
+            "aliases": [target_name]
+        }
+
+        try:
+            install_wp_path = "/home/jjj/Documents/Dapier/Project/robot_ws/install/llm_semantic_docker/share/llm_semantic_docker/config/semantic_waypoints.yaml"
+            for p in [WAYPOINTS_CONFIG_PATH, install_wp_path]:
+                if os.path.exists(os.path.dirname(p)):
+                    with open(p, 'w', encoding='utf-8') as f:
+                        yaml.dump(data, f, allow_unicode=True, sort_keys=False)
+            msg = (f"Successfully saved waypoint '{target_name}' "
+                   f"(Pos: [{self.gizmo_pos[0]:.3f}, {self.gizmo_pos[1]:.3f}, {self.gizmo_pos[2]:.3f}], "
+                   f"Yaw: {yaw_deg:.1f}°) to semantic_waypoints.yaml.")
+            self.get_logger().info(f"📍 {msg}")
+            return True, msg
+        except Exception as e:
+            err = f"Failed to save waypoint '{target_name}' to disk: {e}"
+            self.get_logger().error(err)
+            return False, err
+
+    def _send_feedback(self, text: str):
+        """Sends user-facing feedback to ROS topic, logger, and updates RViz 3D text badge."""
+        self.feedback_status_text = text
+        self.feedback_time = time.time()
+        msg = String()
+        msg.data = text
+        self.feedback_pub.publish(msg)
+        self.get_logger().info(f"📢 [Gizmo Feedback] {text}")
+
+    def _process_command_string(self, raw_cmd: str):
+        """Parses and executes commands from CLI or ROS topic."""
+        cmd = raw_cmd.strip().split()
         if not cmd:
             return
         action = cmd[0].lower()
-        if action == "save":
+
+        # Helper to strip '<>', quotes, whitespace
+        clean = lambda s: s.strip("<> \"'")
+
+        # 1. Station Name Change: 'station [name]', 'st [name]'
+        if action in ("station", "set_station", "st", "set_name", "set_station_name"):
             if len(cmd) > 1:
-                self.station_name = cmd[1]
+                self.station_name = clean(cmd[1])
+                self._init_interactive_marker()
+                self._send_feedback(f"✔ 도킹 스테이션 대상 이름 변경: '{self.station_name}'")
+            else:
+                self._send_feedback(f"ℹ 현재 스테이션 이름: '{self.station_name}' (변경: station <이름>)")
+
+        # 2. Waypoint Name Change: 'wp [name]', 'set_wp [name]'
+        elif action in ("wp", "set_wp", "set_waypoint", "set_waypoint_name", "set_wp_name"):
+            if len(cmd) > 1:
+                self.waypoint_name = clean(cmd[1])
+                self._init_interactive_marker()
+                self._send_feedback(f"✔ 웨이포인트 대상 이름 변경: '{self.waypoint_name}'")
+            else:
+                self._send_feedback(f"ℹ 현재 웨이포인트 이름: '{self.waypoint_name}' (변경: wp <이름>)")
+
+        # 3. Save Waypoint: 'save_wp', 'save wp', 'save waypoint'
+        elif action in ("save_wp", "save_waypoint") or (action == "save" and len(cmd) > 1 and cmd[1].lower() in ("wp", "waypoint")):
+            target_wp = self.waypoint_name
+            if action in ("save_wp", "save_waypoint") and len(cmd) > 1:
+                target_wp = clean(cmd[1])
+            elif action == "save" and len(cmd) > 2:
+                target_wp = clean(cmd[2])
+
+            self.waypoint_name = target_wp
+            success, res = self.save_waypoint(target_wp)
+            self._init_interactive_marker()
+            self._send_feedback(f"📍 웨이포인트 '{self.waypoint_name}': {res}")
+
+        # 4. Save Station: 'save', 'save_station', 'save st', 'save station'
+        elif action in ("save", "save_station"):
+            target_st = self.station_name
+            if len(cmd) > 1:
+                if cmd[1].lower() in ("st", "station"):
+                    if len(cmd) > 2:
+                        target_st = clean(cmd[2])
+                else:
+                    target_st = clean(cmd[1])
+
+            self.station_name = target_st
             success, res = self.save_station_template()
-            self.get_logger().info(f"[Command] Save: {res}")
-        elif action == "set_name" and len(cmd) > 1:
-            self.station_name = cmd[1]
-            self.get_logger().info(f"Target station name updated to '{self.station_name}'")
+            self._init_interactive_marker()
+            self._send_feedback(f"💾 도킹 스테이션 '{self.station_name}': {res}")
+
+        # 5. Status / Info
+        elif action in ("status", "info"):
+            status_str = f"Station='{self.station_name}', WP='{self.waypoint_name}', Pose=[X={self.gizmo_pos[0]:.2f}, Y={self.gizmo_pos[1]:.2f}, Yaw={math.degrees(self.gizmo_yaw):.1f}°]"
+            self._send_feedback(f"📍 상태: {status_str}")
+
+        # 6. Box dimensions
+        elif action in ("box", "size", "set_box_size") and len(cmd) >= 4:
+            try:
+                sx, sy, sz = float(cmd[1]), float(cmd[2]), float(cmd[3])
+                self.set_box_size(sx, sy, sz)
+                self._send_feedback(f"📐 박스 크기 변경: {sx:.2f}x{sy:.2f}x{sz:.2f}m")
+            except Exception as e:
+                self._send_feedback(f"⚠️ 크기 파싱 실패: {e}")
+
+        else:
+            self._send_feedback(f"⚠️ 알 수 없는 명령어: '{raw_cmd}' (사용 가능: station <이름>, wp <이름>, save, save_wp, status)")
+
+    def _command_callback(self, msg: String):
+        """Processes string commands sent via /docking/teach_station_command topic."""
+        self._process_command_string(msg.data)
 
     def _save_service_callback(self, request, response):
-        """Trigger service callback."""
+        """Trigger service callback for station."""
         success, message = self.save_station_template()
+        response.success = success
+        response.message = message
+        return response
+
+    def _save_waypoint_service_callback(self, request, response):
+        """Trigger service callback for waypoint."""
+        success, message = self.save_waypoint()
         response.success = success
         response.message = message
         return response

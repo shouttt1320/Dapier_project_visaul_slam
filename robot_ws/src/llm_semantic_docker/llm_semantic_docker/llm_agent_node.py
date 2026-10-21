@@ -18,7 +18,8 @@ import urllib.request
 import urllib.error
 import threading
 import re
-from typing import Optional, Dict, Any, Tuple
+import yaml
+from typing import Optional, Dict, Any, Tuple, List
 
 import cv2
 import numpy as np
@@ -34,6 +35,9 @@ from cv_bridge import CvBridge
 
 from llm_semantic_docker.command_validator import CommandValidator, RobotIntent, ActionEnum, TargetSpec
 from llm_semantic_docker.software_stop_interceptor import SoftwareStopInterceptor
+
+
+TARGET_CONFIG_PATH = "/home/jjj/Documents/Dapier/Project/robot_ws/src/llm_semantic_docker/config/floor_target_objects.yaml"
 
 
 class TermColor:
@@ -57,10 +61,18 @@ class LLMAgentNode(Node):
         self.bridge = CvBridge()
 
         # ----------------------------------------------------------------------
+        # Target Registry & YAML Configuration
+        # ----------------------------------------------------------------------
+        self.target_profiles: Dict[str, Any] = {}
+        self.alias_to_canonical: Dict[str, str] = {}
+        self.sorted_aliases: List[str] = []
+        self._load_target_profiles()
+
+        # ----------------------------------------------------------------------
         # Parameters
         # ----------------------------------------------------------------------
         self.declare_parameter('ollama_url', 'http://127.0.0.1:11434/api/generate')
-        self.declare_parameter('model_name', 'qwen2.5vl:3b')
+        self.declare_parameter('model_name', 'qwen2.5:3b')
         self.declare_parameter('color_topic', '/camera/color/image_raw')
         self.declare_parameter('keep_alive', -1)
 
@@ -120,6 +132,28 @@ class LLMAgentNode(Node):
         if self.enable_cli_input:
             self.cli_thread = threading.Thread(target=self._cli_worker, daemon=True)
             self.cli_thread.start()
+
+    def _load_target_profiles(self):
+        """Loads floor_target_objects.yaml registry if present"""
+        if os.path.exists(TARGET_CONFIG_PATH):
+            try:
+                with open(TARGET_CONFIG_PATH, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+                    self.target_profiles = cfg.get("targets", {})
+                    self.alias_to_canonical.clear()
+                    for c_id, profile in self.target_profiles.items():
+                        self.alias_to_canonical[c_id.lower()] = c_id
+                        d_name = profile.get("display_name", "")
+                        if d_name:
+                            self.alias_to_canonical[d_name.lower()] = c_id
+                            self.alias_to_canonical[d_name.replace(" ", "").lower()] = c_id
+                        for al in profile.get("aliases", []):
+                            self.alias_to_canonical[al.lower()] = c_id
+                            self.alias_to_canonical[al.replace(" ", "").lower()] = c_id
+                    self.sorted_aliases = sorted(self.alias_to_canonical.keys(), key=lambda s: len(s), reverse=True)
+                    self.get_logger().info(f"📄 LLM Agent: Target profiles loaded ({len(self.target_profiles)} targets, {len(self.sorted_aliases)} aliases)")
+            except Exception as e:
+                self.get_logger().warn(f"Failed to load target config: {e}")
 
     def _print_banner(self):
         banner = f"""
@@ -211,17 +245,62 @@ class LLMAgentNode(Node):
                 "user_text": user_text
             }
 
-        # 2. 바닥 물체 직시 접근 명령 (향후 바닥 물체 접근 알고리즘 100% 호환)
-        if any(kw in cleaned for kw in ["바닥 물체", "바닥에 있는 물체", "물체로 다가가", "물체 다가가", "물체 접근"]):
+        # 2. 바닥 물체 직시 접근 명령 (Custom YOLO / Open-Vocabulary 타겟 매칭)
+        # 2.1 등록된 타겟 별칭(Alias) 우선 매칭
+        matched_canonical = None
+        matched_alias = None
+        cleaned_no_space = cleaned.replace(" ", "")
+
+        for al in self.sorted_aliases:
+            if al in cleaned or al.replace(" ", "") in cleaned_no_space:
+                matched_canonical = self.alias_to_canonical[al]
+                matched_alias = al
+                break
+
+        if matched_canonical is not None:
+            profile = self.target_profiles.get(matched_canonical, {})
+            disp_name = profile.get("display_name", matched_canonical)
+            default_standoff_m = float(profile.get("standoff_m", 0.25))
+
+            cm_match = re.search(r'([0-9]+)\s*cm', cleaned)
+            clearance = float(cm_match.group(1)) if cm_match else (default_standoff_m * 100.0)
+
             return {
                 "action": "DOCK",
                 "target": {
                     "target_structure": "floor_object",
                     "perception_type": "floor_object",
                     "direct_visual": True,
-                    "clearance_cm": 20.0
+                    "clearance_cm": clearance,
+                    "target_name": matched_canonical
                 },
-                "rationale": "바닥 물체 직시 접근",
+                "rationale": f"바닥 타겟 직시 접근 ({disp_name} / {matched_canonical}, {clearance:.0f}cm)",
+                "user_text": user_text
+            }
+
+        # 2.2 일반 바닥 물체 키워드 폴백 매칭
+        if any(kw in cleaned for kw in ["바닥 물체", "바닥에 있는 물체", "물체로 다가가", "물체 다가가", "물체 접근", "상자 접근", "큐브 접근"]):
+            cm_match = re.search(r'([0-9]+)\s*cm', cleaned)
+            clearance = float(cm_match.group(1)) if cm_match else 25.0
+
+            target_query = "small object on the floor"
+            if any(k in cleaned for k in ["상자", "박스", "box"]):
+                target_query = "box on the floor"
+            elif any(k in cleaned for k in ["큐브", "cube"]):
+                target_query = "cube on the floor"
+            elif any(k in cleaned for k in ["공", "볼", "ball"]):
+                target_query = "ball on the floor"
+
+            return {
+                "action": "DOCK",
+                "target": {
+                    "target_structure": "floor_object",
+                    "perception_type": "floor_object",
+                    "direct_visual": True,
+                    "clearance_cm": clearance,
+                    "target_name": target_query
+                },
+                "rationale": f"일반 바닥 물체 직시 접근 ({clearance:.0f}cm)",
                 "user_text": user_text
             }
 
@@ -438,7 +517,11 @@ JSON:"""
                             self.dock_station_pub.publish(String(data="marker"))
                     elif is_direct and p_type == "floor_object":
                         # 바닥 물체 직시 접근 알림
-                        resp_str = "🎯 [바닥 물체 확인] 바닥 물체 시각 검출 및 접근 모드를 개시합니다."
+                        t_name = resolved_task.get("target_name", "물체")
+                        profile = self.target_profiles.get(t_name, {})
+                        disp_name = profile.get("display_name", t_name)
+                        cl_cm = float(resolved_task.get("clearance_cm", 25.0))
+                        resp_str = f"🎯 [바닥 물체 확인] 대상 '{disp_name}' 시각 검출 및 {cl_cm:.0f}cm 정밀 접근 모드를 시작합니다."
                         self.agent_resp_pub.publish(String(data=resp_str))
                     elif resolved_task.get("station_name"):
                         st_name = resolved_task.get("station_name")
@@ -493,7 +576,8 @@ JSON:"""
             return {"target_found": False, "error": "Image encoding failed"}
         b64_img = base64.b64encode(buffer).decode('utf-8')
 
-        prompt = f"""Locate '{target_query}' in the image.
+        prompt = f"""Locate the foreground target object '{target_query}' resting on the floor in the lower half of the image.
+Ignore background furniture, desk legs, chairs, walls, and cabinets.
 Respond strictly in valid JSON format:
 {{
   "target_found": true or false,

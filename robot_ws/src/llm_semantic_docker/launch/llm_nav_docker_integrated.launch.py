@@ -248,6 +248,20 @@ def launch_setup(context, *args, **kwargs):
     )
     nodes.append(docking_controller_node)
 
+    # 11.1 Floor Object Approaching Controller Engine
+    object_approach_node = Node(
+        package='llm_semantic_docker',
+        executable='object_approaching_controller_node',
+        name='object_approaching_controller_node',
+        output='screen',
+        parameters=[{
+            'color_topic': rgb_topic,
+            'depth_topic': depth_topic,
+            'cam_info_topic': camera_info_topic,
+        }]
+    )
+    nodes.append(object_approach_node)
+
     # 12. Qwen Semantic Cockpit Mission Control GUI
     gui_node = Node(
         package='llm_semantic_docker',

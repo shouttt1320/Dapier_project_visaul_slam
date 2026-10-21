@@ -94,24 +94,68 @@ echo -e "      • ${BOLD}Height Z (+/- 5cm)${NC}  : 높이(Z) 미세 조절"
 echo -e "      • ${BOLD}Reset to Default${NC}    : 초기 크기로 리셋"
 echo -e "    - 또는 터미널에서 명령: ${YELLOW}ros2 topic pub --once /docking/set_box_size geometry_msgs/msg/Vector3 \"{x: 0.4, y: 0.4, z: 0.3}\"${NC}"
 echo ""
-echo -e " ${BOLD}4. 도킹 지점 원클릭 저장:${NC}"
-echo -e "    - 상자 위에서 ${GREEN}마우스 우클릭${NC} $\to$ ${BOLD}[Save Station (YAML)]${NC} 클릭"
-echo -e "    - 터미널에 ${GREEN}'Successfully saved station...'${NC} 로그가 뜨면 저장 완료!"
+echo -e " ${BOLD}4. 실시간 이름 변경 및 원클릭 저장 (터미널 입력 or 마우스 우클릭):${NC}"
+echo -e "    - ${YELLOW}[터미널 키보드 입력]${NC} 실행 중인 터미널에 바로 입력하여 변경 및 저장 가능:"
+echo -e "      • ${CYAN}station <이름>${NC} : 도킹 스테이션 이름 실시간 변경 (예: station workplace2)"
+echo -e "      • ${CYAN}wp <이름>${NC}      : 웨이포인트 이름 실시간 변경 (예: wp my_desk)"
+echo -e "      • ${GREEN}save${NC}          : 현재 기즈모 위치를 도킹 스테이션으로 저장"
+echo -e "      • ${GREEN}save_wp${NC}       : 현재 기즈모 위치를 웨이포인트로 저장"
+echo -e "    - ${YELLOW}[마우스 우클릭]${NC} RViz 기즈모 상자 위에서 마우스 우클릭:"
+echo -e "      • ${BOLD}[Save Docking Station (docking_stations.yaml)]${NC} 클릭"
+echo -e "      • ${BOLD}[Save Waypoint (semantic_waypoints.yaml)]${NC} 클릭"
 echo -e "    - 저장 경로:"
-echo -e "      • 도킹 좌표 설정값: ${CYAN}robot_ws/src/llm_semantic_docker/config/docking_stations.yaml${NC}"
+echo -e "      • 도킹 스테이션: ${CYAN}robot_ws/src/llm_semantic_docker/config/docking_stations.yaml${NC}"
+echo -e "      • 웨이포인트:   ${CYAN}robot_ws/src/llm_semantic_docker/config/semantic_waypoints.yaml${NC}"
 echo ""
-echo -e " ${BOLD}4. 완료 후:${NC}"
+echo -e " ${BOLD}5. 완료 후:${NC}"
 echo -e "    - RViz 창을 닫거나 터미널에서 ${RED}Ctrl + C${NC}를 누르면 안전하게 종료됩니다."
 echo -e "${BOLD}${GREEN}==============================================================================${NC}\n"
 
-echo -e "${CYAN}Starting RViz and Interactive Docking Teacher...${NC}"
-sleep 2
+echo -e "${CYAN}Starting RViz and Interactive Docking Teacher in background...${NC}"
 
-# Launch
-exec ros2 launch llm_semantic_docker teach_docking_station.launch.py \
+# Launch ROS 2 nodes & RViz in background
+ros2 launch llm_semantic_docker teach_docking_station.launch.py \
     station_name:="${STATION_NAME}" \
     box_size_x:="${BOX_X}" \
     box_size_y:="${BOX_Y}" \
     box_size_z:="${BOX_Z}" \
     database_path:="${MAP_DB}" \
-    start_map_server:="${START_MAP_SERVER}"
+    start_map_server:="${START_MAP_SERVER}" &
+LAUNCH_PID=$!
+
+# Ensure cleanup on exit
+trap "echo -e '\n${RED}Shutting down RViz and teaching nodes...${NC}'; kill $LAUNCH_PID 2>/dev/null || true; exit 0" INT TERM EXIT
+
+sleep 3
+
+echo -e "\n${BOLD}${GREEN}==============================================================================${NC}"
+echo -e " ⌨️  [실시간 기즈모 콘솔 활성화] 아래에 명령어를 바로 입력하세요 (꺾쇠 '<>' 없이 입력):"
+echo -e "   • ${CYAN}wp my_desk${NC}         : 웨이포인트 이름 지정 (예: wp my_desk)"
+echo -e "   • ${CYAN}station workplace2${NC} : 스테이션 이름 지정 (예: station workplace2)"
+echo -e "   • ${GREEN}save_wp${NC} (또는 ${GREEN}save wp${NC}): 현재 위치를 웨이포인트로 즉시 저장"
+echo -e "   • ${GREEN}save${NC}    (또는 ${GREEN}save st${NC}): 현재 위치를 도킹 스테이션으로 즉시 저장"
+echo -e "   • ${YELLOW}status${NC}              : 현재 좌표 및 타겟 이름 확인"
+echo -e "   • ${RED}q${NC} 또는 ${RED}exit${NC}        : 티칭 세션 종료"
+echo -e "${BOLD}${GREEN}==============================================================================${NC}\n"
+
+# Interactive CLI loop routing to /docking/teach_station_command
+while kill -0 $LAUNCH_PID 2>/dev/null; do
+    read -r -p "🤖 명령 입력 >> " user_cmd || break
+    [ -z "$user_cmd" ] && continue
+
+    case "$user_cmd" in
+        q|quit|exit)
+            echo -e "${YELLOW}티칭 세션을 종료합니다...${NC}"
+            break
+            ;;
+        *)
+            ros2 topic pub --once /docking/teach_station_command std_msgs/msg/String "{data: \"$user_cmd\"}" >/dev/null 2>&1
+            FEEDBACK_RES=$(timeout 1.5 ros2 topic echo /docking/teach_station_feedback std_msgs/msg/String --field data --once 2>/dev/null || true)
+            if [ -n "$FEEDBACK_RES" ]; then
+                echo -e "   ${GREEN}${FEEDBACK_RES}${NC}"
+            else
+                echo -e "   ✔ [전송 완료] '${user_cmd}'"
+            fi
+            ;;
+    esac
+done

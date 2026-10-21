@@ -16,6 +16,7 @@ import sys
 import time
 import math
 import json
+import copy
 import numpy as np
 from enum import Enum
 from typing import Optional, Dict, Any, Tuple
@@ -62,6 +63,8 @@ class TermColor:
 class TaskState(str, Enum):
     IDLE = "IDLE"
     NAVIGATING = "NAVIGATING"
+    AWAITING_PICK_CONFIRMATION = "AWAITING_PICK_CONFIRMATION"
+    WAITING_ARM_PICK = "WAITING_ARM_PICK"
     ACQUIRING = "ACQUIRING"
     ALIGNING = "ALIGNING"
     APPROACHING = "APPROACHING"
@@ -93,8 +96,10 @@ class TaskManagerNode(Node):
         self.current_velocity_linear: float = 0.0
         self.current_velocity_angular: float = 0.0
         self.docker_status_str: str = ""
+        self.obj_approach_status_str: str = ""
         self.visual_lock: bool = False
         self.estimated_target_dist: Optional[float] = None
+        self._obj_service_called: bool = False
 
         # ----------------------------------------------------------------------
         # ROS 2 Interfaces
@@ -116,6 +121,12 @@ class TaskManagerNode(Node):
         self.dock_start_cli = self.create_client(Trigger, '/docking/start')
         self.dock_abort_cli = self.create_client(Trigger, '/docking/abort')
         self.dock_confirm_cli = self.create_client(Trigger, '/docking/confirm')
+
+        # Floor Object Approach Control Clients & Publishers
+        self.obj_approach_start_cli = self.create_client(Trigger, '/object_approach/start')
+        self.obj_approach_abort_cli = self.create_client(Trigger, '/object_approach/abort')
+        self.obj_standoff_pub = self.create_publisher(String, '/object_approach/target_standoff', 10)
+        self.obj_query_pub = self.create_publisher(String, '/object_approach/target_query', 10)
 
         # Publishers (Twist / TwistStamped depending on enable_stamped_cmd_vel)
         self.declare_parameter('enable_stamped_cmd_vel', True)
@@ -158,12 +169,30 @@ class TaskManagerNode(Node):
         self.latest_target_pose: Optional[PoseStamped] = None
         self.latest_target_time: float = 0.0
 
+        # Command ID & External Robotic Arm Heartbeat Watchdog
+        self.current_cmd_id: Optional[str] = None
+        self.last_arm_heartbeat_time: Optional[float] = None
+        self.arm_heartbeat_timeout_sec: float = 1.0
+
+        # Smart Floor Pick Interruption Variables
+        self.paused_navigation_goal: Optional[Dict[str, Any]] = None
+        self.detected_pick_target: Optional[Dict[str, Any]] = None
+        self.pick_confirm_start_time: float = 0.0
+        self.pick_confirm_timeout_sec: float = 15.0
+        self.rejected_targets_cooldown: Dict[str, float] = {}
+
+        # User Prompt Publisher (For modal popup in GUI)
+        self.user_prompt_pub = self.create_publisher(String, '/task/user_prompt', 10)
+
         # Subscribers
         self.create_subscription(Bool, '/robot/bumper/contact', self._bumper_callback, 10)
         self.create_subscription(String, '/docking/status', self._docker_status_callback, 10)
+        self.create_subscription(String, '/object_approach/status', self._obj_approach_status_callback, 10)
         self.create_subscription(Bool, '/safety/software_stop', self._stop_trigger_callback, 10)
         self.create_subscription(String, '/task/command', self._task_command_callback, 10)
         self.create_subscription(PoseStamped, '/docking/target_object_pose', self._target_pose_callback, 10)
+        self.create_subscription(String, '/arm/heartbeat', self._arm_heartbeat_callback, 10)
+        self.create_subscription(String, '/floor_object/detected_event', self._on_floor_object_detected_event, 10)
 
         # Periodic FSM Update Timer (10 Hz)
         self.fsm_timer = self.create_timer(0.10, self._fsm_step)
@@ -257,6 +286,32 @@ class TaskManagerNode(Node):
                     self.log_info("ℹ️ Precision Docking Controller returned to NAV2_READY/IDLE. Finalizing task.")
                     self._transition_to(TaskState.IDLE, reason="Docking Controller returned to IDLE/NAV2_READY")
 
+    def _obj_approach_status_callback(self, msg: String):
+        self.obj_approach_status_str = msg.data
+        extracted_state = ""
+        if "STATE=" in msg.data:
+            extracted_state = msg.data.split("STATE=")[1].split(",")[0].strip().upper()
+        elif "{" in msg.data and "state" in msg.data:
+            try:
+                extracted_state = str(json.loads(msg.data).get("state", "")).strip().upper()
+            except Exception:
+                pass
+
+        if extracted_state in ("APPROACHED", "SUCCESS") or any(kw in msg.data for kw in ("STATE=APPROACHED", "STATE=SUCCESS", '"APPROACHED"')):
+            if self.state in (TaskState.ACQUIRING, TaskState.APPROACHING):
+                self.log_info("🎯 Object Approaching Controller reported APPROACHED!")
+                self._report_task_info("🎉 [물체 접근 완료] 로봇 정중앙 25cm 위치에 정렬 및 정지했습니다!")
+                if self.paused_navigation_goal:
+                    self.log_info("🤖 [로봇팔 파지 대기] 로봇팔이 물체를 잡을 때까지 대기(WAITING_ARM_PICK)합니다.")
+                    self._transition_to(TaskState.WAITING_ARM_PICK, reason="Object Approached. Awaiting robotic arm pickup.")
+                else:
+                    self._transition_to(TaskState.VERIFYING, reason="Object Approaching Controller Succeeded")
+        elif extracted_state in ("ABORTED", "FAILSAFE") or "STATE=ABORTED" in msg.data:
+            if self.state in (TaskState.ACQUIRING, TaskState.APPROACHING):
+                self.log_warn("❌ Object Approaching Controller reported ABORTED!")
+                self._report_task_failure("[물체 접근 중단] 바닥 물체 접근 제어기가 작업을 중단했습니다.")
+                self._transition_to(TaskState.ABORTED, reason="Object Approaching Controller Aborted")
+
 
 
     def _stop_trigger_callback(self, msg: Bool):
@@ -268,9 +323,62 @@ class TaskManagerNode(Node):
         self.latest_target_time = time.time()
         self.visual_lock = True
 
+    def _arm_heartbeat_callback(self, msg: String):
+        """Monitors liveness from external robotic arm node."""
+        self.last_arm_heartbeat_time = time.time()
+
     def _task_command_callback(self, msg: String):
         try:
             resolved_task = json.loads(msg.data)
+            self.current_cmd_id = resolved_task.get("id")
+
+            # External robotic arm / micro-inching short-hand normalization:
+            # e.g., {"forward": 0.05}, {"backward": 0.02}, {"turn_left": 5.0}, {"turn_right": 5.0}
+            # or {"action": "FORWARD", "distance": 0.05}
+            action_raw = str(resolved_task.get("action", "")).upper()
+
+            # Floor pick confirmation & arm handshake commands
+            if action_raw in ("APPROVE_PICK", "YES_PICK", "ACCEPT_PICK"):
+                self._approve_pick_and_approach()
+                return
+            elif action_raw in ("REJECT_PICK", "NO_PICK", "IGNORE_PICK", "SKIP_PICK"):
+                self._reject_pick_and_resume_navigation(reason="User rejected pick via command")
+                return
+            elif action_raw in ("PICK_COMPLETED", "PICK_DONE", "RESUME_NAV", "RESUME"):
+                self.log_info("🤖 [로봇팔 신호 수신] 물체 파지 완료! 원래 목적지로 주행을 복귀합니다.")
+                self._resume_paused_navigation()
+                return
+
+            # Forward aliases (forward, foward, fwd, front)
+            fwd_key = next((k for k in ("forward", "foward", "fwd", "front") if k in resolved_task), None)
+            # Backward aliases (backward, back, bwd)
+            bwd_key = next((k for k in ("backward", "back", "bwd") if k in resolved_task), None)
+
+            if fwd_key:
+                dist = float(resolved_task[fwd_key])
+                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": dist, "relative_y": 0.0, "relative_yaw": 0.0, "id": self.current_cmd_id}
+            elif bwd_key:
+                dist = float(resolved_task[bwd_key])
+                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": -dist, "relative_y": 0.0, "relative_yaw": 0.0, "id": self.current_cmd_id}
+            elif "turn_left" in resolved_task or "left" in resolved_task:
+                yaw_deg = float(resolved_task.get("turn_left", resolved_task.get("left", 5.0)))
+                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": yaw_deg, "id": self.current_cmd_id}
+            elif "turn_right" in resolved_task or "right" in resolved_task:
+                yaw_deg = float(resolved_task.get("turn_right", resolved_task.get("right", 5.0)))
+                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": -yaw_deg, "id": self.current_cmd_id}
+            elif action_raw in ("FORWARD", "MOVE_FORWARD"):
+                dist = float(resolved_task.get("distance", 0.05))
+                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": dist, "relative_y": 0.0, "relative_yaw": 0.0, "id": self.current_cmd_id}
+            elif action_raw in ("BACKWARD", "MOVE_BACKWARD"):
+                dist = float(resolved_task.get("distance", 0.05))
+                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": -dist, "relative_y": 0.0, "relative_yaw": 0.0, "id": self.current_cmd_id}
+            elif action_raw in ("TURN_LEFT", "ROTATE_LEFT"):
+                deg = float(resolved_task.get("angle_deg", resolved_task.get("angle", 15.0)))
+                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": deg, "id": self.current_cmd_id}
+            elif action_raw in ("TURN_RIGHT", "ROTATE_RIGHT"):
+                deg = float(resolved_task.get("angle_deg", resolved_task.get("angle", 15.0)))
+                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": -deg, "id": self.current_cmd_id}
+
             action = resolved_task.get("action", "")
             if action == "STOP":
                 self.trigger_software_stop(reason=resolved_task.get("reason", "STOP command received"))
@@ -294,21 +402,26 @@ class TaskManagerNode(Node):
             return True
 
         # Intercept commands during active docking session
-        if self.state == TaskState.DOCKING:
+        if self.state in (TaskState.DOCKING, TaskState.APPROACHING):
             if action in ("NAVIGATE", "NAVIGATE_ABSOLUTE", "NAVIGATE_OFFSET", "NAVIGATE_RELATIVE"):
-                self.log_info(f"🔄 Intercepted new action '{action}' during DOCKING. Aborting active docking session.")
+                self.log_info(f"🔄 Intercepted new action '{action}' during {self.state.value}. Aborting active controller session.")
                 if self.dock_abort_cli.service_is_ready():
                     self.dock_abort_cli.call_async(Trigger.Request())
-                self._transition_to(TaskState.IDLE, reason="Aborted docking for new navigation")
+                if self.obj_approach_abort_cli.service_is_ready():
+                    self.obj_approach_abort_cli.call_async(Trigger.Request())
+                self._transition_to(TaskState.IDLE, reason=f"Aborted {self.state.value} for new navigation")
             elif action == "DOCK":
-                self.log_info("🔄 Re-triggered DOCK while in DOCKING state. Resetting previous docking controller session.")
+                self.log_info(f"🔄 Re-triggered DOCK while in {self.state.value} state. Resetting previous controller session.")
                 self._docking_service_called = False
                 self._docking_service_calling = False
+                self._obj_service_called = False
                 if self.dock_abort_cli.service_is_ready():
                     self.dock_abort_cli.call_async(Trigger.Request())
+                if self.obj_approach_abort_cli.service_is_ready():
+                    self.obj_approach_abort_cli.call_async(Trigger.Request())
                 time.sleep(0.05)
 
-        if self.state not in (TaskState.IDLE, TaskState.SUCCESS, TaskState.ABORTED, TaskState.DOCKING):
+        if self.state not in (TaskState.IDLE, TaskState.SUCCESS, TaskState.ABORTED, TaskState.DOCKING, TaskState.APPROACHING):
             warn_msg = f"현재 작업({self.state.value}) 수행 중이므로 새 명령({action})을 수락할 수 없습니다."
             self.log_warn(warn_msg)
             self._report_task_failure(warn_msg)
@@ -324,12 +437,12 @@ class TaskManagerNode(Node):
                 print(f"│ Target:        {resolved_task.get('semantic_target'):<49} │")
             if "mode" in resolved_task:
                 print(f"│ Mode:          {resolved_task.get('mode'):<49} │")
-            if "staging_pose" in resolved_task:
-                wp = resolved_task.get("staging_pose", {})
+            if resolved_task.get("staging_pose"):
+                wp = resolved_task.get("staging_pose") or {}
                 yaw_val = wp.get('yaw_deg', wp.get('yaw', 0.0))
                 wp_str = f"({wp.get('x', 0):.2f}, {wp.get('y', 0):.2f}, yaw={yaw_val:.1f})"
                 print(f"│ Staging:       {wp_str:<49} │")
-            elif "staging_waypoint" in resolved_task:
+            elif resolved_task.get("staging_waypoint"):
                 print(f"│ Staging WP:    {str(resolved_task.get('staging_waypoint')):<49} │")
             print(f"└──────────────────────────────────────────────────────────────────┘{TermColor.RESET}\n")
 
@@ -361,16 +474,105 @@ class TaskManagerNode(Node):
                 self.log_warn("Docking confirm service (/docking/confirm) not ready")
             return True
 
-        self.log_warn(f"Unknown action: {action}")
-        return False
+    # --------------------------------------------------------------------------
+    # Smart Floor Pick Interruption Handlers
+    # --------------------------------------------------------------------------
+    def _on_floor_object_detected_event(self, msg: String):
+        """Triggered when YOLO discovers a floor target during patrol/navigation."""
+        try:
+            data = json.loads(msg.data)
+            cls_name = data.get("class_name", "")
+            now_t = time.time()
 
-    def trigger_software_stop(self, reason: str = "Unspecified"):
-        """
-        Instant software stop handler. Cancels Nav2, triggers docker abort, halts motors.
-        """
-        self.log_safety_event("SOFTWARE STOP INTERCEPT", reason)
-        
-        # 1. Cancel Nav2 Goal
+            # Ignore if within cooldown (e.g. user rejected this target within 15s)
+            if cls_name in self.rejected_targets_cooldown:
+                if (now_t - self.rejected_targets_cooldown[cls_name]) < 15.0:
+                    return
+
+            # Only interrupt when currently navigating on a waypoint patrol
+            if self.state == TaskState.NAVIGATING and not self.active_relative_nav:
+                # 1. Backup current navigation mission goal
+                self.paused_navigation_goal = copy.deepcopy(self.current_task)
+                self.detected_pick_target = data
+                self.pick_confirm_start_time = now_t
+
+                # 2. Halt motion immediately and cancel active Nav2 goal
+                self._cancel_nav2_goal()
+                self._halt_motors()
+
+                # 3. Transition to confirmation state
+                disp_name = data.get("display_name", cls_name)
+                dist_m = float(data.get("distance_m", 1.0))
+                self.log_info(f"🛑 [물체 감지 인터럽트] 바닥 {dist_m:.2f}m에서 '{disp_name}' 감지! 자율주행 일시정지 후 사용자 승인 대기...")
+                self._transition_to(TaskState.AWAITING_PICK_CONFIRMATION, reason=f"Detected {disp_name}")
+
+                # 4. Publish user prompt to GUI
+                prompt_payload = {
+                    "type": "PICK_CONFIRMATION",
+                    "class_name": cls_name,
+                    "display_name": disp_name,
+                    "distance_m": dist_m,
+                    "confidence": float(data.get("confidence", 0.8)),
+                    "timeout_sec": self.pick_confirm_timeout_sec,
+                    "message": f"전방 {dist_m:.2f}m에서 '{disp_name}'을(를) 발견했습니다!\n자율주행을 멈추고 물건을 잡으러 갈까요?"
+                }
+                self.user_prompt_pub.publish(String(data=json.dumps(prompt_payload)))
+                self._report_task_info(f"❓ [확인 대기] '{disp_name}' 발견! 수거 여부 승인 대기 중 ({self.pick_confirm_timeout_sec:.0f}초)...")
+
+        except Exception as e:
+            self.log_error(f"Failed to process /floor_object/detected_event: {e}")
+
+    def _approve_pick_and_approach(self):
+        """User approved picking the detected floor object."""
+        if self.state != TaskState.AWAITING_PICK_CONFIRMATION or not self.detected_pick_target:
+            self.log_warn("No pending pick confirmation to approve.")
+            return
+
+        cls_name = self.detected_pick_target.get("class_name", "")
+        disp_name = self.detected_pick_target.get("display_name", cls_name)
+        self.log_info(f"✅ [수거 승인] 사용자가 '{disp_name}' 수거를 승인했습니다. 25cm 정밀 접근 시작!")
+        self._report_task_info(f"✅ [수거 승인] '{disp_name}' 25cm 정밀 접근을 시작합니다.")
+
+        # Set target on object approaching controller and trigger start service
+        if hasattr(self, 'detect_query_pub'):
+            self.detect_query_pub.publish(String(data=cls_name))
+
+        dock_task = {
+            "action": "DOCK",
+            "target_structure": "floor_object",
+            "target_name": cls_name
+        }
+        self.current_task = dock_task
+        self._execute_dock_task(dock_task)
+
+    def _reject_pick_and_resume_navigation(self, reason: str = "User rejected"):
+        """User rejected or confirmation timed out: resume paused navigation goal."""
+        if self.detected_pick_target:
+            cls_name = self.detected_pick_target.get("class_name", "")
+            self.rejected_targets_cooldown[cls_name] = time.time()
+
+        self.log_info(f"⏭️ [수거 건너뛰기] {reason}. 원래 목적지로 주행을 재개합니다...")
+        self._report_task_info(f"⏭️ [주행 재개] 물체 수거를 건너뛰고 원래 목적지로 주행합니다.")
+        self._resume_paused_navigation()
+
+    def _resume_paused_navigation(self):
+        """Resumes the backed-up navigation goal."""
+        if not self.paused_navigation_goal:
+            self.log_info("No paused navigation goal to resume. Returning to IDLE.")
+            self._transition_to(TaskState.IDLE, reason="No paused goal")
+            return
+
+        resume_goal = copy.deepcopy(self.paused_navigation_goal)
+        self.paused_navigation_goal = None
+        self.detected_pick_target = None
+
+        # Reset state to IDLE first so submit_task is never blocked by previous state
+        self._transition_to(TaskState.IDLE, reason="Reset state before resuming navigation")
+        self.log_info(f"🚀 [원래 목적지 복귀] Action={resume_goal.get('action')} 재출발!")
+        self.submit_task(resume_goal)
+
+    def _cancel_nav2_goal(self):
+        """Cancels active Nav2 goal if in progress."""
         if self.nav2_goal_handle is not None and self.nav2_in_progress:
             self.log_info("Canceling active Nav2 goal...")
             try:
@@ -379,10 +581,21 @@ class TaskManagerNode(Node):
                 self.log_warn(f"Nav2 cancel error: {e}")
             self.nav2_in_progress = False
 
-        # 2. Abort Docking Service
+    def trigger_software_stop(self, reason: str = "Unspecified"):
+        """
+        Instant software stop handler. Cancels Nav2, triggers docker abort, halts motors.
+        """
+        self.log_safety_event("SOFTWARE STOP INTERCEPT", reason)
+        
+        # 1. Cancel Nav2 Goal
+        self._cancel_nav2_goal()
+
+        # 2. Abort Docking & Object Approach Services
         if self.dock_abort_cli.service_is_ready():
             req = Trigger.Request()
             self.dock_abort_cli.call_async(req)
+        if self.obj_approach_abort_cli.service_is_ready():
+            self.obj_approach_abort_cli.call_async(Trigger.Request())
 
         # 3. Publish zero velocity burst across all channels immediately
         self.active_relative_nav = False
@@ -420,8 +633,24 @@ class TaskManagerNode(Node):
         status_msg.data = f"STATE={self.state.value}, task={task_name}, target={target_name}, bumper={self.bumper_contact}"
         self.task_status_pub.publish(status_msg)
 
+        # Check external arm heartbeat watchdog if active
+        if self.last_arm_heartbeat_time is not None:
+            if time.time() - self.last_arm_heartbeat_time > self.arm_heartbeat_timeout_sec:
+                if self.active_relative_nav or self.state in (TaskState.NAVIGATING, TaskState.APPROACHING):
+                    self.log_error(f"🚨 [WATCHDOG] Arm heartbeat lost (> {self.arm_heartbeat_timeout_sec:.1f}s)! Triggering E-STOP.")
+                    self.trigger_software_stop(reason="Arm heartbeat timeout")
+                self.last_arm_heartbeat_time = None
+
         if self.state == TaskState.IDLE:
             pass
+
+        elif self.state == TaskState.AWAITING_PICK_CONFIRMATION:
+            self.send_cmd_vel(0.0, 0.0)
+            if elapsed > self.pick_confirm_timeout_sec:
+                self._reject_pick_and_resume_navigation(reason=f"Confirmation timeout ({self.pick_confirm_timeout_sec:.0f}s)")
+
+        elif self.state == TaskState.WAITING_ARM_PICK:
+            self.send_cmd_vel(0.0, 0.0)
 
         elif self.state == TaskState.NAVIGATING:
             if self.active_relative_nav:
@@ -499,9 +728,25 @@ class TaskManagerNode(Node):
                 self._transition_to(TaskState.APPROACHING, reason="Heading Alignment Time Elapsed")
 
         elif self.state == TaskState.APPROACHING:
-            # Standoff approach: precision_docking_controller_node에 전권을 위임하므로 바로 DOCKING으로 전이
-            self._halt_motors()
-            self._transition_to(TaskState.DOCKING, reason="Delegating approach to Precision Docking Controller")
+            # 바닥 물체 접근 제어기(object_approaching_controller_node)에 전권 위임
+            if not getattr(self, '_obj_service_called', False):
+                if self.obj_approach_start_cli.service_is_ready():
+                    def _on_obj_start_retry(f):
+                        try:
+                            res = f.result()
+                            if res.success:
+                                self.log_info(f"✅ 바닥 물체 접근 제어기 가동 승인: {res.message}")
+                            else:
+                                self.log_warn(f"⚠️ 바닥 물체 접근 제어기 시작 실패: {res.message}")
+                        except Exception as ex:
+                            self.log_error(f"바닥 물체 접근 제어기 응답 오류: {ex}")
+                    fut = self.obj_approach_start_cli.call_async(Trigger.Request())
+                    fut.add_done_callback(_on_obj_start_retry)
+                    self._obj_service_called = True
+            if elapsed > 90.0:
+                self.log_warn("물체 접근 타임아웃 (>90초) 발생!")
+                self.trigger_software_stop(reason="Object Approach Timeout")
+            return
 
         elif self.state == TaskState.DOCKING:
             # 정밀 도킹 엔진(precision_docking_controller_node)에 제어권을 완전 위임
@@ -715,6 +960,36 @@ class TaskManagerNode(Node):
         target_structure = resolved_task.get("target_structure", "box")
         staging_pose = resolved_task.get("staging_pose")
         station_name = resolved_task.get("station_name")
+
+        p_type = resolved_task.get("perception_type", "")
+        is_floor_obj = (p_type == "floor_object") or (target_structure == "floor_object")
+
+        # 바닥 물체 직시 접근인 경우 ObjectApproachingControllerNode로 즉시 위임
+        if is_floor_obj and bool(resolved_task.get("direct_visual", True)):
+            clearance_m = float(resolved_task.get("clearance_cm", 25.0)) / 100.0
+            self.obj_standoff_pub.publish(String(data=f"{clearance_m:.2f}"))
+            t_query = resolved_task.get("target_name")
+            if t_query:
+                self.obj_query_pub.publish(String(data=str(t_query)))
+            self.log_info(f"🎯 [Floor Object Approach] 바닥 물체 접근 제어기로 제어권을 위임합니다 (목표: {clearance_m*100:.0f}cm, 대상: '{t_query or 'default'}').")
+            self._obj_service_called = False
+            self._transition_to(TaskState.APPROACHING, reason="Handover to ObjectApproachingController")
+            if self.obj_approach_start_cli.service_is_ready():
+                def _on_obj_start_done(f):
+                    try:
+                        res = f.result()
+                        if res.success:
+                            self.log_info(f"✅ 바닥 물체 접근 제어기 가동 승인: {res.message}")
+                        else:
+                            self.log_warn(f"⚠️ 바닥 물체 접근 제어기 거부: {res.message}")
+                    except Exception as ex:
+                        self.log_error(f"바닥 물체 접근 제어기 응답 오류: {ex}")
+                fut = self.obj_approach_start_cli.call_async(Trigger.Request())
+                fut.add_done_callback(_on_obj_start_done)
+                self._obj_service_called = True
+            else:
+                self.log_warn("⚠️ /object_approach/start 서비스 준비 대기 중 (FSM에서 재시도)")
+            return
 
         # 0. 마커/물체 직시 도킹 모드인 경우: Nav2 Staging 주행 완전 생략 (Bypass)
         is_direct_visual = bool(resolved_task.get("direct_visual", False))
@@ -942,6 +1217,10 @@ class TaskManagerNode(Node):
             if abs(err_dist) < 0.012:  # Reached within 1.2cm
                 self.send_cmd_vel(0.0, 0.0)
                 self.active_relative_nav = False
+                done_text = f"INFO: Relative displacement completed: dx={dx_local*100:.1f}cm"
+                if self.current_cmd_id:
+                    done_text += f", id={self.current_cmd_id}"
+                self.task_status_pub.publish(String(data=done_text))
                 self.log_info(f"🎯 [Relative Nav Done] Traveled {dx_local*100:.1f}cm (target: {self.rel_target_dist*100:.1f}cm)")
                 self._transition_to(TaskState.VERIFYING, reason="Relative Nav Reached via Odom")
                 return

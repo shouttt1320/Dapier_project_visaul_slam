@@ -12,6 +12,7 @@ A modern, dark-themed robotic cockpit GUI for interacting with:
 """
 
 import sys
+import os
 import json
 import math
 import time
@@ -19,16 +20,21 @@ import re
 import threading
 import subprocess
 import urllib.request
+import yaml
+from typing import Optional, Tuple, List, Dict, Any
 import numpy as np
 import cv2
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit, QFrame, QGridLayout,
-    QSizePolicy, QSplitter, QProgressBar, QScrollArea
+    QSizePolicy, QSplitter, QProgressBar, QScrollArea, QComboBox, QDialog
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
 from PyQt5.QtGui import QImage, QPixmap, QFont, QColor, QPalette, QIcon
+
+GIZMO_STATIONS_PATH = "/home/jjj/Documents/Dapier/Project/robot_ws/src/llm_semantic_docker/config/docking_stations.yaml"
+WAYPOINTS_PATH = "/home/jjj/Documents/Dapier/Project/robot_ws/src/llm_semantic_docker/config/semantic_waypoints.yaml"
 
 import rclpy
 from rclpy.node import Node
@@ -39,6 +45,134 @@ from nav_msgs.msg import Odometry, OccupancyGrid
 from std_msgs.msg import String, Bool
 from std_srvs.srv import Trigger
 from cv_bridge import CvBridge
+
+
+class PickConfirmationDialog(QDialog):
+    """Modern dark-themed popup dialog for confirming floor object pickup."""
+    def __init__(self, data: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedSize(500, 270)
+
+        self.data = data
+        self.remaining_sec = int(data.get("timeout_sec", 15))
+        self.result_action = "REJECT_PICK"
+
+        # Outer card frame
+        card = QFrame(self)
+        card.setGeometry(0, 0, 500, 270)
+        card.setStyleSheet("""
+            QFrame {
+                background-color: #0f172a;
+                border: 2px solid #38bdf8;
+                border-radius: 14px;
+            }
+        """)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
+
+        # Header Title
+        title_box = QHBoxLayout()
+        icon_lbl = QLabel("📦")
+        icon_lbl.setStyleSheet("font-size: 24px; border: none;")
+        title_lbl = QLabel("바닥 물체 발견 - 수거(집기) 승인 요청")
+        title_lbl.setStyleSheet("font-size: 16px; font-weight: bold; color: #38bdf8; border: none;")
+        title_box.addWidget(icon_lbl)
+        title_box.addWidget(title_lbl)
+        title_box.addStretch()
+        layout.addLayout(title_box)
+
+        # Body Message
+        disp_name = data.get("display_name", "물체")
+        dist_m = float(data.get("distance_m", 1.0))
+        conf = int(float(data.get("confidence", 0.8)) * 100)
+
+        body_lbl = QLabel(f"전방 <b>{dist_m:.2f}m</b>에서 <b>'{disp_name}'</b> (신뢰도 {conf}%)을(를) 발견했습니다!<br>"
+                          f"자율주행을 멈추고 <b>로봇팔 수거(25cm 정밀 접근)</b>를 진행할까요?")
+        body_lbl.setStyleSheet("font-size: 13px; color: #e2e8f0; line-height: 1.4; border: none;")
+        body_lbl.setWordWrap(True)
+        layout.addWidget(body_lbl)
+
+        # Timer Countdown label
+        self.timer_lbl = QLabel(f"⏳ 남은 시간: {self.remaining_sec}초 (미응답 시 자동 계속 주행)")
+        self.timer_lbl.setStyleSheet("font-size: 11px; color: #94a3b8; border: none;")
+        layout.addWidget(self.timer_lbl)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(12)
+
+        self.btn_reject = QPushButton("⚪ 무시하고 계속 (Esc)")
+        self.btn_reject.setStyleSheet("""
+            QPushButton {
+                background-color: #334155;
+                color: #cbd5e1;
+                font-size: 12px;
+                font-weight: bold;
+                border: 1px solid #475569;
+                border-radius: 8px;
+                padding: 10px 16px;
+            }
+            QPushButton:hover {
+                background-color: #475569;
+                color: #ffffff;
+            }
+        """)
+        self.btn_reject.clicked.connect(self._on_reject)
+        btn_layout.addWidget(self.btn_reject)
+
+        self.btn_approve = QPushButton("🟢 지금 잡기 (Enter)")
+        self.btn_approve.setStyleSheet("""
+            QPushButton {
+                background-color: #0284c7;
+                color: #ffffff;
+                font-size: 12px;
+                font-weight: bold;
+                border: 1px solid #38bdf8;
+                border-radius: 8px;
+                padding: 10px 20px;
+            }
+            QPushButton:hover {
+                background-color: #0369a1;
+            }
+        """)
+        self.btn_approve.clicked.connect(self._on_approve)
+        btn_layout.addWidget(self.btn_approve)
+
+        layout.addLayout(btn_layout)
+
+        # Countdown Timer (1s tick)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._on_tick)
+        self.timer.start(1000)
+
+    def _on_tick(self):
+        self.remaining_sec -= 1
+        if self.remaining_sec <= 0:
+            self.timer.stop()
+            self._on_reject()
+        else:
+            self.timer_lbl.setText(f"⏳ 남은 시간: {self.remaining_sec}초 (미응답 시 자동 계속 주행)")
+
+    def _on_approve(self):
+        self.timer.stop()
+        self.result_action = "APPROVE_PICK"
+        self.accept()
+
+    def _on_reject(self):
+        self.timer.stop()
+        self.result_action = "REJECT_PICK"
+        self.reject()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self._on_approve()
+        elif event.key() == Qt.Key_Escape:
+            self._on_reject()
+        else:
+            super().keyPressEvent(event)
 
 
 class RosWorkerThread(QThread):
@@ -55,6 +189,7 @@ class RosWorkerThread(QThread):
     odom_pose_signal = pyqtSignal(float, float, float, float)  # x, y, yaw_deg, total_dist
     topic_health_signal = pyqtSignal(dict)  # topic stats
     connectivity_signal = pyqtSignal(dict)  # network & AI backend status
+    user_prompt_signal = pyqtSignal(str)   # Modal confirmation prompt for floor object pick
 
     def __init__(self, node: Node):
         super().__init__()
@@ -101,10 +236,14 @@ class RosWorkerThread(QThread):
             Image, '/camera/color/image_decompressed', self._raw_decomp_img_cb, sensor_qos)
         self.node.create_subscription(
             Image, '/camera/color/image_raw', self._raw_decomp_img_cb, sensor_qos)
+        self.node.create_subscription(
+            Image, '/object_approach/debug_image', self._obj_approach_img_cb, sensor_qos)
 
         # 2. System Status Subscriptions
         self.node.create_subscription(String, '/task/status', self._task_status_cb, 10)
+        self.node.create_subscription(String, '/task/user_prompt', self._user_prompt_cb, 10)
         self.node.create_subscription(String, '/docking/status', self._docking_status_cb, 10)
+        self.node.create_subscription(String, '/object_approach/status', self._obj_approach_status_cb, 10)
         self.node.create_subscription(String, '/llm/agent_response', self._agent_response_cb, 10)
         self.node.create_subscription(PoseStamped, '/docking/target_object_pose', self._target_pose_cb, 10)
         self.node.create_subscription(Bool, '/robot/bumper/contact', self._bumper_cb, 10)
@@ -185,9 +324,26 @@ class RosWorkerThread(QThread):
         self._mark_topic("TaskStatus")
         self.fsm_status_signal.emit(f"SOURCE=TASK,{msg.data}")
 
+    def _user_prompt_cb(self, msg: String):
+        self.user_prompt_signal.emit(msg.data)
+
     def _docking_status_cb(self, msg: String):
         self._mark_topic("DockingStatus")
         self.fsm_status_signal.emit(f"SOURCE=DOCK,{msg.data}")
+
+    def _obj_approach_img_cb(self, msg: Image):
+        self._mark_topic("Camera")
+        try:
+            cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            if cv_img is not None:
+                self._last_hud_img_time = time.time()
+                self.image_signal.emit(cv_img)
+        except Exception:
+            pass
+
+    def _obj_approach_status_cb(self, msg: String):
+        self._mark_topic("DockingStatus")
+        self.fsm_status_signal.emit(f"SOURCE=APPROACH,{msg.data}")
 
     def _agent_response_cb(self, msg: String):
         self.agent_response_signal.emit(msg.data)
@@ -404,14 +560,18 @@ class RosWorkerThread(QThread):
 
 
 class QwenMissionControlGUI(QMainWindow):
-    """Premium Dark-Themed Cockpit UI for Qwen2.5-VL Visual SLAM & Semantic Docker."""
+    """Premium Dark-Themed Cockpit UI for Qwen2.5 (3B) + YOLO 3D Visual SLAM & Semantic Docker."""
 
     def __init__(self, ros_node: Node):
         super().__init__()
         self.ros_node = ros_node
-        self.setWindowTitle("🚀 Qwen2.5-VL Autonomous Mission Control & Semantic Docker")
-        self.resize(1280, 880)
-        self.setMinimumSize(1024, 720)
+        self.setWindowTitle("🚀 Qwen2.5 (3B) + YOLO 3D Mission Control & Semantic Docker")
+        self.resize(1320, 920)
+        self.setMinimumSize(1100, 750)
+
+        # Gizmo & Registered Waypoints State
+        self.gizmo_locations = {}
+        self._load_gizmo_locations()
 
         # Telemetry State (Populated in Precision Docking Mode)
         self.target_dist = None
@@ -455,8 +615,120 @@ class QwenMissionControlGUI(QMainWindow):
         self.worker.odom_pose_signal.connect(self._update_odom_pose)
         self.worker.topic_health_signal.connect(self._update_topic_health)
         self.worker.connectivity_signal.connect(self._update_connectivity)
+        self.worker.user_prompt_signal.connect(self._on_user_prompt_received)
 
         self.worker.start()
+
+    def _on_user_prompt_received(self, json_str: str):
+        """Displays modal confirmation dialog when robot discovers floor object on patrol."""
+        try:
+            data = json.loads(json_str)
+            if data.get("type") == "PICK_CONFIRMATION":
+                dialog = PickConfirmationDialog(data, self)
+                # Center dialog over main window
+                dialog.move(self.geometry().center() - dialog.rect().center())
+                dialog.exec_()
+
+                # Send user decision action to /task/command
+                cmd = {"action": dialog.result_action}
+                self.worker.send_direct_task(cmd)
+                self.chat_history.append(
+                    f"<div style='margin: 4px 0; color: #38bdf8;'><b>[수거 응답]</b> "
+                    f"'{dialog.result_action}' 전송 완료.</div>"
+                )
+        except Exception as e:
+            print(f"Failed to display prompt dialog: {e}")
+
+    # --------------------------------------------------------------------------
+    # Gizmo & Registered Waypoints Location Management
+    # --------------------------------------------------------------------------
+    def _load_gizmo_locations(self):
+        """Loads stations from docking_stations.yaml (taught via RViz Gizmo) and waypoints from semantic_waypoints.yaml"""
+        self.gizmo_locations.clear()
+
+        # 1. Docking Stations (RViz Gizmo로 등록된 정밀 도킹 스테이션)
+        if os.path.exists(GIZMO_STATIONS_PATH):
+            try:
+                with open(GIZMO_STATIONS_PATH, 'r', encoding='utf-8') as f:
+                    data = yaml.safe_load(f) or {}
+                    stations = data.get("stations", {})
+                    for name, s_info in stations.items():
+                        standoff = s_info.get("standoff", {})
+                        x = float(standoff.get("x", 0.0))
+                        y = float(standoff.get("y", 0.0))
+                        yaw = float(standoff.get("yaw_deg", 0.0))
+                        desc = s_info.get("description", "RViz 기즈모 등록 도킹 스테이션")
+                        label = f"🎯 [기즈모 도킹] {name}"
+                        self.gizmo_locations[label] = {
+                            "type": "station",
+                            "name": name,
+                            "x": x, "y": y, "yaw": yaw,
+                            "desc": desc
+                        }
+            except Exception as e:
+                print(f"[GUI] Failed to load docking_stations.yaml: {e}")
+
+        # 2. Semantic Waypoints (사전 정의/티칭된 웨이포인트 목록)
+        if os.path.exists(WAYPOINTS_PATH):
+            try:
+                with open(WAYPOINTS_PATH, 'r', encoding='utf-8') as f:
+                    data = yaml.safe_load(f) or {}
+                    wps = data.get("waypoints", {})
+                    for name, w_info in wps.items():
+                        x = float(w_info.get("x", 0.0))
+                        y = float(w_info.get("y", 0.0))
+                        yaw = float(w_info.get("yaw_deg", 0.0))
+                        desc = w_info.get("description", "")
+                        label = f"📍 [웨이포인트] {name}"
+                        self.gizmo_locations[label] = {
+                            "type": "waypoint",
+                            "name": name,
+                            "x": x, "y": y, "yaw": yaw,
+                            "desc": desc
+                        }
+            except Exception as e:
+                print(f"[GUI] Failed to load semantic_waypoints.yaml: {e}")
+
+    def _refresh_gizmo_list(self):
+        """Reloads YAML files and refreshes the UI combo box"""
+        self._load_gizmo_locations()
+        if hasattr(self, 'gizmo_combo'):
+            self.gizmo_combo.blockSignals(True)
+            self.gizmo_combo.clear()
+            for label in self.gizmo_locations.keys():
+                self.gizmo_combo.addItem(label)
+            self.gizmo_combo.blockSignals(False)
+            self._on_gizmo_selected()
+        self.dialog_box.append("🔄 [좌표 목록 새로고침] 기즈모 스테이션 및 웨이포인트 목록을 갱신했습니다.")
+
+    def _on_gizmo_selected(self):
+        """Displays coordinates and details for selected gizmo/waypoint"""
+        if not hasattr(self, 'gizmo_combo') or not hasattr(self, 'gizmo_coord_lbl'):
+            return
+        curr_label = self.gizmo_combo.currentText()
+        info = self.gizmo_locations.get(curr_label)
+        if info:
+            self.gizmo_coord_lbl.setText(
+                f"📍 X: {info['x']:+.2f}m | Y: {info['y']:+.2f}m | Yaw: {info['yaw']:+.1f}°\n({info['desc']})"
+            )
+        else:
+            self.gizmo_coord_lbl.setText("선택된 좌표: ---")
+
+    def _handle_go_gizmo_click(self):
+        """Dispatches navigation/docking command for currently selected gizmo/waypoint"""
+        if not hasattr(self, 'gizmo_combo'):
+            return
+        curr_label = self.gizmo_combo.currentText()
+        info = self.gizmo_locations.get(curr_label)
+        if not info:
+            return
+        name = info["name"]
+        if info["type"] == "station":
+            prompt = f"{name}로 도킹해"
+        else:
+            prompt = f"{name}으로 이동해줘"
+        self.dialog_box.append(f"\n🚀 [기즈모/웨이포인트 이동]: '{prompt}' 실행")
+        self._submit_prompt(prompt)
 
     def _setup_styling(self):
         self.setStyleSheet("""
@@ -465,7 +737,7 @@ class QwenMissionControlGUI(QMainWindow):
             }
             QWidget {
                 color: #e2e8f0;
-                font-family: 'Inter', 'Ubuntu', 'Segoe UI', sans-serif;
+                font-family: 'Noto Sans CJK KR', 'Noto Sans KR', 'Malgun Gothic', 'Ubuntu', 'DejaVu Sans', sans-serif;
             }
             QFrame.panel {
                 background-color: #131a29;
@@ -480,16 +752,22 @@ class QwenMissionControlGUI(QMainWindow):
             }
             QLabel.title {
                 color: #00f0ff;
-                font-size: 15px;
+                font-size: 14px;
                 font-weight: bold;
                 letter-spacing: 0.5px;
             }
             QLabel.metric-val {
-                font-size: 18px;
+                border: none;
+                background: transparent;
+                padding: 0px;
+                font-size: 17px;
                 font-weight: bold;
                 color: #38bdf8;
             }
             QLabel.metric-lbl {
+                border: none;
+                background: transparent;
+                padding: 0px;
                 font-size: 11px;
                 color: #94a3b8;
                 text-transform: uppercase;
@@ -597,13 +875,13 @@ class QwenMissionControlGUI(QMainWindow):
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(10, 0, 10, 0)
 
-        title_lbl = QLabel("👁️ Qwen2.5-VL MISSION CONTROL & SEMANTIC DOCKER")
+        title_lbl = QLabel("🧠 QWEN2.5 (3B) + YOLO 3D MISSION CONTROL & DOCKER")
         title_lbl.setStyleSheet("font-size: 16px; font-weight: bold; color: #00f0ff; letter-spacing: 0.8px;")
         header_layout.addWidget(title_lbl)
 
         header_layout.addStretch()
 
-        mode_tag = QLabel("MODE: VLM VISUAL GROUNDING (ACTIVE)")
+        mode_tag = QLabel("MODE: QWEN2.5 + YOLO 3D SERVOING (ACTIVE)")
         mode_tag.setStyleSheet("""
             background-color: rgba(0, 240, 255, 0.12);
             color: #00f0ff;
@@ -680,13 +958,13 @@ class QwenMissionControlGUI(QMainWindow):
         grid = QGridLayout()
         grid.setSpacing(6)
 
-        self.dist_card = self._create_metric_card("MARKER DIST (마커 거리)", "--- m", "#38bdf8")
+        self.dist_card = self._create_metric_card("TARGET DIST (목표 거리)", "--- m", "#38bdf8")
         grid.addWidget(self.dist_card, 0, 0)
 
         self.yaw_card = self._create_metric_card("ALIGN YAW (법선 정렬각)", "--- °", "#a78bfa")
         grid.addWidget(self.yaw_card, 0, 1)
 
-        self.axis_card = self._create_metric_card("CENTERLINE ERR (중심선 편차)", "--- cm", "#f59e0b")
+        self.axis_card = self._create_metric_card("CENTERLINE ERR (중심 편차)", "--- cm", "#f59e0b")
         grid.addWidget(self.axis_card, 1, 0)
 
         self.bumper_card = self._create_metric_card("BUMPER (범퍼접촉)", "SAFE", "#10b981")
@@ -698,16 +976,71 @@ class QwenMissionControlGUI(QMainWindow):
         right_layout.addLayout(grid)
 
         # 2.2 Agent Thought & Dialog Box
-        dialog_title = QLabel("QWEN2.5-VL AGENT INTELLIGENCE LOG")
+        dialog_title = QLabel("QWEN2.5 AGENT & YOLO 3D LOG")
         dialog_title.setProperty("class", "title")
         right_layout.addWidget(dialog_title)
 
         self.dialog_box = QTextEdit()
         self.dialog_box.setReadOnly(True)
-        self.dialog_box.append("🤖 [Qwen2.5-VL Agent Ready] Multimodal visual grounding active.")
+        self.dialog_box.setMinimumHeight(65)
+        self.dialog_box.setMaximumHeight(100)
+        self.dialog_box.append("🤖 [Qwen2.5 Agent Ready] Qwen2.5 (3B) LLM + Real-time YOLO 3D active.")
         right_layout.addWidget(self.dialog_box)
 
-        # 2.3 Quick Relative Navigation & Docking Presets
+        # 2.3 Registered Gizmo Stations & Semantic Waypoints
+        gizmo_panel_title = QLabel("📍 GIZMO & REGISTERED WAYPOINTS")
+        gizmo_panel_title.setProperty("class", "title")
+        right_layout.addWidget(gizmo_panel_title)
+
+        gizmo_box = QFrame()
+        gizmo_box.setStyleSheet("background-color: #131d2e; border: 1px solid #1e293b; border-radius: 8px; padding: 6px;")
+        gizmo_layout = QVBoxLayout(gizmo_box)
+        gizmo_layout.setContentsMargins(6, 6, 6, 6)
+        gizmo_layout.setSpacing(5)
+
+        combo_row = QHBoxLayout()
+        self.gizmo_combo = QComboBox()
+        self.gizmo_combo.setStyleSheet("""
+            QComboBox {
+                background-color: #0f172a;
+                color: #38bdf8;
+                border: 1px solid #334155;
+                border-radius: 4px;
+                padding: 5px 8px;
+                font-weight: bold;
+                font-size: 11px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #0f172a;
+                color: #f8fafc;
+                selection-background-color: #2563eb;
+            }
+        """)
+        for label in self.gizmo_locations.keys():
+            self.gizmo_combo.addItem(label)
+        self.gizmo_combo.currentIndexChanged.connect(self._on_gizmo_selected)
+        combo_row.addWidget(self.gizmo_combo, 1)
+
+        btn_refresh_gizmo = QPushButton("🔄")
+        btn_refresh_gizmo.setToolTip("기즈모 및 웨이포인트 목록 새로고침")
+        btn_refresh_gizmo.setStyleSheet("background-color: #1e293b; color: #f8fafc; font-weight: bold; padding: 5px 10px; border: 1px solid #334155; border-radius: 4px;")
+        btn_refresh_gizmo.clicked.connect(self._refresh_gizmo_list)
+        combo_row.addWidget(btn_refresh_gizmo)
+        gizmo_layout.addLayout(combo_row)
+
+        self.gizmo_coord_lbl = QLabel("선택된 좌표: ---")
+        self.gizmo_coord_lbl.setStyleSheet("color: #a78bfa; font-family: monospace; font-size: 11px; font-weight: bold; padding: 2px 4px;")
+        self._on_gizmo_selected()
+        gizmo_layout.addWidget(self.gizmo_coord_lbl)
+
+        btn_go_gizmo = QPushButton("🚀 선택한 기즈모 위치로 이동 / 도킹")
+        btn_go_gizmo.setStyleSheet("background-color: rgba(59, 130, 246, 0.25); border: 1px solid #3b82f6; color: #60a5fa; font-weight: bold; padding: 7px; border-radius: 6px; font-size: 12px;")
+        btn_go_gizmo.clicked.connect(self._handle_go_gizmo_click)
+        gizmo_layout.addWidget(btn_go_gizmo)
+
+        right_layout.addWidget(gizmo_box)
+
+        # 2.4 Quick Relative Navigation & Target Servoing
         presets_title = QLabel("QUICK ACTION PRESETS")
         presets_title.setProperty("class", "title")
         right_layout.addWidget(presets_title)
@@ -745,24 +1078,67 @@ class QwenMissionControlGUI(QMainWindow):
         btn_right15.clicked.connect(lambda: self._send_relative_nav(0.0, 0.0, -15.0))
         quick_grid.addWidget(btn_right15, 1, 2)
 
-        btn_dock_marker = QPushButton("🎯 마커 정밀 도킹 (Dock Station)")
+        # 3열: 타겟 시각 접근 (빨간 큐브, 파란 공, 마커)
+        btn_yolo_red = QPushButton("🔴 빨간 큐브 접근")
+        btn_yolo_red.setStyleSheet("background-color: rgba(239, 68, 68, 0.20); border: 1px solid #ef4444; color: #f87171; font-weight: bold; padding: 6px;")
+        btn_yolo_red.clicked.connect(lambda: self._submit_prompt("빨간 큐브 앞으로 접근해"))
+        quick_grid.addWidget(btn_yolo_red, 2, 0)
+
+        btn_yolo_blue = QPushButton("🔵 파란 공 접근")
+        btn_yolo_blue.setStyleSheet("background-color: rgba(59, 130, 246, 0.20); border: 1px solid #3b82f6; color: #60a5fa; font-weight: bold; padding: 6px;")
+        btn_yolo_blue.clicked.connect(lambda: self._submit_prompt("파란 공 앞으로 가줘"))
+        quick_grid.addWidget(btn_yolo_blue, 2, 1)
+
+        btn_dock_marker = QPushButton("🎯 마커 도킹")
         btn_dock_marker.setStyleSheet("background-color: rgba(16, 185, 129, 0.20); border: 1px solid #10b981; color: #34d399; font-weight: bold; padding: 6px;")
         btn_dock_marker.clicked.connect(lambda: self._submit_prompt("마커 보고 도킹해"))
-        quick_grid.addWidget(btn_dock_marker, 2, 0, 1, 2)
+        quick_grid.addWidget(btn_dock_marker, 2, 2)
 
-        btn_dock_desk = QPushButton("🖥️ 책상(Desk) 이동")
-        btn_dock_desk.setStyleSheet("background-color: rgba(59, 130, 246, 0.15); border: 1px solid #3b82f6; color: #60a5fa; font-weight: bold; padding: 6px;")
-        btn_dock_desk.clicked.connect(lambda: self._submit_prompt("책상으로 이동해줘"))
-        quick_grid.addWidget(btn_dock_desk, 2, 2)
+        # 4열: 바닥 물체 수거 핸드셰이크 (로봇팔 수거 완료 / 건너뛰기)
+        btn_pick_resume = QPushButton("🦾 수거 완료 (주행 복귀)")
+        btn_pick_resume.setStyleSheet("background-color: rgba(168, 85, 247, 0.25); border: 1px solid #c084fc; color: #e9d5ff; font-weight: bold; padding: 6px;")
+        btn_pick_resume.setToolTip("로봇팔 수거 작업 완료 신호를 보내고 원래 자율주행 목적지로 주행을 복귀합니다.")
+        btn_pick_resume.clicked.connect(lambda: self.worker.send_direct_task({"action": "PICK_COMPLETED"}))
+        quick_grid.addWidget(btn_pick_resume, 3, 0, 1, 2)
 
-        btn_confirm_dock = QPushButton("🚀 당근점 이동 승인 (Proceed)")
-        btn_confirm_dock.setStyleSheet("background-color: rgba(16, 185, 129, 0.25); border: 2px solid #10b981; color: #34d399; font-weight: bold; padding: 7px; font-size: 12px;")
-        btn_confirm_dock.clicked.connect(self._handle_confirm_dock_click)
-        quick_grid.addWidget(btn_confirm_dock, 3, 0, 1, 3)
+        btn_pick_skip = QPushButton("⏭️ 건너뛰기")
+        btn_pick_skip.setStyleSheet("background-color: rgba(148, 163, 184, 0.20); border: 1px solid #64748b; color: #cbd5e1; font-weight: bold; padding: 6px;")
+        btn_pick_skip.setToolTip("물체 수거를 건너뛰고 원래 목적지로 계속 주행합니다.")
+        btn_pick_skip.clicked.connect(lambda: self.worker.send_direct_task({"action": "REJECT_PICK"}))
+        quick_grid.addWidget(btn_pick_skip, 3, 2)
 
         right_layout.addLayout(quick_grid)
 
-        splitter.addWidget(right_panel)
+        # Wrap right panel in a sleek scroll area so telemetry cards are NEVER crushed vertically
+        right_scroll = QScrollArea()
+        right_scroll.setWidget(right_panel)
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.NoFrame)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        right_scroll.setStyleSheet("""
+            QScrollArea {
+                background: transparent;
+                border: none;
+            }
+            QScrollBar:vertical {
+                background: #0b111e;
+                width: 6px;
+                border-radius: 3px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: #334155;
+                min-height: 25px;
+                border-radius: 3px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #00f0ff;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+        """)
+        splitter.addWidget(right_scroll)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         main_layout.addWidget(splitter)
@@ -988,27 +1364,36 @@ class QwenMissionControlGUI(QMainWindow):
 
     def _create_metric_card(self, label: str, default_val: str, color_hex: str) -> QFrame:
         card = QFrame()
+        card.setObjectName("metricCard")
+        card.setMinimumHeight(56)
+        card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         card.setStyleSheet("""
-            background-color: #0d1422;
-            border: 1px solid #1e293b;
-            border-radius: 6px;
-            padding: 5px;
+            QFrame#metricCard {
+                background-color: #0d1422;
+                border: 1px solid #1e293b;
+                border-radius: 6px;
+            }
         """)
         v = QVBoxLayout(card)
-        v.setContentsMargins(6, 4, 6, 4)
+        v.setContentsMargins(10, 6, 10, 6)
         v.setSpacing(2)
 
         lbl = QLabel(label)
-        lbl.setProperty("class", "metric-lbl")
+        lbl.setStyleSheet("border: none; background: transparent; color: #94a3b8; font-size: 11px; font-weight: 600; text-transform: uppercase;")
         v.addWidget(lbl)
 
         val = QLabel(default_val)
-        val.setProperty("class", "metric-val")
-        val.setStyleSheet(f"color: {color_hex}; font-size: 16px; font-weight: bold;")
+        val.setStyleSheet(f"border: none; background: transparent; color: {color_hex}; font-size: 18px; font-weight: bold; font-family: 'Ubuntu Mono', 'DejaVu Sans Mono', monospace;")
         card.value_lbl = val
+        card.default_color_hex = color_hex
         v.addWidget(val)
 
         return card
+
+    def _set_card_value(self, card: QFrame, text: str, color_hex: Optional[str] = None):
+        card.value_lbl.setText(text)
+        col = color_hex if color_hex else getattr(card, 'default_color_hex', '#38bdf8')
+        card.value_lbl.setStyleSheet(f"border: none; background: transparent; color: {col}; font-size: 18px; font-weight: bold; font-family: 'Ubuntu Mono', 'DejaVu Sans Mono', monospace;")
 
     # --------------------------------------------------------------------------
     # UI Event Handlers & Signal Slots
@@ -1160,6 +1545,9 @@ class QwenMissionControlGUI(QMainWindow):
         elif raw_status.startswith("SOURCE=DOCK,"):
             source = "DOCK"
             status_str = raw_status.replace("SOURCE=DOCK,", "")
+        elif raw_status.startswith("SOURCE=APPROACH,"):
+            source = "APPROACH"
+            status_str = raw_status.replace("SOURCE=APPROACH,", "")
 
         # 1. Alert / Info message handling
         if status_str.startswith("ALERT:") or "[주행 불가]" in status_str or "[도킹 불가]" in status_str or "[주행 실패]" in status_str:
@@ -1201,7 +1589,12 @@ class QwenMissionControlGUI(QMainWindow):
         state_val = status_str.split("STATE=")[1].split(",")[0].strip() if "STATE=" in status_str else ""
         substate_val = status_str.split("substate=")[1].split(",")[0].strip() if "substate=" in status_str else ""
 
-        # 2.5 Extract precision docking telemetry (ey, yaw_err, dist) from DOCK status
+        approach_active_states = (
+            "REQUEST_QWEN", "WAIT_QWEN", "ALIGN_CENTER",
+            "APPROACH_OBJECT", "FINAL_SETTLE", "APPROACHED"
+        )
+
+        # 2.5 Extract precision docking / floor approach telemetry (ey, yaw_err, dist)
         docking_active = (state_val in (
             "INIT", "CHECK_STAGING", "STAGING_SETTLE", "STAGING_AIM",
             "CARROT_ALIGN", "STANDOFF_SETTLE", "CRAWL_CONTACT",
@@ -1210,45 +1603,37 @@ class QwenMissionControlGUI(QMainWindow):
             "INIT", "CHECK_STAGING", "STAGING_SETTLE", "STAGING_AIM",
             "CARROT_ALIGN", "STANDOFF_SETTLE", "CRAWL_CONTACT",
             "BACKUP_STANDOFF", "BACKUP_RETRY", "SEARCH_MARKER", "DOCKED"
-        ))
+        )) or (source == "APPROACH" and state_val in approach_active_states)
 
-        if source == "DOCK" and docking_active:
+        if (source in ("DOCK", "APPROACH")) and docking_active:
             try:
                 if "ey=" in status_str:
                     ey_str = status_str.split("ey=")[1].split(",")[0].replace("cm", "").strip()
                     ey_cm = float(ey_str)
                     self.target_lateral_err_cm = ey_cm
-                    self.axis_card.value_lbl.setText(f"{ey_cm:+.1f} cm")
-                    if abs(ey_cm) <= 2.8:
-                        self.axis_card.value_lbl.setStyleSheet("color: #10b981; font-size: 18px; font-weight: bold;")
-                    else:
-                        self.axis_card.value_lbl.setStyleSheet("color: #f59e0b; font-size: 18px; font-weight: bold;")
+                    col = "#10b981" if abs(ey_cm) <= 2.8 else "#f59e0b"
+                    self._set_card_value(self.axis_card, f"{ey_cm:+.1f} cm", col)
 
                 if "yaw_err=" in status_str:
                     yaw_str = status_str.split("yaw_err=")[1].split(",")[0].replace("°", "").replace("deg", "").strip()
                     yaw_deg = float(yaw_str)
                     self.target_yaw_deg = yaw_deg
-                    self.yaw_card.value_lbl.setText(f"{yaw_deg:+.1f} °")
-                    if abs(yaw_deg) <= 3.5:
-                        self.yaw_card.value_lbl.setStyleSheet("color: #10b981; font-size: 18px; font-weight: bold;")
-                    else:
-                        self.yaw_card.value_lbl.setStyleSheet("color: #f59e0b; font-size: 18px; font-weight: bold;")
+                    col = "#10b981" if abs(yaw_deg) <= 3.5 else "#f59e0b"
+                    self._set_card_value(self.yaw_card, f"{yaw_deg:+.1f} °", col)
 
                 if "dist=" in status_str:
                     dist_str = status_str.split("dist=")[1].split(",")[0].replace("m", "").strip()
                     dist_m = float(dist_str)
                     self.target_dist = dist_m
-                    self.dist_card.value_lbl.setText(f"{dist_m:.2f} m")
+                    self._set_card_value(self.dist_card, f"{dist_m:.2f} m", "#38bdf8")
                 self.target_time = time.time()
             except Exception:
                 pass
         elif not docking_active and self.docking_fsm_state in ("IDLE", "NAV2_READY", "FAILSAFE"):
             # Standby mode during autonomous navigation
-            self.dist_card.value_lbl.setText("--- m")
-            self.yaw_card.value_lbl.setText("--- °")
-            self.axis_card.value_lbl.setText("--- cm")
-            self.yaw_card.value_lbl.setStyleSheet("color: #a78bfa; font-size: 18px; font-weight: bold;")
-            self.axis_card.value_lbl.setStyleSheet("color: #f59e0b; font-size: 18px; font-weight: bold;")
+            self._set_card_value(self.dist_card, "--- m", "#38bdf8")
+            self._set_card_value(self.yaw_card, "--- °", "#a78bfa")
+            self._set_card_value(self.axis_card, "--- cm", "#f59e0b")
             self.target_dist = None
             self.target_yaw_deg = None
             self.target_lateral_err_cm = None
@@ -1260,13 +1645,14 @@ class QwenMissionControlGUI(QMainWindow):
         docking_active_states = (
             "STAGE1_APPROACH", "STAGE1_VISUAL_SERVO", "STAGE2_STANDOFF_SETTLE", "STAGE3_BLIND_CRAWL", "BACKUP_RETRY",
             "STANDOFF_SETTLE", "STANDOFF_AIM_CARROT", "STANDOFF_DRIVE_CARROT", "STANDOFF_ALIGN_BOX", "STATION_VERIFY", "STATION_CRAWL",
-            "SEARCH_MARKER", "STAGING_SETTLE", "STAGING_AIM", "CARROT_ALIGN", "CRAWL_CONTACT", "BACKUP_STANDOFF"
+            "SEARCH_MARKER", "STAGING_SETTLE", "STAGING_AIM", "CARROT_ALIGN", "CRAWL_CONTACT", "BACKUP_STANDOFF",
+            "REQUEST_QWEN", "WAIT_QWEN", "APPROACH_OBJECT", "FINAL_SETTLE"
         )
-        task_active_states = ("NAVIGATING", "ACQUIRING", "ALIGNING", "APPROACHING", "DOCKING")
+        task_active_states = ("NAVIGATING", "ACQUIRING", "ALIGNING", "APPROACHING", "DOCKING", "AWAITING_PICK_CONFIRMATION", "WAITING_ARM_PICK")
 
         now = time.time()
 
-        if source == "DOCK":
+        if source in ("DOCK", "APPROACH"):
             self.docking_fsm_state = state_val
         elif source == "TASK":
             self.task_fsm_state = state_val
@@ -1324,8 +1710,17 @@ class QwenMissionControlGUI(QMainWindow):
             "STAGE3_BLIND_CRAWL": "DOCK: 3. 최종 크롤링",
             "BACKUP_RETRY": "DOCK: 후진 재진입(BACKUP)",
             "DOCKING": "DOCK: 정밀 도킹 진행중",
+            "REQUEST_QWEN": "APPROACH: Qwen2.5-VL 시각 질의 요청",
+            "WAIT_QWEN": "APPROACH: Qwen 시각 락온 대기",
+            "ALIGN_CENTER": "APPROACH: 로봇 정중앙 정렬",
+            "APPROACH_OBJECT": "APPROACH: 25cm 정밀 접근 주행",
+            "FINAL_SETTLE": "APPROACH: 25cm 정지/미세 보정",
+            "APPROACHING": "APPROACH: 바닥 물체 접근중",
+            "APPROACHED": "APPROACH: 물체 25cm 안착 완료",
+            "AWAITING_PICK_CONFIRMATION": "PICK: 🛑 물체 발견! 수거 승인 대기",
+            "WAITING_ARM_PICK": "PICK: 🤖 로봇팔 수거 대기중",
             "NAVIGATING": "NAV: 이동 주행중",
-            "SUCCESS": "SUCCESS (도킹 완료)" if is_docking_task else "SUCCESS (이동 완료)",
+            "SUCCESS": "SUCCESS (도킹/접근 완료)" if is_docking_task else "SUCCESS (이동 완료)",
             "ABORTED": "ABORTED (중단)"
         }
         display_text = label_map.get(effective_state, f"FSM: {effective_state}")
@@ -1333,10 +1728,18 @@ class QwenMissionControlGUI(QMainWindow):
 
         color_map = {
             "IDLE": ("#1e293b", "#94a3b8"),
+            "AWAITING_PICK_CONFIRMATION": ("rgba(245, 158, 11, 0.35)", "#fbbf24"),
+            "WAITING_ARM_PICK": ("rgba(168, 85, 247, 0.35)", "#c084fc"),
+            "APPROACHING": ("#1e3a8a", "#60a5fa"),
+            "APPROACHED": ("#065f46", "#34d399"),
+            "REQUEST_QWEN": ("rgba(234, 179, 8, 0.35)", "#facc15"),
+            "WAIT_QWEN": ("rgba(168, 85, 247, 0.35)", "#c084fc"),
+            "ALIGN_CENTER": ("rgba(2, 132, 199, 0.35)", "#38bdf8"),
+            "APPROACH_OBJECT": ("rgba(59, 130, 246, 0.35)", "#60a5fa"),
+            "FINAL_SETTLE": ("rgba(249, 115, 22, 0.35)", "#fb923c"),
             "NAVIGATING": ("rgba(2, 132, 199, 0.25)", "#38bdf8"),
             "ACQUIRING": ("rgba(234, 179, 8, 0.25)", "#facc15"),
             "ALIGNING": ("rgba(168, 85, 247, 0.25)", "#c084fc"),
-            "APPROACHING": ("rgba(59, 130, 246, 0.25)", "#60a5fa"),
             "DOCKING": ("rgba(236, 72, 153, 0.25)", "#f472b6"),
             "SEARCH_MARKER": ("rgba(234, 179, 8, 0.35)", "#facc15"),
             "STAGING_SETTLE": ("rgba(234, 179, 8, 0.35)", "#facc15"),
@@ -1450,29 +1853,27 @@ class QwenMissionControlGUI(QMainWindow):
             # Fallback update if status string hasn't updated yet
             if self.target_dist is None:
                 self.target_dist = x
-                self.dist_card.value_lbl.setText(f"{x:.2f} m")
+                self._set_card_value(self.dist_card, f"{x:.2f} m")
             if self.target_yaw_deg is None:
                 norm_yaw_deg = math.degrees(norm_yaw_rad)
                 self.target_yaw_deg = norm_yaw_deg
-                self.yaw_card.value_lbl.setText(f"{norm_yaw_deg:+.1f} °")
+                self._set_card_value(self.yaw_card, f"{norm_yaw_deg:+.1f} °")
             if self.target_lateral_err_cm is None:
                 lat_cm = y * 100.0
                 self.target_lateral_err_cm = lat_cm
-                self.axis_card.value_lbl.setText(f"{lat_cm:+.1f} cm")
+                self._set_card_value(self.axis_card, f"{lat_cm:+.1f} cm")
 
     def _update_bumper(self, engaged: bool):
         self.bumper_engaged = engaged
         if engaged:
-            self.bumper_card.value_lbl.setText("💥 CONTACT!")
-            self.bumper_card.value_lbl.setStyleSheet("color: #ef4444; font-size: 16px; font-weight: bold;")
+            self._set_card_value(self.bumper_card, "💥 CONTACT!", "#ef4444")
         else:
-            self.bumper_card.value_lbl.setText("SAFE")
-            self.bumper_card.value_lbl.setStyleSheet("color: #10b981; font-size: 16px; font-weight: bold;")
+            self._set_card_value(self.bumper_card, "SAFE", "#10b981")
 
     def _update_velocity(self, vx: float, wz: float):
         self.current_vx = vx
         self.current_wz = wz
-        self.vel_card.value_lbl.setText(f"{vx:+.2f} / {wz:+.2f}")
+        self._set_card_value(self.vel_card, f"{vx:+.2f} / {wz:+.2f}")
 
     def _update_battery(self, voltage: float, percentage: float, status_str: str):
         self.bat_voltage_lbl.setText(f"VOLTAGE: {voltage:.2f} V ({percentage:.0f}%)")
