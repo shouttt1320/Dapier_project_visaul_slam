@@ -1078,7 +1078,7 @@ class QwenMissionControlGUI(QMainWindow):
         btn_right15.clicked.connect(lambda: self._send_relative_nav(0.0, 0.0, -15.0))
         quick_grid.addWidget(btn_right15, 1, 2)
 
-        # 3열: 타겟 시각 접근 (빨간 큐브, 파란 공, 마커)
+        # 3열: 타겟 시각 접근 1행 (빨간 큐브, 파란 공, 마커)
         btn_yolo_red = QPushButton("🔴 빨간 큐브 접근")
         btn_yolo_red.setStyleSheet("background-color: rgba(239, 68, 68, 0.20); border: 1px solid #ef4444; color: #f87171; font-weight: bold; padding: 6px;")
         btn_yolo_red.clicked.connect(lambda: self._submit_prompt("빨간 큐브 앞으로 접근해"))
@@ -1094,18 +1094,29 @@ class QwenMissionControlGUI(QMainWindow):
         btn_dock_marker.clicked.connect(lambda: self._submit_prompt("마커 보고 도킹해"))
         quick_grid.addWidget(btn_dock_marker, 2, 2)
 
-        # 4열: 바닥 물체 수거 핸드셰이크 (로봇팔 수거 완료 / 건너뛰기)
+        # 4열: 타겟 시각 접근 2행 (검은 큐브, 검은 막대)
+        btn_yolo_black_cube = QPushButton("⬛ 검은 큐브 접근")
+        btn_yolo_black_cube.setStyleSheet("background-color: rgba(148, 163, 184, 0.20); border: 1px solid #94a3b8; color: #f1f5f9; font-weight: bold; padding: 6px;")
+        btn_yolo_black_cube.clicked.connect(lambda: self._submit_prompt("검은 큐브 앞으로 접근해"))
+        quick_grid.addWidget(btn_yolo_black_cube, 3, 0)
+
+        btn_yolo_black_rod = QPushButton("🥢 검은 막대 접근")
+        btn_yolo_black_rod.setStyleSheet("background-color: rgba(234, 179, 8, 0.20); border: 1px solid #eab308; color: #fde047; font-weight: bold; padding: 6px;")
+        btn_yolo_black_rod.clicked.connect(lambda: self._submit_prompt("검은 막대 앞으로 접근해"))
+        quick_grid.addWidget(btn_yolo_black_rod, 3, 1)
+
+        # 5열: 바닥 물체 수거 핸드셰이크 (로봇팔 수거 완료 / 건너뛰기)
         btn_pick_resume = QPushButton("🦾 수거 완료 (주행 복귀)")
         btn_pick_resume.setStyleSheet("background-color: rgba(168, 85, 247, 0.25); border: 1px solid #c084fc; color: #e9d5ff; font-weight: bold; padding: 6px;")
         btn_pick_resume.setToolTip("로봇팔 수거 작업 완료 신호를 보내고 원래 자율주행 목적지로 주행을 복귀합니다.")
         btn_pick_resume.clicked.connect(lambda: self.worker.send_direct_task({"action": "PICK_COMPLETED"}))
-        quick_grid.addWidget(btn_pick_resume, 3, 0, 1, 2)
+        quick_grid.addWidget(btn_pick_resume, 4, 0, 1, 2)
 
         btn_pick_skip = QPushButton("⏭️ 건너뛰기")
         btn_pick_skip.setStyleSheet("background-color: rgba(148, 163, 184, 0.20); border: 1px solid #64748b; color: #cbd5e1; font-weight: bold; padding: 6px;")
         btn_pick_skip.setToolTip("물체 수거를 건너뛰고 원래 목적지로 계속 주행합니다.")
         btn_pick_skip.clicked.connect(lambda: self.worker.send_direct_task({"action": "REJECT_PICK"}))
-        quick_grid.addWidget(btn_pick_skip, 3, 2)
+        quick_grid.addWidget(btn_pick_skip, 4, 2)
 
         right_layout.addLayout(quick_grid)
 

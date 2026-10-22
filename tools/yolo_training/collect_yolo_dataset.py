@@ -356,15 +356,7 @@ class DatasetCollectorNode(Node):
         up_h = int(H * SCALE)
         vis = cv2.resize(raw_bgr, (up_w, up_h), interpolation=cv2.INTER_LINEAR)
 
-        # 1. Distance Horizon Reference Lines (0.5m, 1.0m, 2.0m, 3.0m)
-        for dist_m, col in [(0.5, (0, 200, 255)), (1.0, (0, 255, 0)), (2.0, (255, 200, 0)), (3.0, (255, 100, 100))]:
-            v_line = int((self.cy + (self.fy * self.astra_z_base / dist_m)) * SCALE)
-            if 0 <= v_line < up_h:
-                cv2.line(vis, (0, v_line), (up_w, v_line), col, 1, cv2.LINE_AA)
-                cv2.putText(vis, f"~{dist_m:.1f}m Floor Guide", (10, v_line - 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.40, col, 1)
-
-        # 2. Top Banner
+        # 1. Top Banner
         overlay = vis.copy()
         cv2.rectangle(overlay, (0, 0), (up_w, 54), (20, 25, 35), -1)
         vis = cv2.addWeighted(overlay, 0.75, vis, 0.25, 0)

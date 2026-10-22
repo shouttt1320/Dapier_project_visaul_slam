@@ -421,12 +421,16 @@ class ObjectApproachingControllerNode(Node):
         t0 = time.time()
 
         # Decide whether to use Custom YOLO or YOLO-World
-        use_custom = False
+        # During IDLE (patrol/standby): use Custom YOLO to detect ANY trained floor object!
         target_norm = self.target_query.lower().strip().replace(" ", "_")
-        for cls_name in self.custom_classes:
-            if target_norm in cls_name.lower() or cls_name.lower() in target_norm:
-                use_custom = True
-                break
+        if self.state == "IDLE":
+            use_custom = (self.custom_model is not None)
+        else:
+            use_custom = False
+            for cls_name in self.custom_classes:
+                if target_norm in cls_name.lower() or cls_name.lower() in target_norm:
+                    use_custom = True
+                    break
 
         dets = []
         if use_custom and self.custom_model is not None:
@@ -463,13 +467,22 @@ class ObjectApproachingControllerNode(Node):
         if not dets:
             return None
 
-        # Filter for candidates strictly matching target
-        valid_target_names = {target_norm, self.target_query.lower()}
-        if self.target_query in self.target_profiles:
-            p_info = self.target_profiles[self.target_query]
-            valid_target_names.add(p_info.get("canonical_id", "").lower())
-            for al in p_info.get("aliases", []):
-                valid_target_names.add(al.lower())
+        # Filter candidates:
+        # During IDLE: ALL classes in custom_classes and target_profiles are valid candidates for patrol discovery!
+        if self.state == "IDLE":
+            valid_target_names = {c.lower() for c in self.custom_classes}
+            for t_k, p_info in self.target_profiles.items():
+                valid_target_names.add(t_k.lower())
+                valid_target_names.add(p_info.get("canonical_id", "").lower())
+                for al in p_info.get("aliases", []):
+                    valid_target_names.add(al.lower())
+        else:
+            valid_target_names = {target_norm, self.target_query.lower()}
+            if self.target_query in self.target_profiles:
+                p_info = self.target_profiles[self.target_query]
+                valid_target_names.add(p_info.get("canonical_id", "").lower())
+                for al in p_info.get("aliases", []):
+                    valid_target_names.add(al.lower())
 
         matched = []
         for d in dets:
@@ -889,22 +902,7 @@ class ObjectApproachingControllerNode(Node):
         vis = self.last_color_img.copy()
         H, W = vis.shape[:2]
 
-        # 1. Floor Reference Lines (with Pitch Compensation)
-        pitch_rad = math.radians(self.astra_pitch)
-        for dist_m, col in [(0.5, (0, 200, 255)), (1.0, (0, 255, 0)), (2.0, (255, 200, 0))]:
-            alpha = math.atan2(self.astra_z_base, dist_m)
-            beta = alpha - pitch_rad
-            v_line = int(self.cy + self.fy * math.tan(beta))
-            if 0 <= v_line < H:
-                cv2.line(vis, (0, v_line), (W, v_line), col, 1, cv2.LINE_AA)
-                cv2.putText(vis, f"{dist_m:.1f}m", (10, v_line - 3),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, col, 1)
-
-        # 2. Heading Axis
-        u_heading = int(self.cx + (self.fx * self.astra_y_base / 0.50))
-        cv2.line(vis, (u_heading, H), (int(self.cx), int(self.cy)), (255, 255, 0), 1)
-
-        # 3. Detection Bounding Box
+        # 1. Detection Bounding Box
         if detection is not None:
             x, y, bw, bh = detection["bbox"]
             cls_name = detection["cls_name"]
@@ -913,7 +911,14 @@ class ObjectApproachingControllerNode(Node):
             ey = detection["y_base"]
             mode_str = self.depth_source_mode
 
-            col = (0, 0, 255) if "red" in cls_name else (255, 120, 0)
+            if "red" in cls_name:
+                col = (0, 0, 255)       # Red
+            elif "blue" in cls_name:
+                col = (255, 120, 0)     # Blue / Cyan
+            elif "black" in cls_name or "rod" in cls_name:
+                col = (230, 230, 230)   # White / Silver
+            else:
+                col = (0, 255, 0)       # Green
             cv2.rectangle(vis, (x, y), (x + bw, y + bh), col, 2)
             cv2.circle(vis, (int(x + bw * 0.5), y + bh), 4, (0, 255, 255), -1)
 
@@ -927,16 +932,20 @@ class ObjectApproachingControllerNode(Node):
             cv2.putText(vis, f"BLIND-ZONE DEAD-RECKONING (Z={self.lens_distance:.2f}m)", (10, H - 12),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 220, 255), 1)
 
-        # 4. Top Telemetry Banner
+        # 2. Top Telemetry Banner (Clean 2-line layout without text collision)
         overlay = vis.copy()
-        cv2.rectangle(overlay, (0, 0), (W, 36), (15, 20, 30), -1)
+        cv2.rectangle(overlay, (0, 0), (W, 30), (15, 20, 30), -1)
         vis = cv2.addWeighted(overlay, 0.75, vis, 0.25, 0)
 
-        status_text = f"[{self.state}] Pitch:{self.astra_pitch:+.1f}° | Tgt:'{self.target_query}'"
-        cv2.putText(vis, status_text, (8, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 255), 1)
+        status_text = f"[{self.state}] Pitch:{self.astra_pitch:+.1f}deg"
+        cv2.putText(vis, status_text, (8, 13), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255), 1)
 
-        lat_text = f"{self.yolo_latency_ms:.1f}ms | {self.fps:.1f}FPS"
-        cv2.putText(vis, lat_text, (W - 100, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 0), 1)
+        fps_text = f"{self.fps:.1f}FPS"
+        cv2.putText(vis, fps_text, (W - 65, 13), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
+
+        if self.target_query:
+            tgt_text = f"Tgt: '{self.target_query}'"
+            cv2.putText(vis, tgt_text, (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (200, 230, 255), 1)
 
         # Compress & Publish
         success, enc = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 60])
