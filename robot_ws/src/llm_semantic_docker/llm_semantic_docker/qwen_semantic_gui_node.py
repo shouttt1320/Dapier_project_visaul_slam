@@ -28,7 +28,8 @@ import cv2
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit, QFrame, QGridLayout,
-    QSizePolicy, QSplitter, QProgressBar, QScrollArea, QComboBox, QDialog
+    QSizePolicy, QSplitter, QProgressBar, QScrollArea, QComboBox, QDialog,
+    QListWidget, QListWidgetItem
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
 from PyQt5.QtGui import QImage, QPixmap, QFont, QColor, QPalette, QIcon
@@ -190,6 +191,7 @@ class RosWorkerThread(QThread):
     topic_health_signal = pyqtSignal(dict)  # topic stats
     connectivity_signal = pyqtSignal(dict)  # network & AI backend status
     user_prompt_signal = pyqtSignal(str)   # Modal confirmation prompt for floor object pick
+    queue_status_signal = pyqtSignal(dict)  # Real-time task queue status & pipeline items
 
     def __init__(self, node: Node):
         super().__init__()
@@ -241,6 +243,7 @@ class RosWorkerThread(QThread):
 
         # 2. System Status Subscriptions
         self.node.create_subscription(String, '/task/status', self._task_status_cb, 10)
+        self.node.create_subscription(String, '/task/queue_status', self._queue_status_cb, 10)
         self.node.create_subscription(String, '/task/user_prompt', self._user_prompt_cb, 10)
         self.node.create_subscription(String, '/docking/status', self._docking_status_cb, 10)
         self.node.create_subscription(String, '/object_approach/status', self._obj_approach_status_cb, 10)
@@ -271,6 +274,8 @@ class RosWorkerThread(QThread):
         self.confirm_dock_pub = self.node.create_publisher(String, '/docking/confirm_cmd', 10)
         self.dock_confirm_cli = self.node.create_client(Trigger, '/docking/confirm')
         self.dock_abort_cli = self.node.create_client(Trigger, '/docking/abort')
+        self.clear_queue_cli = self.node.create_client(Trigger, '/task/clear_pending_queue')
+        self.cancel_all_cli = self.node.create_client(Trigger, '/task/cancel_all_and_stop')
         
         # Hard Brake Zero-Velocity Publishers
         self.cmd_vel_stamped_pub = self.node.create_publisher(TwistStamped, '/cmd_vel', 10)
@@ -323,6 +328,13 @@ class RosWorkerThread(QThread):
     def _task_status_cb(self, msg: String):
         self._mark_topic("TaskStatus")
         self.fsm_status_signal.emit(f"SOURCE=TASK,{msg.data}")
+
+    def _queue_status_cb(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+            self.queue_status_signal.emit(data)
+        except Exception:
+            pass
 
     def _user_prompt_cb(self, msg: String):
         self.user_prompt_signal.emit(msg.data)
@@ -530,6 +542,21 @@ class RosWorkerThread(QThread):
             self.cmd_vel_nav_pub.publish(zero_twist)
             self.cmd_vel_stamped_pub.publish(zero_stamped)
 
+    def send_clear_pending_queue(self):
+        """Invoke /task/clear_pending_queue service to flush pending sequence items."""
+        if self.clear_queue_cli.service_is_ready():
+            self.clear_queue_cli.call_async(Trigger.Request())
+        else:
+            self.node.get_logger().warn("[GUI] Clear pending queue service not ready")
+
+    def send_cancel_all_and_stop(self):
+        """Invoke /task/cancel_all_and_stop service to immediately halt robot and clear entire queue."""
+        if self.cancel_all_cli.service_is_ready():
+            self.cancel_all_cli.call_async(Trigger.Request())
+        else:
+            # Fallback to direct emergency stop if service not ready
+            self.send_emergency_stop()
+
     def _network_check_worker(self):
         """Asynchronously monitor robot ping and Ollama status without blocking ROS spin."""
         while self._running:
@@ -616,6 +643,7 @@ class QwenMissionControlGUI(QMainWindow):
         self.worker.topic_health_signal.connect(self._update_topic_health)
         self.worker.connectivity_signal.connect(self._update_connectivity)
         self.worker.user_prompt_signal.connect(self._on_user_prompt_received)
+        self.worker.queue_status_signal.connect(self._update_queue_status)
 
         self.worker.start()
 
@@ -986,6 +1014,121 @@ class QwenMissionControlGUI(QMainWindow):
         self.dialog_box.setMaximumHeight(100)
         self.dialog_box.append("🤖 [Qwen2.5 Agent Ready] Qwen2.5 (3B) LLM + Real-time YOLO 3D active.")
         right_layout.addWidget(self.dialog_box)
+
+        # 2.2.1 Task Sequence Queue Visualizer (대기열 실시간 검사기)
+        queue_box_title = QLabel("📋 TASK SEQUENCE QUEUE (작업 대기열)")
+        queue_box_title.setProperty("class", "title")
+        right_layout.addWidget(queue_box_title)
+
+        queue_box = QFrame()
+        queue_box.setStyleSheet("background-color: #131d2e; border: 1px solid #1e293b; border-radius: 8px; padding: 6px;")
+        queue_layout = QVBoxLayout(queue_box)
+        queue_layout.setContentsMargins(6, 6, 6, 6)
+        queue_layout.setSpacing(4)
+
+        # Header row: Status label + completed count
+        queue_hdr_row = QHBoxLayout()
+        self.queue_status_lbl = QLabel("대기열: 유휴 (비어있음)")
+        self.queue_status_lbl.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: bold;")
+        queue_hdr_row.addWidget(self.queue_status_lbl, 1)
+
+        self.queue_count_lbl = QLabel("0 / 0 완료")
+        self.queue_count_lbl.setStyleSheet("color: #38bdf8; font-size: 11px; font-weight: bold; font-family: monospace;")
+        queue_hdr_row.addWidget(self.queue_count_lbl)
+        queue_layout.addLayout(queue_hdr_row)
+
+        # Progress bar
+        self.queue_progress_bar = QProgressBar()
+        self.queue_progress_bar.setRange(0, 100)
+        self.queue_progress_bar.setValue(0)
+        self.queue_progress_bar.setTextVisible(True)
+        self.queue_progress_bar.setFixedHeight(14)
+        self.queue_progress_bar.setStyleSheet("""
+            QProgressBar {
+                background-color: #0f172a;
+                border: 1px solid #334155;
+                border-radius: 4px;
+                text-align: center;
+                color: #e2e8f0;
+                font-size: 10px;
+                font-weight: bold;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0284c7, stop:1 #38bdf8);
+                border-radius: 3px;
+            }
+        """)
+        queue_layout.addWidget(self.queue_progress_bar)
+
+        # Current running task card
+        self.queue_current_task_lbl = QLabel("▶ 실행 중: 없음")
+        self.queue_current_task_lbl.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: bold; background: rgba(148, 163, 184, 0.05); border: 1px solid #334155; border-radius: 4px; padding: 3px 6px;")
+        queue_layout.addWidget(self.queue_current_task_lbl)
+
+        # Pending items list
+        self.queue_list_widget = QListWidget()
+        self.queue_list_widget.setFixedHeight(65)
+        self.queue_list_widget.setStyleSheet("""
+            QListWidget {
+                background-color: #0f172a;
+                border: 1px solid #1e293b;
+                border-radius: 4px;
+                color: #cbd5e1;
+                font-size: 10px;
+                font-family: monospace;
+                padding: 2px;
+            }
+            QListWidget::item {
+                padding: 2px 4px;
+                border-bottom: 1px solid #1e293b;
+            }
+        """)
+        queue_layout.addWidget(self.queue_list_widget)
+
+        # Buttons row: Clear Pending / Cancel All
+        queue_btn_row = QHBoxLayout()
+        queue_btn_row.setSpacing(6)
+
+        btn_clear_queue = QPushButton("대기열 비우기")
+        btn_clear_queue.setToolTip("현재 실행 중인 작업은 유지하고 대기 중인 후속 작업들만 취소합니다.")
+        btn_clear_queue.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(245, 158, 11, 0.2);
+                border: 1px solid #f59e0b;
+                color: #fbbf24;
+                font-weight: bold;
+                font-size: 11px;
+                padding: 4px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: rgba(245, 158, 11, 0.4);
+            }
+        """)
+        btn_clear_queue.clicked.connect(self.worker.send_clear_pending_queue)
+        queue_btn_row.addWidget(btn_clear_queue)
+
+        btn_cancel_all = QPushButton("전체 취소 & 정지")
+        btn_cancel_all.setToolTip("현재 실행 중인 작업을 즉각 하드 정지하고 전체 대기열을 폐기합니다.")
+        btn_cancel_all.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(239, 68, 68, 0.25);
+                border: 1px solid #ef4444;
+                color: #f87171;
+                font-weight: bold;
+                font-size: 11px;
+                padding: 4px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: rgba(239, 68, 68, 0.45);
+            }
+        """)
+        btn_cancel_all.clicked.connect(self.worker.send_cancel_all_and_stop)
+        queue_btn_row.addWidget(btn_cancel_all)
+
+        queue_layout.addLayout(queue_btn_row)
+        right_layout.addWidget(queue_box)
 
         # 2.3 Registered Gizmo Stations & Semantic Waypoints
         gizmo_panel_title = QLabel("📍 GIZMO & REGISTERED WAYPOINTS")
@@ -1965,6 +2108,102 @@ class QwenMissionControlGUI(QMainWindow):
             self.vlm_status_lbl.setText("OLLAMA VLM: OFFLINE (PORT 11434)")
             self.hdr_ollama_badge.setText("🧠 VLM: OFFLINE")
             self.hdr_ollama_badge.setStyleSheet("font-size: 11px; font-weight: bold; color: #ef4444; background: #0c121e; border: 1px solid #ef4444; border-radius: 4px; padding: 4px 8px;")
+
+    def _update_queue_status(self, data: dict):
+        """Update Queue Inspector HUD with atomic sequence progress and pending tasks."""
+        try:
+            state = data.get("state") or data.get("fsm_state", "IDLE")
+            total = int(data.get("total_tasks", 0))
+            completed = int(data.get("completed_tasks", 0))
+            items = data.get("items", [])
+
+            # Extract active running task description
+            current_task = data.get("current_task")
+            if not current_task or current_task == "없음":
+                for item in items:
+                    if item.get("status") == "RUNNING":
+                        current_task = item.get("desc") or item.get("action")
+                        break
+            if not current_task:
+                current_task = "없음"
+
+            # Extract pending tasks list
+            pending_tasks = data.get("pending_tasks", [])
+            if not pending_tasks and items:
+                pending_tasks = [
+                    item.get("desc") or item.get("action")
+                    for item in items
+                    if item.get("status") == "PENDING"
+                ]
+
+            self.queue_count_lbl.setText(f"{completed} / {total} 완료")
+
+            if total > 0:
+                pct = int((completed / total) * 100)
+                self.queue_progress_bar.setValue(pct)
+            else:
+                self.queue_progress_bar.setValue(0)
+
+            if state in ("RUNNING", "NAVIGATING", "ACQUIRING", "ALIGNING", "APPROACHING", "DOCKING", "VERIFYING"):
+                self.queue_status_lbl.setText("시퀀스 실행 중")
+                self.queue_status_lbl.setStyleSheet("color: #38bdf8; font-size: 11px; font-weight: bold;")
+                self.queue_current_task_lbl.setText(f"▶ 실행 중: {current_task}")
+                self.queue_current_task_lbl.setStyleSheet("color: #facc15; font-size: 11px; font-weight: bold; background: rgba(250, 204, 21, 0.1); border: 1px solid #eab308; border-radius: 4px; padding: 3px 6px;")
+            elif state in ("INTERRUPTED_BY_PICK", "WAITING_ARM_PICK"):
+                self.queue_status_lbl.setText("⏸️ 물체 수거로 일시 정지")
+                self.queue_status_lbl.setStyleSheet("color: #c084fc; font-size: 11px; font-weight: bold;")
+                self.queue_current_task_lbl.setText(f"⏸️ [수거 대기 중] 원래 작업: {current_task}")
+                self.queue_current_task_lbl.setStyleSheet("color: #e9d5ff; font-size: 11px; font-weight: bold; background: rgba(168, 85, 247, 0.15); border: 1px solid #c084fc; border-radius: 4px; padding: 3px 6px;")
+            elif state == "SUCCESS":
+                self.queue_status_lbl.setText("시퀀스 완료")
+                self.queue_status_lbl.setStyleSheet("color: #4ade80; font-size: 11px; font-weight: bold;")
+                self.queue_current_task_lbl.setText("✓ 모든 시퀀스 작업 완료됨")
+                self.queue_current_task_lbl.setStyleSheet("color: #4ade80; font-size: 11px; font-weight: bold; background: rgba(74, 222, 128, 0.1); border: 1px solid #4ade80; border-radius: 4px; padding: 3px 6px;")
+            elif state in ("FAILED", "ABORTED"):
+                self.queue_status_lbl.setText("시퀀스 실패 (정지)")
+                self.queue_status_lbl.setStyleSheet("color: #f87171; font-size: 11px; font-weight: bold;")
+                self.queue_current_task_lbl.setText(f"❌ 실패 중단: {current_task}")
+                self.queue_current_task_lbl.setStyleSheet("color: #f87171; font-size: 11px; font-weight: bold; background: rgba(239, 68, 68, 0.1); border: 1px solid #ef4444; border-radius: 4px; padding: 3px 6px;")
+            else:
+                self.queue_status_lbl.setText("대기열: 유휴 (비어있음)")
+                self.queue_status_lbl.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: bold;")
+                self.queue_current_task_lbl.setText("▶ 실행 중: 없음")
+                self.queue_current_task_lbl.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: bold; background: rgba(148, 163, 184, 0.05); border: 1px solid #334155; border-radius: 4px; padding: 3px 6px;")
+
+            self.queue_list_widget.clear()
+            # 1. 완료된 작업 안내 (존재할 경우)
+            if completed > 0:
+                comp_item = QListWidgetItem(f"✓ 이전 작업 {completed}개 완료됨")
+                comp_item.setForeground(QColor("#4ade80"))
+                self.queue_list_widget.addItem(comp_item)
+
+            # 2. 현재 실행 중인 작업 표시
+            has_active = (current_task != "없음" and state in (
+                "RUNNING", "NAVIGATING", "ACQUIRING", "ALIGNING", "APPROACHING", "DOCKING", "VERIFYING", "INTERRUPTED_BY_PICK", "WAITING_ARM_PICK"
+            ))
+            if has_active:
+                step_num = completed + 1
+                total_str = f"/{total}" if total > 0 else ""
+                run_item = QListWidgetItem(f"▶ [{step_num}{total_str}] {current_task}  (실행 중)")
+                run_item.setForeground(QColor("#facc15"))
+                self.queue_list_widget.addItem(run_item)
+
+            # 3. 대기열에 쌓인 작업 표시
+            for idx, ptask in enumerate(pending_tasks):
+                step_num = completed + (2 if has_active else 1) + idx
+                total_str = f"/{total}" if total > 0 else ""
+                wait_item = QListWidgetItem(f"⏳ [{step_num}{total_str}] {ptask}  (대기)")
+                wait_item.setForeground(QColor("#94a3b8"))
+                self.queue_list_widget.addItem(wait_item)
+
+            # 4. 아무 작업도 없는 경우 안내
+            if not has_active and not pending_tasks and completed == 0:
+                idle_item = QListWidgetItem("(대기 중인 작업 없음)")
+                idle_item.setForeground(QColor("#64748b"))
+                self.queue_list_widget.addItem(idle_item)
+
+        except Exception as e:
+            print(f"[GUI] Error updating queue status: {e}")
 
     def closeEvent(self, event):
         self.worker.stop()

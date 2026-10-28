@@ -16,6 +16,8 @@
 import os
 import math
 import yaml
+import copy
+import time
 from enum import Enum
 from typing import Optional, Dict, Any, List, Union
 from pydantic import BaseModel, Field, ValidationError, model_validator
@@ -81,6 +83,15 @@ class RobotIntent(BaseModel):
     navigation: Optional[Dict[str, Any]] = None
     docking: Optional[Dict[str, Any]] = None
     rationale: Optional[str] = None
+
+
+class TaskSequenceSpec(BaseModel):
+    is_sequence: bool = True
+    sequence_id: Optional[str] = None
+    title: Optional[str] = "연속 복합 명령"
+    mode: Optional[str] = "PREEMPT_AND_REPLACE"
+    failure_policy: Optional[str] = "STOP_ON_FAILURE"
+    tasks: List[Dict[str, Any]]
 
 
 class ValidationResult:
@@ -376,7 +387,19 @@ class CommandValidator:
         return None
 
     def validate(self, raw_data: Any) -> ValidationResult:
-        """Pydantic 스키마 검증 및 Semantic DB 대조, 동적 좌표 생성"""
+        """Pydantic 스키마 검증 및 Semantic DB 대조, 동적 좌표 생성 (단일 및 시퀀스 작업 지원)"""
+        # 0. 시퀀스 데이터 감지 시 validate_sequence로 자동 위임
+        if isinstance(raw_data, dict) and "tasks" in raw_data and isinstance(raw_data["tasks"], list):
+            return self.validate_sequence(raw_data)
+        elif isinstance(raw_data, str) and '"tasks"' in raw_data:
+            try:
+                import json
+                p = json.loads(raw_data)
+                if isinstance(p, dict) and "tasks" in p:
+                    return self.validate_sequence(p)
+            except Exception:
+                pass
+
         # 1. Pydantic 스키마 유효성 검사
         try:
             if isinstance(raw_data, str):
@@ -628,3 +651,76 @@ class CommandValidator:
             )
 
         return ValidationResult(False, error_code="UNSUPPORTED_ACTION", error_msg=f"지원하지 않는 Action: {action}")
+
+    def validate_sequence(self, raw_sequence: Dict[str, Any]) -> ValidationResult:
+        """
+        Validates a multi-step task sequence using the All-or-Nothing principle.
+        If even one sub-task is invalid, the entire sequence is rejected.
+        """
+        try:
+            seq_spec = TaskSequenceSpec(**raw_sequence)
+        except ValidationError as e:
+            return ValidationResult(
+                is_valid=False,
+                action="SEQUENCE",
+                error_code="SCHEMA_ERROR",
+                error_msg=f"시퀀스 스키마 검증 실패: {e.errors()}"
+            )
+
+        tasks = seq_spec.tasks
+        if not tasks:
+            return ValidationResult(
+                is_valid=False,
+                action="SEQUENCE",
+                error_code="EMPTY_SEQUENCE",
+                error_msg="시퀀스 내에 수행할 작업(tasks)이 비어 있습니다."
+            )
+
+        seq_id = seq_spec.sequence_id or f"seq_{int(time.time()*1000)%1000000}"
+        title = seq_spec.title or f"연속 복합 명령 ({len(tasks)}개)"
+        mode = seq_spec.mode or "PREEMPT_AND_REPLACE"
+        failure_policy = seq_spec.failure_policy or "STOP_ON_FAILURE"
+
+        resolved_tasks = []
+        cumulative_rel_dist = 0.0
+
+        for i, sub_raw in enumerate(tasks):
+            sub_res = self.validate(sub_raw)
+            if not sub_res.is_valid:
+                return ValidationResult(
+                    is_valid=False,
+                    action="SEQUENCE",
+                    error_code="SUBTASK_INVALID",
+                    error_msg=f"시퀀스 {i+1}번째 작업 검증 실패: [{sub_res.error_code}] {sub_res.error_msg}"
+                )
+
+            task_dict = copy.deepcopy(sub_res.resolved_task)
+            task_dict["task_id"] = sub_raw.get("task_id", f"{seq_id}_step_{i+1}")
+
+            # Cumulative relative distance check for indoor safety (Max 5.0m limit)
+            if task_dict.get("action") == "NAVIGATE_RELATIVE":
+                rx = abs(float(task_dict.get("relative_x", 0.0)))
+                ry = abs(float(task_dict.get("relative_y", 0.0)))
+                cumulative_rel_dist += math.hypot(rx, ry)
+                if cumulative_rel_dist > 5.0:
+                    return ValidationResult(
+                        is_valid=False,
+                        action="SEQUENCE",
+                        error_code="EXCEEDED_SAFETY_LIMIT",
+                        error_msg=f"시퀀스 내 상대 이동 누적 거리({cumulative_rel_dist:.2f}m)가 실내 안전 한계(5.0m)를 초과했습니다."
+                    )
+
+            resolved_tasks.append(task_dict)
+
+        return ValidationResult(
+            is_valid=True,
+            action="SEQUENCE",
+            resolved_task={
+                "is_sequence": True,
+                "sequence_id": seq_id,
+                "title": title,
+                "mode": mode,
+                "failure_policy": failure_policy,
+                "tasks": resolved_tasks
+            }
+        )

@@ -279,5 +279,5 @@ python3 tools/yolo_training/test_floor_object_detector.py
 
 * 📚 [YOLO 데이터셋 수집, 라벨링, 파인튜닝 가이드](file:///home/jjj/Documents/Dapier/Project/docs/yolo_training_pipeline_guide.md)
 * 📚 [바닥 타겟 물체 정밀 접근 시스템 기술 사양서](file:///home/jjj/Documents/Dapier/Project/docs/floor_object_approach_system.md)
-* 📚 [정밀 도킹 알고리즘 및 PND 제어 수학적 명세서](file:///home/jjj/Documents/Dapier/Project/docking_algorithm_guide.md)
-* 📚 [RGB-D 3D Visual SLAM 파이프라인 가이드](file:///home/jjj/Documents/Dapier/Project/visual_slam_guide.md)
+* 📚 [정밀 도킹 알고리즘 및 PND 제어 수학적 명세서](file:///home/jjj/Documents/Dapier/Project/docs/docking_algorithm_guide.md)
+* 📚 [RGB-D 3D Visual SLAM 파이프라인 가이드](file:///home/jjj/Documents/Dapier/Project/docs/visual_slam_guide.md)

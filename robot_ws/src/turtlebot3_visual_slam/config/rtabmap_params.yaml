@@ -49,6 +49,6 @@
     Grid/RangeMax: "2.5"           # Max sensor range for mapping (matches Astra S 2.5m)
     Grid/RayTracing: "true"        # Clear free space along optical rays
     Grid/CellSize: "0.05"          # 5cm grid resolution (matches standard Nav2)
-    Grid/MaxObstacleHeight: "1.2"  # Max height for obstacles
+    Grid/MaxObstacleHeight: "0.65"  # Max height for obstacles
     Grid/MinGroundHeight: "0.05"   # Filter floor plane noise
     Grid/MaxGroundHeight: "0.15"

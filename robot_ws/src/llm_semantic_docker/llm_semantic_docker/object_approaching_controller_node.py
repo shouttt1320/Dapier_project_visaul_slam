@@ -73,8 +73,8 @@ class ObjectApproachingControllerNode(Node):
         self.declare_parameter('astra_z_base', 0.147)         # 14.7cm lens height from floor
         self.declare_parameter('astra_pitch', 0.0)
 
-        self.declare_parameter('max_linear_speed', 0.075)
-        self.declare_parameter('crawl_linear_speed', 0.035)
+        self.declare_parameter('max_linear_speed', 0.16)
+        self.declare_parameter('crawl_linear_speed', 0.040)
         self.declare_parameter('max_angular_speed', 0.22)
         self.declare_parameter('approach_timeout_sec', 90.0)
 
@@ -675,8 +675,8 @@ class ObjectApproachingControllerNode(Node):
             pose_msg.pose.position.z = 0.0
             self.target_pose_pub.publish(pose_msg)
 
-            # Check for patrol detection interrupt event (Valid range: 0.45m ~ 2.20m, conf >= 0.65)
-            if self.lens_distance is not None and 0.45 <= self.lens_distance <= 2.20 and self.detected_conf >= 0.65:
+            # Check for patrol detection interrupt event (Valid range: 0.45m ~ 1.20m, conf >= 0.65)
+            if self.lens_distance is not None and 0.45 <= self.lens_distance <= 1.20 and self.detected_conf >= 0.65:
                 self._consecutive_detect_count += 1
                 if self._consecutive_detect_count >= 3 and (now_sec - self._last_event_pub_time) > 2.5:
                     self._last_event_pub_time = now_sec
@@ -819,10 +819,10 @@ class ObjectApproachingControllerNode(Node):
                 v_target = self.crawl_linear_speed
                 w_target = np.clip(0.60 * yaw_corr, -0.08, 0.08)  # Minimal yaw perturbations
             elif dist_err > 0.55:
-                v_target = np.clip(0.40 * dist_err, self.crawl_linear_speed, self.max_linear_speed)
+                v_target = np.clip(0.50 * dist_err, self.crawl_linear_speed, self.max_linear_speed)
                 w_target = np.clip(1.15 * yaw_corr, -0.18, 0.18)
             else:
-                v_target = np.clip(0.28 * dist_err, self.crawl_linear_speed, self.max_linear_speed * 0.70)
+                v_target = np.clip(0.32 * dist_err, self.crawl_linear_speed, self.max_linear_speed * 0.70)
                 w_target = np.clip(1.15 * yaw_corr, -0.18, 0.18)
 
             twist.linear.x = float(v_target)

@@ -119,18 +119,18 @@ class PrecisionDockingControllerNode(Node):
         self.astra_pitch = float(self.get_parameter('astra_pitch').value)
 
         # ----------------------------------------------------------------------
-        # Camera Intrinsics
+        # Camera Intrinsics (Calibrated for Astra S 320x240)
         # ----------------------------------------------------------------------
+        self.fx = 285.17
+        self.fy = 285.17
+        self.cx = 159.5
+        self.cy = 119.5
         self.camera_matrix = np.array([
-            [500.0, 0.0, 320.0],
-            [0.0, 500.0, 240.0],
+            [self.fx, 0.0, self.cx],
+            [0.0, self.fy, self.cy],
             [0.0, 0.0, 1.0]
         ], dtype=np.float64)
         self.dist_coeffs = np.zeros((5, 1), dtype=np.float64)
-        self.fx = 500.0
-        self.fy = 500.0
-        self.cx = 320.0
-        self.cy = 240.0
         self.camera_info_received = False
 
         # OpenCV ArUco Setup

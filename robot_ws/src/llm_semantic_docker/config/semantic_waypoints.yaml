@@ -1,9 +1,22 @@
 waypoints:
   wp1:
     description: Taught waypoint wp1 via RViz Gizmo
-    x: -0.0712
-    y: 1.2588
-    z: -0.0317
-    yaw_deg: 100.69
+    x: -0.3859
+    y: 1.8601
+    z: 0.0864
+    yaw_deg: -88.26
     aliases:
     - wp1
+    - waypoint1
+    - 웨이포인트1
+  wp2:
+    description: Taught waypoint wp2 via RViz Gizmo
+    x: 0.0718
+    y: 0.2953
+    z: 0.0864
+    yaw_deg: 0.87
+    aliases:
+    - wp2
+    - waypoint2
+    - 웨이포인트2
+

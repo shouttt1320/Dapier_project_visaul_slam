@@ -105,6 +105,7 @@ class LLMAgentNode(Node):
 
         # Publishers
         self.task_cmd_pub = self.create_publisher(String, '/task/command', 10)
+        self.task_seq_pub = self.create_publisher(String, '/task/command_sequence', 10)
         self.task_status_pub = self.create_publisher(String, '/task/status', 10)
         self.stop_pub = self.create_publisher(Bool, '/safety/software_stop', 10)
         self.target_bbox_pub = self.create_publisher(String, '/qwen/target_bbox', 10)
@@ -228,8 +229,137 @@ class LLMAgentNode(Node):
         except Exception as e:
             return False, f"마커 검출 중 오류: {e}", None
 
+    def _quick_parse_single_clause(self, clause: str) -> Optional[Dict[str, Any]]:
+        """Parses a single atomic clause into an Action dictionary."""
+        cl = clause.strip().lower()
+        if not cl:
+            return None
+
+        # 1. Rotation (angle check)
+        m_angle = re.search(r'(?<![a-zA-Z0-9_가-힣])([+-]?\d+(?:\.\d+)?)\s*(도|deg|°)?', cl)
+        is_left = any(w in cl for w in ["좌회전", "왼쪽", "좌", "반시계", "ccw"])
+        is_right = any(w in cl for w in ["우회전", "오른쪽", "우", "시계", "cw"])
+        is_rot = any(w in cl for w in ["회전", "돌아", "틀어", "turn", "rotate"])
+
+        if (is_left or is_right or is_rot) and m_angle:
+            try:
+                deg = float(m_angle.group(1))
+                if is_right:
+                    deg = -abs(deg)
+                else:
+                    deg = abs(deg)
+                return {
+                    "action": "NAVIGATE",
+                    "target": {
+                        "mode": "RELATIVE",
+                        "relative_x": 0.0,
+                        "relative_y": 0.0,
+                        "relative_yaw": deg
+                    }
+                }
+            except Exception:
+                pass
+
+        # 2. Docking (if docking keyword or station key present)
+        if "도킹" in cl or "dock" in cl:
+            st_key = self.validator.resolve_station_key(cl)
+            target_st = st_key or "marker"
+            return {
+                "action": "DOCK",
+                "target": {
+                    "target_structure": target_st,
+                    "docking_face": "front",
+                    "direct_visual": (target_st == "marker")
+                }
+            }
+
+        # 3. Waypoint & Station Standoff Navigation (Checked before generic distance numbers)
+        wp_key = self.validator.resolve_waypoint_key(cl)
+        if wp_key:
+            return {
+                "action": "NAVIGATE",
+                "target": {
+                    "mode": "WAYPOINT",
+                    "semantic_name": wp_key
+                }
+            }
+
+        st_key = self.validator.resolve_station_key(cl)
+        if st_key:
+            # If explicit dock keyword absent, navigate to the station's standoff waypoint
+            return {
+                "action": "NAVIGATE",
+                "target": {
+                    "mode": "WAYPOINT",
+                    "semantic_name": st_key
+                }
+            }
+
+        # 4. Linear displacement (Distance check with word boundary protection)
+        m_dist = re.search(r'(?<![a-zA-Z0-9_가-힣])([+-]?\d+(?:\.\d+)?)\s*(cm|m|미터|센티|센치)?', cl)
+        is_fwd = any(w in cl for w in ["앞으로", "전진", "앞", "직진", "가줘", "가", "이동"])
+        is_bwd = any(w in cl for w in ["뒤로", "후진", "뒤"])
+
+        if (is_fwd or is_bwd) and m_dist:
+            try:
+                val = float(m_dist.group(1))
+                unit = m_dist.group(2) or "m"
+                if unit in ("cm", "센티", "센치"):
+                    dist_m = val / 100.0
+                else:
+                    dist_m = val
+                if is_bwd:
+                    dist_m = -abs(dist_m)
+                else:
+                    dist_m = abs(dist_m)
+                return {
+                    "action": "NAVIGATE",
+                    "target": {
+                        "mode": "RELATIVE",
+                        "relative_x": dist_m,
+                        "relative_y": 0.0,
+                        "relative_yaw": 0.0
+                    }
+                }
+            except Exception:
+                pass
+
+        return None
+
+    def _quick_parse_sequence(self, user_text: str) -> Optional[Dict[str, Any]]:
+        """Splits compound natural language instructions into a sequence of atomic actions (0ms)."""
+        delimiters = r'하고나서|하고|해서|가서|한\s*뒤에?|한\s*후에?|이동\s*후에?|(?<=\s)후(?!진|방|면)(?:에)?(?:\s+|$)|한\s*다음에?|그\s*다음에?|갔다가|그리고|,\s*|\.\s*'
+        clauses = [c.strip() for c in re.split(delimiters, user_text) if c.strip()]
+        if len(clauses) < 2:
+            return None
+
+        tasks = []
+        for c in clauses:
+            sub_task = self._quick_parse_single_clause(c)
+            if sub_task is None:
+                return None
+            tasks.append(sub_task)
+
+        if len(tasks) >= 2:
+            seq_id = f"seq_{int(time.time()*1000)%1000000}"
+            return {
+                "is_sequence": True,
+                "sequence_id": seq_id,
+                "title": user_text,
+                "mode": "PREEMPT_AND_REPLACE",
+                "failure_policy": "STOP_ON_FAILURE",
+                "tasks": tasks,
+                "rationale": f"0ms 고속 정규식 복합 시퀀스 분해 ({len(tasks)}개 작업)"
+            }
+        return None
+
     def _quick_parse_command(self, user_text: str) -> Optional[Dict[str, Any]]:
         """정형화된 주요 명령을 LLM 대기 없이 0ms에 즉시 확정 파싱 (오류/부호 역전 완전 방지)"""
+        # 0. Check multi-step compound instruction first
+        seq_res = self._quick_parse_sequence(user_text)
+        if seq_res is not None:
+            return seq_res
+
         cleaned = user_text.strip().lower()
 
         # 1. 마커 직시 도킹 명령
@@ -398,10 +528,17 @@ class LLMAgentNode(Node):
             parsed_dict = quick_parsed
             print(f">> 고속 확정 파서 매칭 ({time.perf_counter() - t0:.2f}ms): {parsed_dict.get('rationale')}")
         else:
+            # 규칙 기반 파싱 실패 시 명시적 로그 출력
+            miss_msg = f"[LLM Agent] 규칙 기반 빠른 파싱 매칭 실패 -> LLM(Qwen) 기반 추론 진행: '{user_text}'"
+            self.get_logger().info(miss_msg)
+            print(f"{TermColor.YELLOW}>> [Fast Parser Miss] {miss_msg}{TermColor.RESET}")
+
             # 2. Qwen2.5-VL 프롬프트 작성 (등록된 웨이포인트 포함)
             registered_places = list(self.validator.waypoints.keys())
             system_prompt = f"""You are an autonomous robot command planner.
-Analyze the user command and output ONLY valid JSON matching this schema:
+Analyze the user command and output ONLY valid JSON matching one of these two schemas:
+
+Case 1: Single Action:
 {{
   "action": "NAVIGATE" or "DOCK" or "STATUS",
   "target": {{
@@ -420,30 +557,37 @@ Analyze the user command and output ONLY valid JSON matching this schema:
   }},
   "rationale": "short explanation"
 }}
+
+Case 2: Multiple / Sequential Actions (e.g. "~갔다가 ~해", "~이동 후 ~도킹해"):
+{{
+  "is_sequence": true,
+  "title": "short title of sequence",
+  "tasks": [
+    {{"action": "NAVIGATE", "target": {{"semantic_name": "place1", "mode": "WAYPOINT"}}}},
+    {{"action": "NAVIGATE", "target": {{"semantic_name": "place2", "mode": "WAYPOINT"}}}}
+  ],
+  "rationale": "short explanation"
+}}
+
 Registered places: {registered_places}
 
 Examples:
 - "앞으로 1미터 이동해": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 1.0, "relative_y": 0.0, "relative_yaw": 0.0}}}}
 - "move toward 20cm": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.20, "relative_y": 0.0, "relative_yaw": 0.0}}}}
-- "앞으로 20cm 가줘": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.20, "relative_y": 0.0, "relative_yaw": 0.0}}}}
 - "뒤로 10cm 후진": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": -0.10, "relative_y": 0.0, "relative_yaw": 0.0}}}}
 - "좌회전 15도": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": 15.0}}}}
-- "왼쪽으로 회전해": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": 15.0}}}}
-- "왼쪽으로 돌아줘": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": 15.0}}}}
-- "왼쪽으로 90도 회전해": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": 90.0}}}}
-- "우회전 15도": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": -15.0}}}}
-- "오른쪽으로 회전해": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": -15.0}}}}
-- "오른쪽으로 돌아줘": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": -15.0}}}}
-- "좌회전해": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": 15.0}}}}
-- "우회전해": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": -15.0}}}}
+- "오른쪽으로 90도 회전해": {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": -90.0}}}}
 - "마커 보고 도킹해": {{"action": "DOCK", "target": {{"target_structure": "marker", "perception_type": "aruco", "direct_visual": true}}}}
-- "바닥에 있는 물체로 다가가": {{"action": "DOCK", "target": {{"target_structure": "floor_object", "perception_type": "floor_object", "direct_visual": true, "clearance_cm": 20.0}}}}
 - "workplace1로 도킹해": {{"action": "DOCK", "target": {{"target_structure": "workplace1", "docking_face": "front"}}}}
 - "책상으로 가줘": {{"action": "NAVIGATE", "target": {{"semantic_name": "desk", "mode": "WAYPOINT"}}}}
+- "waypoint1로 갔다가 workplace1로 가": {{"is_sequence": true, "title": "웨이포인트1 경유 워크플레이스1 이동", "tasks": [{{"action": "NAVIGATE", "target": {{"semantic_name": "wp1", "mode": "WAYPOINT"}}}}, {{"action": "NAVIGATE", "target": {{"semantic_name": "workplace1", "mode": "WAYPOINT"}}}}]}}
+- "workplace1로 가서 마커 보고 도킹해": {{"is_sequence": true, "title": "워크플레이스1 이동 후 마커 도킹", "tasks": [{{"action": "NAVIGATE", "target": {{"semantic_name": "workplace1", "mode": "WAYPOINT"}}}}, {{"action": "DOCK", "target": {{"target_structure": "marker", "perception_type": "aruco", "direct_visual": true}}}}]}}
+- "앞으로 50cm 갔다가 우회전 90도 해줘": {{"is_sequence": true, "title": "직진 50cm 후 우회전 90도", "tasks": [{{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.5, "relative_y": 0.0, "relative_yaw": 0.0}}}}, {{"action": "NAVIGATE", "target": {{"mode": "RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": -90.0}}}}]}}
 
 Important Rules:
-1. When parsing place or station names with numbers (e.g. workplace1), ALWAYS keep the number with the name.
+1. When parsing place or station names with numbers (e.g. workplace1), ALWAYS keep the number with the name. Note that 'waypoint1' or '웨이포인트1' corresponds to 'wp1'.
 2. Note for rotation: relative_yaw is in degrees (Left/CCW/좌회전/왼쪽: positive +, Right/CW/우회전/오른쪽: negative -).
+3. If the user command specifies multiple steps connected by sequential phrases (e.g. '~갔다가', '~하고 나서', '~한 뒤', 'first ... then ...'), ALWAYS output the Case 2 sequential schema with "is_sequence": true.
 
 User Command: "{user_text}"
 JSON:"""
@@ -453,7 +597,7 @@ JSON:"""
                 "prompt": system_prompt,
                 "stream": False,
                 "format": "json",
-                "options": {"temperature": 0.1, "num_predict": 128},
+                "options": {"temperature": 0.1, "num_predict": 256},
                 "keep_alive": self.keep_alive
             }
 
@@ -469,7 +613,8 @@ JSON:"""
                     parsed_dict = json.loads(raw_json)
 
                 elapsed = time.perf_counter() - t0
-                print(f">> Qwen2.5-VL 추론 완료 ({elapsed*1000:.1f}ms): {parsed_dict.get('action')}")
+                summary_action = "SEQUENCE" if parsed_dict.get("is_sequence") else parsed_dict.get('action')
+                print(f">> Qwen2.5-VL 추론 완료 ({elapsed*1000:.1f}ms): {summary_action}")
             except Exception as e:
                 self.get_logger().error(f"Ollama inference error: {e}")
                 resp_str = f"명령 분석 중 오류가 발생했습니다: {e}"
@@ -542,7 +687,17 @@ JSON:"""
                             print(f"{TermColor.YELLOW}⚠️ 도킹 대상 '{target_cue}' VLM 미감지 (3D Depth Fallback 연계 대기){TermColor.RESET}")
                         time.sleep(0.15)
 
-                # Task Manager로 태스크 발행
+                # Multi-Action Sequence인 경우 /task/command_sequence로 우선 발행
+                if resolved_task.get("is_sequence"):
+                    task_str = json.dumps(resolved_task, ensure_ascii=False)
+                    self.task_seq_pub.publish(String(data=task_str))
+                    task_cnt = len(resolved_task.get("tasks", []))
+                    resp_str = f"연속 복합 명령({task_cnt}개 작업)을 접수했습니다: [{resolved_task.get('title')}] 순차 실행을 시작합니다."
+                    print(f"\n{TermColor.CYAN}🚀 [Multi-Task Sequence Dispatched] {resp_str}{TermColor.RESET}")
+                    self.agent_resp_pub.publish(String(data=resp_str))
+                    return
+
+                # Task Manager로 단일 태스크 발행
                 task_str = json.dumps(resolved_task, ensure_ascii=False)
                 self.task_cmd_pub.publish(String(data=task_str))
 
