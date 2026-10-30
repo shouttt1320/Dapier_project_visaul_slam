@@ -29,17 +29,16 @@ except ImportError:
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
-CLASSES = ["red_cube", "blue_ball", "black_cube", "black_rod"]
+CLASSES = ["red_cube", "blue_ball", "white_tissue"]
 CLASS_COLORS = [
     (0, 0, 255),     # 0: red_cube (Red)
     (255, 120, 0),   # 1: blue_ball (Blue/Cyan)
-    (230, 230, 230), # 2: black_cube (White/Silver outline)
-    (0, 230, 255),   # 3: black_rod (Yellow outline)
-    (0, 255, 0),     # 4: Green
-    (255, 0, 255),   # 5: Magenta
+    (255, 255, 50),  # 2: white_tissue (Bright Mint/Yellow-Green outline)
+    (0, 255, 0),     # 3: Green
+    (255, 0, 255),   # 4: Magenta
 ]
 YOLO_WEIGHTS_PATH = os.path.join(PROJECT_ROOT, "yolov8s-worldv2.pt")
-DISPLAY_SCALE = 3.0  # 320x240 -> 960x720 for large, comfortable mouse drawing
+DISPLAY_SCALE = 1.0  # Dynamic adaptive scaling applied in InteractiveLabeler
 
 
 class AutoAnnotator:
@@ -53,8 +52,9 @@ class AutoAnnotator:
             self.yolo_model = YOLOWorld(YOLO_WEIGHTS_PATH)
             self.yolo_model.set_classes([
                 "red cube", "blue ball", "sports ball",
-                "black cube", "black box", "small black box",
-                "black rod", "black stick", "stick"
+                "crumpled tissue", "crumpled paper", "white tissue",
+                "tissue paper", "tissue", "paper ball", "wad of paper",
+                "toilet paper", "tissue clump"
             ])
             dummy = np.zeros((240, 320, 3), dtype=np.uint8)
             self.yolo_model.predict(dummy, device=0, verbose=False)
@@ -71,50 +71,8 @@ class AutoAnnotator:
         k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
 
         # ----------------------------------------------------------------------
-        # 1. Black Objects: black_cube & black_rod (HSV: V < 72, S < 140)
+        # (Black Objects excluded to prevent dark floor/shadow false positives)
         # ----------------------------------------------------------------------
-        if parent_dir in ("black_cube", "black_rod") or not parent_dir:
-            mask_k = cv2.inRange(hsv, np.array([0, 0, 0], dtype=np.uint8), np.array([180, 140, 72], dtype=np.uint8))
-            # Floor gate: Exclude top 22% horizon and extreme 3px border margins
-            mask_k[:int(H * 0.22), :] = 0
-            mask_k[H - 3:, :] = 0
-            mask_k[:, :3] = 0
-            mask_k[:, W - 3:] = 0
-
-            mask_k = cv2.morphologyEx(mask_k, cv2.MORPH_OPEN, k_open)
-            mask_k = cv2.morphologyEx(mask_k, cv2.MORPH_CLOSE, k_open)
-
-            cnts_k, _ = cv2.findContours(mask_k, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            k_cands = []
-            for c in cnts_k:
-                area = cv2.contourArea(c)
-                if area >= 20:
-                    x, y, w, h = cv2.boundingRect(c)
-                    # Exclude edge noise at bottom boundary
-                    if not (y + h >= H - 2 and h <= 8):
-                        aspect = w / float(h)
-                        if parent_dir == "black_cube":
-                            cls_name = "black_cube"
-                        elif parent_dir == "black_rod":
-                            cls_name = "black_rod"
-                        else:
-                            # Rod is elongated (w/h >= 2.2 or <= 0.45), Cube is squarish
-                            cls_name = "black_rod" if (aspect >= 2.2 or aspect <= 0.45) else "black_cube"
-
-                        if cls_name in CLASSES:
-                            cls_id = CLASSES.index(cls_name)
-                            k_cands.append({
-                                "cls_id": cls_id,
-                                "cls_name": cls_name,
-                                "bbox": (x, y, w, h),
-                                "area": area,
-                                "conf": 0.95
-                            })
-            k_cands = sorted(k_cands, key=lambda d: d["area"], reverse=True)
-            if k_cands:
-                detections.append(k_cands[0])
-                if len(k_cands) > 1 and k_cands[1]["area"] > k_cands[0]["area"] * 0.4:
-                    detections.append(k_cands[1])
 
         # ----------------------------------------------------------------------
         # 2. Red Cube (Strict Saturation >= 85 to prevent floor tile false-positives)
@@ -179,7 +137,45 @@ class AutoAnnotator:
                 detections.append(b_cands[0])
 
         # ----------------------------------------------------------------------
-        # 4. YOLO-World Fallback (if no detections found by color)
+        # 4. White Tissue Clump (HSV: Low Saturation S <= 62, High Value V >= 165)
+        # ----------------------------------------------------------------------
+        if parent_dir in ("white_tissue", "tissue") or not parent_dir:
+            mask_w = cv2.inRange(hsv, np.array([0, 0, 165], dtype=np.uint8), np.array([180, 62, 255], dtype=np.uint8))
+            # Floor gate: Exclude top 20% horizon, extreme border noise
+            mask_w[:int(H * 0.20), :] = 0
+            mask_w[H - 3:, :] = 0
+            mask_w[:, :3] = 0
+            mask_w[:, W - 3:] = 0
+
+            mask_w = cv2.morphologyEx(mask_w, cv2.MORPH_OPEN, k_open)
+            mask_w = cv2.morphologyEx(mask_w, cv2.MORPH_CLOSE, k_open)
+
+            cnts_w, _ = cv2.findContours(mask_w, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            w_cands = []
+            for c in cnts_w:
+                area = cv2.contourArea(c)
+                if area >= 20:
+                    x, y, w, h = cv2.boundingRect(c)
+                    # Filter out edge noise or whole-image glare
+                    if not (y + h >= H - 2 and h <= 8) and w < W * 0.80 and h < H * 0.80:
+                        aspect = w / float(h)
+                        # Tissue clump is roughly compact or irregular (0.35 <= aspect <= 3.0)
+                        if 0.30 <= aspect <= 3.20 and "white_tissue" in CLASSES:
+                            w_cands.append({
+                                "cls_id": CLASSES.index("white_tissue"),
+                                "cls_name": "white_tissue",
+                                "bbox": (x, y, w, h),
+                                "area": area,
+                                "conf": 0.92
+                            })
+            w_cands = sorted(w_cands, key=lambda d: d["area"], reverse=True)
+            if w_cands:
+                detections.append(w_cands[0])
+                if len(w_cands) > 1 and w_cands[1]["area"] > w_cands[0]["area"] * 0.40:
+                    detections.append(w_cands[1])
+
+        # ----------------------------------------------------------------------
+        # 5. YOLO-World Fallback (if no detections found by color)
         # ----------------------------------------------------------------------
         if len(detections) == 0 and self.yolo_model is not None:
             results = self.yolo_model.predict(bgr_img, conf=0.18, device=0, verbose=False)
@@ -196,10 +192,8 @@ class AutoAnnotator:
                         target_cls_id = CLASSES.index("red_cube")
                     elif ("ball" in detected_lbl or "blue" in detected_lbl) and "blue_ball" in CLASSES:
                         target_cls_id = CLASSES.index("blue_ball")
-                    elif ("rod" in detected_lbl or "stick" in detected_lbl) and "black_rod" in CLASSES:
-                        target_cls_id = CLASSES.index("black_rod")
-                    elif ("black" in detected_lbl or "cube" in detected_lbl or "box" in detected_lbl) and "black_cube" in CLASSES:
-                        target_cls_id = CLASSES.index("black_cube")
+                    elif any(k in detected_lbl for k in ("tissue", "paper", "clump", "wad", "toilet")) and "white_tissue" in CLASSES:
+                        target_cls_id = CLASSES.index("white_tissue")
 
                     if target_cls_id is not None:
                         x1, y1, x2, y2 = xyxy
@@ -222,7 +216,7 @@ class AutoAnnotator:
 # Interactive GUI / Mouse Box Drawer with 3X Zoom & Two-Click Support
 # ==============================================================================
 class InteractiveLabeler:
-    def __init__(self, annotator: AutoAnnotator, image_paths: List[str]):
+    def __init__(self, annotator: AutoAnnotator, image_paths: List[str], initial_class: int = 0):
         self.annotator = annotator
         self.image_paths = sorted(image_paths)
         self.curr_idx = 0
@@ -238,7 +232,7 @@ class InteractiveLabeler:
         self.mouse_y = 0
         self.start_x = 0
         self.start_y = 0
-        self.manual_class = 0  # 0: red_cube, 1: blue_ball
+        self.manual_class = initial_class
 
     def _disp_to_orig(self, dx: int, dy: int, orig_w: int, orig_h: int) -> Tuple[int, int]:
         ox = int(round(dx / self.scale))
@@ -359,6 +353,18 @@ class InteractiveLabeler:
                 continue
 
             orig_h, orig_w = raw_img.shape[:2]
+
+            # Auto-calculate screen scale so window fits comfortably on screen
+            target_max_w = 960.0
+            target_max_h = 720.0
+            if orig_w <= 360 and orig_h <= 270:
+                self.scale = 3.0  # For small 320x240 camera frames
+            elif orig_w <= 640 and orig_h <= 480:
+                self.scale = 1.25 # For 640x480
+            else:
+                # For high-res images (e.g. phone 1080x1080) scale down to fit screen
+                self.scale = min(1.0, target_max_w / float(orig_w), target_max_h / float(orig_h))
+
             disp_w = int(orig_w * self.scale)
             disp_h = int(orig_h * self.scale)
 
@@ -580,7 +586,9 @@ def main():
     parser.add_argument('--output', type=str, default=os.path.join(PROJECT_ROOT, "dataset_capture", "yolo_dataset"),
                         help="Output YOLO dataset folder (train/val split)")
     parser.add_argument('--classes', type=str, default="",
-                        help="Custom comma-separated class list (e.g. red_cube,blue_ball,black_cube,black_rod)")
+                        help="Custom comma-separated class list (e.g. red_cube,blue_ball,black_cube,black_rod,white_tissue)")
+    parser.add_argument('--label', '--target', type=str, default="",
+                        help="Filter to label only specific class/folder (e.g. white_tissue)")
     parser.add_argument('--auto', action='store_true',
                         help="Auto-approve all images without showing GUI")
     args, unknown = parser.parse_known_args()
@@ -606,14 +614,32 @@ def main():
 
     img_files = [f for f in img_files if "yolo_dataset" not in f]
 
+    # Filter by specific label if requested
+    init_cls_idx = 0
+    target_filter = args.label.strip().lower()
+    input_base = os.path.basename(os.path.normpath(args.input)).lower()
+    if not target_filter and input_base in [c.lower() for c in CLASSES]:
+        target_filter = input_base
+
+    if target_filter:
+        for idx, c in enumerate(CLASSES):
+            if c.lower() == target_filter:
+                init_cls_idx = idx
+                break
+        img_files = [
+            f for f in img_files
+            if target_filter == os.path.basename(os.path.dirname(f)).lower() or target_filter in os.path.basename(f).lower()
+        ]
+        print(f"🎯 [단일 라벨 필터 적용] '{CLASSES[init_cls_idx]}' 관련 이미지 {len(img_files)}장만 엽니다.")
+
     if not img_files:
-        print(f"❌ {args.input} 디렉토리에서 이미지를 찾을 수 없습니다.")
+        print(f"❌ {args.input} 디렉토리에서 대상 이미지를 찾을 수 없습니다.")
         return
 
     print(f"📂 총 {len(img_files)}장의 수집된 이미지를 발견했습니다.")
 
     annotator = AutoAnnotator(args.input, use_yolo_world=True)
-    labeler = InteractiveLabeler(annotator, img_files)
+    labeler = InteractiveLabeler(annotator, img_files, initial_class=init_cls_idx)
 
     labeler.run(auto_all=args.auto)
 

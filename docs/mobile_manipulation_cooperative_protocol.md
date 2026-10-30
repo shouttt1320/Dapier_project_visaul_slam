@@ -16,7 +16,7 @@ sequenceDiagram
     participant Arm as 🦾 로봇팔 제어기 (Manipulator)
 
     Note over Base,Arm: [시나리오 1: 바닥 물체 발견 및 수거 (Pick)]
-    Base->>Base: 물체 전방 25cm 정렬 및 정지
+    Base->>Base: 물체 전방 25cm 정렬 및 좌측 10도(+10°) 편향 회전
     Base->>Bridge: /task/ack {"status": "APPROACH_DONE"}
     Base->>Base: 모터 잠금 (WAITING_ARM_PICK)
     
@@ -142,6 +142,18 @@ sequenceDiagram
 {"action": "FORWARD", "distance": 0.05, "id": "nudge_05"}
 {"action": "TURN_LEFT", "angle": 1.45, "id": "nudge_06"}
 ```
+
+#### C. 물체 관측 실패 시 시각 재접근 요청 포맷 (Re-approach)
+* **목적**: 로봇팔 카메라가 물체를 놓쳐 미세 이동 수치를 계산할 수 없을 때, 모바일 베이스의 Astra 카메라로 물체를 다시 포착하여 25cm 정밀 재접근을 수행하도록 요청.
+* **명령 규격 (한 줄 JSON)**:
+  ```json
+  {"action": "REAPPROACH", "id": "retry_01"}
+  ```
+  *(※ `{"action": "RETRY_APPROACH", "id": "retry_01"}` 또는 `/sweepick/ready`의 `{"status": "REAPPROACH", "id": "retry_01"}`도 호환 지원)*
+* **모바일 로봇 동작 흐름**:
+  1. 베이스가 **22cm 안전 후진** 및 **-10° 회전(각도 원복)**을 수행하여 물체를 Astra 카메라 황금 화각(약 45~50cm) 정중앙에 재배치합니다.
+  2. 바닥 시각 제어기(`object_approaching_controller`)가 자동으로 재가동되어 **전방 25cm 정밀 재접근 + 좌측 10도 재정렬**을 수행합니다.
+  3. 완료 시 로봇팔로 다시 `/task/ack` `{"id": "retry_01", "state": "done", "status": "APPROACH_DONE"}` 신호를 반환합니다.
 
 ---
 

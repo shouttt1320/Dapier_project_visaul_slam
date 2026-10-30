@@ -76,3 +76,9 @@ OtherProjects/
 # Local agent artifacts
 .agents/
 
+# Dataset Capture & Training Media
+dataset_capture/images/
+dataset_capture/raw_videos/
+dataset_capture/yolo_dataset/
+*.mp4
+robot_runs/

@@ -1221,7 +1221,7 @@ class QwenMissionControlGUI(QMainWindow):
         btn_right15.clicked.connect(lambda: self._send_relative_nav(0.0, 0.0, -15.0))
         quick_grid.addWidget(btn_right15, 1, 2)
 
-        # 3열: 타겟 시각 접근 1행 (빨간 큐브, 파란 공, 마커)
+        # 3열: 타겟 시각 접근 1행 (빨간 큐브, 파란 공, 흰색 휴지)
         btn_yolo_red = QPushButton("🔴 빨간 큐브 접근")
         btn_yolo_red.setStyleSheet("background-color: rgba(239, 68, 68, 0.20); border: 1px solid #ef4444; color: #f87171; font-weight: bold; padding: 6px;")
         btn_yolo_red.clicked.connect(lambda: self._submit_prompt("빨간 큐브 앞으로 접근해"))
@@ -1232,21 +1232,16 @@ class QwenMissionControlGUI(QMainWindow):
         btn_yolo_blue.clicked.connect(lambda: self._submit_prompt("파란 공 앞으로 가줘"))
         quick_grid.addWidget(btn_yolo_blue, 2, 1)
 
+        btn_yolo_white_tissue = QPushButton("🧻 흰색 휴지 접근")
+        btn_yolo_white_tissue.setStyleSheet("background-color: rgba(248, 250, 252, 0.20); border: 1px solid #f8fafc; color: #ffffff; font-weight: bold; padding: 6px;")
+        btn_yolo_white_tissue.clicked.connect(lambda: self._submit_prompt("흰색 휴지 앞으로 접근해"))
+        quick_grid.addWidget(btn_yolo_white_tissue, 2, 2)
+
+        # 4열: 마커 도킹
         btn_dock_marker = QPushButton("🎯 마커 도킹")
         btn_dock_marker.setStyleSheet("background-color: rgba(16, 185, 129, 0.20); border: 1px solid #10b981; color: #34d399; font-weight: bold; padding: 6px;")
         btn_dock_marker.clicked.connect(lambda: self._submit_prompt("마커 보고 도킹해"))
-        quick_grid.addWidget(btn_dock_marker, 2, 2)
-
-        # 4열: 타겟 시각 접근 2행 (검은 큐브, 검은 막대)
-        btn_yolo_black_cube = QPushButton("⬛ 검은 큐브 접근")
-        btn_yolo_black_cube.setStyleSheet("background-color: rgba(148, 163, 184, 0.20); border: 1px solid #94a3b8; color: #f1f5f9; font-weight: bold; padding: 6px;")
-        btn_yolo_black_cube.clicked.connect(lambda: self._submit_prompt("검은 큐브 앞으로 접근해"))
-        quick_grid.addWidget(btn_yolo_black_cube, 3, 0)
-
-        btn_yolo_black_rod = QPushButton("🥢 검은 막대 접근")
-        btn_yolo_black_rod.setStyleSheet("background-color: rgba(234, 179, 8, 0.20); border: 1px solid #eab308; color: #fde047; font-weight: bold; padding: 6px;")
-        btn_yolo_black_rod.clicked.connect(lambda: self._submit_prompt("검은 막대 앞으로 접근해"))
-        quick_grid.addWidget(btn_yolo_black_rod, 3, 1)
+        quick_grid.addWidget(btn_dock_marker, 3, 0, 1, 3)
 
         # 5열: 바닥 물체 수거 핸드셰이크 (로봇팔 수거 완료 / 건너뛰기)
         btn_pick_resume = QPushButton("🦾 수거 완료 (주행 복귀)")

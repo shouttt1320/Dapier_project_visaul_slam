@@ -395,10 +395,10 @@ class DatasetCollectorNode(Node):
 # ==============================================================================
 # Standalone Video Slicer / Frame Extractor
 # ==============================================================================
-def slice_video_to_images(video_path: str, output_dir: str, target_label: str, frame_interval: int = 5, blur_thresh: float = 50.0):
+def slice_video_to_images(video_path: str, output_dir: str, target_label: str, frame_interval: int = 5, blur_thresh: float = 0.0):
     """
-    Extracts sharp frames from a recorded video clip into the label image folder.
-    Avoids duplicate and blurry frames.
+    Extracts frames from a recorded video clip into the label image folder.
+    Avoids duplicate frames; blur filtering can be set via blur_thresh (0 to disable).
     """
     if not os.path.exists(video_path):
         print(f"❌ 동영상 파일을 찾을 수 없습니다: {video_path}")
@@ -415,7 +415,7 @@ def slice_video_to_images(video_path: str, output_dir: str, target_label: str, f
     print(f"   - 입력 영상: {video_path}")
     print(f"   - 총 프레임: {total_frames} (FPS: {fps:.1f})")
     print(f"   - 추출 간격: 매 {frame_interval}번째 프레임 추출")
-    print(f"   - 흐림(Blur) 필터 임계값: >= {blur_thresh:.1f}")
+    print(f"   - 흐림(Blur) 필터 임계값: >= {blur_thresh:.1f} (0일 경우 필터 미적용, 전체 추출)")
     print(f"   - 저장 위치: {label_dir}")
 
     extracted_cnt = 0
@@ -432,12 +432,13 @@ def slice_video_to_images(video_path: str, output_dir: str, target_label: str, f
         if frame_idx % frame_interval != 0:
             continue
 
-        # Check sharpness
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        score = cv2.Laplacian(gray, cv2.CV_64F).var()
-        if score < blur_thresh:
-            skipped_blur += 1
-            continue
+        # Check sharpness if blur_thresh > 0
+        if blur_thresh > 0.0:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            score = cv2.Laplacian(gray, cv2.CV_64F).var()
+            if score < blur_thresh:
+                skipped_blur += 1
+                continue
 
         extracted_cnt += 1
         out_name = f"{target_label}_{t_base}_slice_{extracted_cnt:04d}.jpg"
@@ -453,9 +454,10 @@ def slice_video_to_images(video_path: str, output_dir: str, target_label: str, f
 # ==============================================================================
 def generate_data_yaml(output_dir: str):
     img_dir = os.path.join(output_dir, "images")
-    classes = [d for d in sorted(os.listdir(img_dir)) if os.path.isdir(os.path.join(img_dir, d))]
+    excluded = {"black_cube", "black_rod"}
+    classes = [d for d in sorted(os.listdir(img_dir)) if os.path.isdir(os.path.join(img_dir, d)) and d not in excluded]
     if not classes:
-        classes = ["red_cube", "blue_ball"]
+        classes = ["red_cube", "blue_ball", "white_tissue"]
 
     yaml_content = f"""# YOLOv8 / YOLO-World Fine-Tuning Dataset Configuration
 path: {output_dir}
@@ -491,12 +493,14 @@ def main():
                         help="Class label for sliced images (default: matches --label)")
     parser.add_argument('--interval', type=int, default=5,
                         help="Frame extraction interval for video slicing (default: 5)")
+    parser.add_argument('--blur-thresh', type=float, default=0.0,
+                        help="Laplacian blur threshold for slicing (default: 0.0, 0 to extract all frames)")
     args, unknown = parser.parse_known_args()
 
     # If standalone video slicing requested
     if args.slice:
         lbl = args.slice_label if args.slice_label else args.label
-        slice_video_to_images(args.slice, args.output, lbl, frame_interval=args.interval)
+        slice_video_to_images(args.slice, args.output, lbl, frame_interval=args.interval, blur_thresh=args.blur_thresh)
         generate_data_yaml(args.output)
         return
 

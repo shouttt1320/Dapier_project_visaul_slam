@@ -747,21 +747,30 @@ class InteractiveDockingTeacherNode(Node):
         )
 
         if success:
+            # Auto-sync station standoff position as a waypoint in semantic_waypoints.yaml
+            station_info = self.station_manager.get_station(self.station_name)
+            if station_info and "standoff" in station_info:
+                so = station_info["standoff"]
+                self._save_waypoint_entry(
+                    wp_name=self.station_name,
+                    x=so["x"],
+                    y=so["y"],
+                    z=self.gizmo_pos[2],
+                    yaw_deg=so["yaw_deg"],
+                    desc=f"Taught station {self.station_name} standoff waypoint via RViz Gizmo"
+                )
+
             msg = (f"Successfully saved station '{self.station_name}' "
                    f"(Pos: [{self.gizmo_pos[0]:.3f}, {self.gizmo_pos[1]:.3f}, {self.gizmo_pos[2]:.3f}], "
-                   f"Yaw: {math.degrees(approach_yaw):.1f}°) to docking_stations.yaml.")
+                   f"Yaw: {math.degrees(approach_yaw):.1f}°) to docking_stations.yaml "
+                   f"& auto-synced to semantic_waypoints.yaml.")
+            self.get_logger().info(f"💾 {msg}")
             return True, msg
         else:
             return False, "Failed to write station configuration to disk."
 
-    def save_waypoint(self, wp_name: Optional[str] = None) -> Tuple[bool, str]:
-        """
-        Saves waypoint position and yaw orientation directly to semantic_waypoints.yaml.
-        """
-        target_name = (wp_name or self.waypoint_name).strip()
-        if not target_name:
-            target_name = "waypoint_01"
-
+    def _save_waypoint_entry(self, wp_name: str, x: float, y: float, z: float, yaw_deg: float, desc: str = "") -> bool:
+        """Helper to write or update a waypoint entry in semantic_waypoints.yaml."""
         data = {}
         if os.path.exists(WAYPOINTS_CONFIG_PATH):
             try:
@@ -773,14 +782,13 @@ class InteractiveDockingTeacherNode(Node):
         if "waypoints" not in data or not isinstance(data["waypoints"], dict):
             data["waypoints"] = {}
 
-        yaw_deg = round(float(math.degrees(self.gizmo_yaw)), 2)
-        data["waypoints"][target_name] = {
-            "description": f"Taught waypoint {target_name} via RViz Gizmo",
-            "x": round(float(self.gizmo_pos[0]), 4),
-            "y": round(float(self.gizmo_pos[1]), 4),
-            "z": round(float(self.gizmo_pos[2]), 4),
-            "yaw_deg": yaw_deg,
-            "aliases": [target_name]
+        data["waypoints"][wp_name] = {
+            "description": desc or f"Taught waypoint {wp_name} via RViz Gizmo",
+            "x": round(float(x), 4),
+            "y": round(float(y), 4),
+            "z": round(float(z), 4),
+            "yaw_deg": round(float(yaw_deg), 2),
+            "aliases": [wp_name]
         }
 
         try:
@@ -789,15 +797,36 @@ class InteractiveDockingTeacherNode(Node):
                 if os.path.exists(os.path.dirname(p)):
                     with open(p, 'w', encoding='utf-8') as f:
                         yaml.dump(data, f, allow_unicode=True, sort_keys=False)
+            return True
+        except Exception as e:
+            self.get_logger().error(f"Failed to save waypoint '{wp_name}' to disk: {e}")
+            return False
+
+    def save_waypoint(self, wp_name: Optional[str] = None) -> Tuple[bool, str]:
+        """
+        Saves waypoint position and yaw orientation directly to semantic_waypoints.yaml.
+        """
+        target_name = (wp_name or self.waypoint_name).strip()
+        if not target_name:
+            target_name = "waypoint_01"
+
+        yaw_deg = round(float(math.degrees(self.gizmo_yaw)), 2)
+        ok = self._save_waypoint_entry(
+            wp_name=target_name,
+            x=self.gizmo_pos[0],
+            y=self.gizmo_pos[1],
+            z=self.gizmo_pos[2],
+            yaw_deg=yaw_deg,
+            desc=f"Taught waypoint {target_name} via RViz Gizmo"
+        )
+        if ok:
             msg = (f"Successfully saved waypoint '{target_name}' "
                    f"(Pos: [{self.gizmo_pos[0]:.3f}, {self.gizmo_pos[1]:.3f}, {self.gizmo_pos[2]:.3f}], "
                    f"Yaw: {yaw_deg:.1f}°) to semantic_waypoints.yaml.")
             self.get_logger().info(f"📍 {msg}")
             return True, msg
-        except Exception as e:
-            err = f"Failed to save waypoint '{target_name}' to disk: {e}"
-            self.get_logger().error(err)
-            return False, err
+        else:
+            return False, f"Failed to save waypoint '{target_name}' to disk."
 
     def _send_feedback(self, text: str):
         """Sends user-facing feedback to ROS topic, logger, and updates RViz 3D text badge."""

@@ -30,7 +30,7 @@ from rclpy.action.client import ClientGoalHandle
 from action_msgs.msg import GoalStatus
 
 from geometry_msgs.msg import Twist, TwistStamped, PoseStamped, Point, Quaternion, Vector3
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import String, Bool
 from std_srvs.srv import Trigger
@@ -140,6 +140,8 @@ class TaskManagerNode(Node):
         self.cmd_vel_nav_pub = self.create_publisher(Twist, '/cmd_vel_nav', 10)
         self.task_status_pub = self.create_publisher(String, '/task/status', 10)
         self.rviz_goal_pub = self.create_publisher(MarkerArray, '/redbox/marker', 10)
+        self.rviz_plan_pub = self.create_publisher(Path, '/plan', 10)
+        self.rviz_local_plan_pub = self.create_publisher(Path, '/local_plan', 10)
         self.detect_query_pub = self.create_publisher(String, '/qwen/detect_query', 10)
         self.start_station_pub = self.create_publisher(String, '/docking/start_station', 10)
 
@@ -183,6 +185,12 @@ class TaskManagerNode(Node):
         self.pick_confirm_start_time: float = 0.0
         self.pick_confirm_timeout_sec: float = 15.0
         self.rejected_targets_cooldown: Dict[str, float] = {}
+
+        # Floor target memory & reapproach tracking
+        self.last_floor_target_name: str = "black_cube"
+        self.reapproach_count: int = 0
+        self.reapproach_cmd_id: Optional[str] = None
+        self.reapproach_pending_approach: bool = False
 
         # Task Queue & Multi-Action Sequence Management
         self.active_sequence_id: Optional[str] = None
@@ -353,7 +361,9 @@ class TaskManagerNode(Node):
                 self.log_info("🎯 Object Approaching Controller reported APPROACHED!")
                 self._report_task_info("🎉 [접근 완료] APPROACH_DONE: 로봇 정중앙 25cm 위치에 정렬 및 정지 완료! (로봇팔 작업 준비 완료)")
                 # Send /task/ack for robotic arm
-                self.task_ack_pub.publish(String(data=json.dumps({"id": "approach", "state": "done", "status": "APPROACH_DONE"})))
+                ack_id = getattr(self, 'reapproach_cmd_id', None) or "approach"
+                self.task_ack_pub.publish(String(data=json.dumps({"id": ack_id, "state": "done", "status": "APPROACH_DONE"})))
+                self.reapproach_cmd_id = None
                 self.is_arm_interacting = True
                 self.log_info("🤖 [로봇팔 파지/자세조정 대기] 로봇팔이 물체를 잡거나 미세 조정할 때까지 대기(WAITING_ARM_PICK)합니다.")
                 self._transition_to(TaskState.WAITING_ARM_PICK, reason="Object Approached. Awaiting robotic arm pickup or inching.")
@@ -389,7 +399,11 @@ class TaskManagerNode(Node):
             elif status in ("PICK_DONE", "PICK_COMPLETED", "SUCCESS", "ACTION_DONE", "DOCK_TASK_DONE", "TASK_DONE", "DONE"):
                 self.log_info(f"🤖 [/sweepick/ready] 로봇팔 작업 완료({status})! 자율주행/다음 작업을 재개합니다.")
                 self.is_arm_interacting = False
+                self.reapproach_count = 0
                 self._resume_paused_navigation()
+            elif status in ("REAPPROACH", "RETRY_APPROACH", "RE_APPROACH"):
+                self.log_info(f"🔄 [/sweepick/ready] 로봇팔 재접근 요청({status}) 수신! 후진 후 시각 재접근을 가동합니다.")
+                self._handle_reapproach_request(data.get("id"))
             elif status in ("PICK_NOT_DONE", "BUS_LOST", "ERROR", "MANUAL_INTERVENTION"):
                 reason = data.get("reason", "Robotic arm halted or required manual inspection")
                 self.log_error(f"🚨 [/sweepick/ready] 로봇팔 실패/중단({status}) 수신! 사유: {reason}. 베이스를 절대 움직이지 않고 잠금 유지합니다.")
@@ -423,7 +437,11 @@ class TaskManagerNode(Node):
             elif action_raw in ("PICK_COMPLETED", "PICK_DONE", "RESUME_NAV", "RESUME"):
                 self.log_info("🤖 [로봇팔 신호 수신] 물체 파지 완료! 원래 목적지로 주행을 복귀합니다.")
                 self.is_arm_interacting = False
+                self.reapproach_count = 0
                 self._resume_paused_navigation()
+                return
+            elif action_raw in ("REAPPROACH", "RETRY_APPROACH", "RE_APPROACH") or bool(resolved_task.get("reapproach", False)):
+                self._handle_reapproach_request(self.current_cmd_id)
                 return
             elif action_raw in ("TRIGGER_APPROACH_DONE", "SIMULATE_APPROACH_DONE", "MOCK_APPROACH_DONE", "APPROACH_DONE"):
                 self.log_info("🧪 [테스트 모드] 가상 접근 완료(TRIGGER_APPROACH_DONE) 명령 수신! 즉시 WAITING_ARM_PICK 전환 및 신호 발행")
@@ -441,28 +459,22 @@ class TaskManagerNode(Node):
 
             if fwd_key:
                 dist = min(0.10, max(-0.10, float(resolved_task[fwd_key])))
-                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": dist, "relative_y": 0.0, "relative_yaw": 0.0, "id": self.current_cmd_id}
+                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": dist, "relative_y": 0.0, "relative_yaw": 0.0, "id": self.current_cmd_id, "is_arm_inching": True}
             elif bwd_key:
                 dist = min(0.10, max(-0.10, float(resolved_task[bwd_key])))
-                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": -dist, "relative_y": 0.0, "relative_yaw": 0.0, "id": self.current_cmd_id}
+                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": -dist, "relative_y": 0.0, "relative_yaw": 0.0, "id": self.current_cmd_id, "is_arm_inching": True}
             elif "turn_left" in resolved_task or "left" in resolved_task:
                 yaw_deg = min(30.0, max(-30.0, float(resolved_task.get("turn_left", resolved_task.get("left", 5.0)))))
-                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": yaw_deg, "id": self.current_cmd_id}
+                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": yaw_deg, "id": self.current_cmd_id, "is_arm_inching": True}
             elif "turn_right" in resolved_task or "right" in resolved_task:
                 yaw_deg = min(30.0, max(-30.0, float(resolved_task.get("turn_right", resolved_task.get("right", 5.0)))))
-                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": -yaw_deg, "id": self.current_cmd_id}
-            elif action_raw in ("FORWARD", "MOVE_FORWARD"):
+                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": -yaw_deg, "id": self.current_cmd_id, "is_arm_inching": True}
+            elif action_raw in ("FORWARD", "MOVE_FORWARD") and resolved_task.get("source") == "arm":
                 dist = min(0.10, max(-0.10, float(resolved_task.get("distance", 0.05))))
-                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": dist, "relative_y": 0.0, "relative_yaw": 0.0, "id": self.current_cmd_id}
-            elif action_raw in ("BACKWARD", "MOVE_BACKWARD"):
+                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": dist, "relative_y": 0.0, "relative_yaw": 0.0, "id": self.current_cmd_id, "is_arm_inching": True}
+            elif action_raw in ("BACKWARD", "MOVE_BACKWARD") and resolved_task.get("source") == "arm":
                 dist = min(0.10, max(-0.10, float(resolved_task.get("distance", 0.05))))
-                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": -dist, "relative_y": 0.0, "relative_yaw": 0.0, "id": self.current_cmd_id}
-            elif action_raw in ("TURN_LEFT", "ROTATE_LEFT"):
-                deg = min(30.0, max(-30.0, float(resolved_task.get("angle_deg", resolved_task.get("angle", 15.0)))))
-                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": deg, "id": self.current_cmd_id}
-            elif action_raw in ("TURN_RIGHT", "ROTATE_RIGHT"):
-                deg = min(30.0, max(-30.0, float(resolved_task.get("angle_deg", resolved_task.get("angle", 15.0)))))
-                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": 0.0, "relative_y": 0.0, "relative_yaw": -deg, "id": self.current_cmd_id}
+                resolved_task = {"action": "NAVIGATE_RELATIVE", "relative_x": -dist, "relative_y": 0.0, "relative_yaw": 0.0, "id": self.current_cmd_id, "is_arm_inching": True}
 
             action = resolved_task.get("action", "")
             if "tasks" in resolved_task and isinstance(resolved_task["tasks"], list):
@@ -475,6 +487,35 @@ class TaskManagerNode(Node):
                 self.submit_task(resolved_task)
         except Exception as e:
             self.log_error(f"Failed to parse /task/command: {e}")
+
+    def _handle_reapproach_request(self, cmd_id: Optional[str] = None):
+        """
+        Handles robot arm request to back up and re-approach the floor target.
+        Triggered by: {"action": "REAPPROACH", "id": "..."} on /task/command or /sweepick/ready.
+        1. Backs up 22cm and rotates -10.0 deg (undoing the +10 deg left bias).
+        2. Once backed up, automatically re-launches floor visual approach.
+        3. Upon 25cm approach and +10 deg turn, returns /task/ack with status: "APPROACH_DONE".
+        """
+        if getattr(self, 'reapproach_count', 0) >= 3:
+            self.log_warn("⚠️ [재접근 한도 초과] 재접근 최대 시도 횟수(3회)를 초과하여 중단합니다.")
+            self.task_ack_pub.publish(String(data=json.dumps({
+                "id": cmd_id or "reapproach",
+                "state": "error",
+                "status": "REAPPROACH_FAILED",
+                "reason": "Max re-approach retries exceeded (3/3)"
+            }, ensure_ascii=False)))
+            return
+
+        self.reapproach_count = getattr(self, 'reapproach_count', 0) + 1
+        self.reapproach_cmd_id = cmd_id
+        self.reapproach_pending_approach = True
+
+        target_name = getattr(self, 'last_floor_target_name', 'black_cube') or 'black_cube'
+        self.log_info(f"🔄 [재접근 요청 수신 ({self.reapproach_count}/3)] 대상: '{target_name}'. 22cm 후진 및 각도 원복(-10°) 시작...")
+        self._report_task_info(f"🔄 [재접근 시작] 로봇팔 관측 실패로 22cm 후진 후 '{target_name}' 시각 재접근을 수행합니다.")
+
+        self.is_arm_interacting = True
+        self._start_relative_navigation(-0.22, 0.0, -10.0)
 
     # --------------------------------------------------------------------------
     # Task Queue & Multi-Action Sequence Engine
@@ -697,8 +738,10 @@ class TaskManagerNode(Node):
         """Clears pending tasks only, keeping the currently running task active."""
         q_len = len(self.task_queue)
         self.task_queue.clear()
+        self.paused_navigation_goal = None
+        self.paused_task_context = None
         self.sequence_total_tasks = self.sequence_completed_tasks + (1 if self.current_task else 0)
-        self.log_info(f"🧹 [대기열 비우기] 대기 중이던 {q_len}개 작업을 삭제했습니다. (현재 실행 중인 작업은 유지)")
+        self.log_info(f"🧹 [대기열 비우기] 대기 중이던 {q_len}개 작업 및 일시정지 복귀 목표를 삭제했습니다. (현재 실행 중인 작업은 유지)")
         self._publish_queue_status()
         response.success = True
         response.message = f"Cleared {q_len} pending tasks from queue."
@@ -708,6 +751,9 @@ class TaskManagerNode(Node):
         """Full safe cancellation: aborts active task, halts robot, and empties entire queue."""
         q_len = len(self.task_queue)
         self.task_queue.clear()
+        self.paused_navigation_goal = None
+        self.paused_task_context = None
+        self.current_task = None
         self._cancel_nav2_goal()
         if self.dock_abort_cli.service_is_ready():
             self.dock_abort_cli.call_async(Trigger.Request())
@@ -720,8 +766,9 @@ class TaskManagerNode(Node):
         self.current_task_id = None
         self.sequence_total_tasks = 0
         self.sequence_completed_tasks = 0
+        self._clear_rviz_path_and_markers()
         self._transition_to(TaskState.IDLE, reason="Canceled all tasks by user request")
-        self.log_warn(f"🛑 [전체 작업 즉각 취소] 실행 중인 작업을 중단하고 대기열({q_len}개)을 전면 비웠습니다.")
+        self.log_warn(f"🛑 [전체 작업 즉각 취소] 실행 중인 작업을 중단하고 대기열({q_len}개)과 RViz 경로를 전면 삭제했습니다.")
         self._publish_queue_status()
         response.success = True
         response.message = f"Canceled active task and cleared {q_len} queued tasks."
@@ -766,6 +813,13 @@ class TaskManagerNode(Node):
             self.log_warn(warn_msg)
             self._report_task_failure(warn_msg)
             return False
+
+        # Clear any lingering paused navigation goal and arm interaction flag when explicitly starting a new standalone task
+        if not resolved_task.get("_is_resumed_goal", False):
+            self.paused_navigation_goal = None
+            self.paused_task_context = None
+            if not resolved_task.get("is_arm_inching", False) and action != "DOCK":
+                self.is_arm_interacting = False
 
         self.current_task = resolved_task
         self.retry_count = 0
@@ -833,9 +887,9 @@ class TaskManagerNode(Node):
             cls_name = data.get("class_name", "")
             now_t = time.time()
 
-            # Ignore if within cooldown (e.g. user rejected this target within 15s)
+            # Ignore if within cooldown (e.g. user rejected this target within 5s)
             if cls_name in self.rejected_targets_cooldown:
-                if (now_t - self.rejected_targets_cooldown[cls_name]) < 15.0:
+                if (now_t - self.rejected_targets_cooldown[cls_name]) < 5.0:
                     return
 
             # Distance filter: only interrupt if target is within 1.20m
@@ -900,6 +954,9 @@ class TaskManagerNode(Node):
             return
 
         cls_name = self.detected_pick_target.get("class_name", "")
+        if cls_name:
+            self.last_floor_target_name = cls_name
+        self.reapproach_count = 0
         disp_name = self.detected_pick_target.get("display_name", cls_name)
         self.log_info(f"✅ [수거 승인] 사용자가 '{disp_name}' 수거를 승인했습니다. 25cm 정밀 접근 시작!")
         self._report_task_info(f"✅ [수거 승인] '{disp_name}' 25cm 정밀 접근을 시작합니다.")
@@ -949,6 +1006,7 @@ class TaskManagerNode(Node):
             return
 
         resume_goal = copy.deepcopy(self.paused_navigation_goal)
+        resume_goal["_is_resumed_goal"] = True
         self.paused_navigation_goal = None
         self.detected_pick_target = None
 
@@ -958,7 +1016,7 @@ class TaskManagerNode(Node):
         self.submit_task(resume_goal)
 
     def _cancel_nav2_goal(self):
-        """Cancels active Nav2 goal if in progress."""
+        """Cancels active Nav2 goal if in progress and clears path visual from RViz."""
         if self.nav2_goal_handle is not None and self.nav2_in_progress:
             self.log_info("Canceling active Nav2 goal...")
             try:
@@ -966,6 +1024,7 @@ class TaskManagerNode(Node):
             except Exception as e:
                 self.log_warn(f"Nav2 cancel error: {e}")
             self.nav2_in_progress = False
+        self._clear_rviz_path_and_markers()
 
     def trigger_software_stop(self, reason: str = "Unspecified"):
         """
@@ -977,14 +1036,18 @@ class TaskManagerNode(Node):
         if len(self.task_queue) > 0:
             self.log_warn(f"🛑 [E-STOP] 대기열에 등록된 {len(self.task_queue)}개 작업을 즉시 폐기합니다.")
             self.task_queue.clear()
+        self.paused_navigation_goal = None
+        self.paused_task_context = None
+        self.current_task = None
         self.active_sequence_id = None
         self.current_task_id = None
         self.sequence_total_tasks = 0
         self.sequence_completed_tasks = 0
         self._publish_queue_status()
         
-        # 1. Cancel Nav2 Goal
+        # 1. Cancel Nav2 Goal and clear RViz path & markers
         self._cancel_nav2_goal()
+        self._clear_rviz_path_and_markers()
 
         # 2. Abort Docking & Object Approach Services
         if self.dock_abort_cli.service_is_ready():
@@ -1160,8 +1223,24 @@ class TaskManagerNode(Node):
             # Verify zero velocity
             self._halt_motors()
             if elapsed > 0.6:
+                # Re-approach pipeline: If backup is complete, automatically trigger floor visual re-approach!
+                if getattr(self, 'reapproach_pending_approach', False):
+                    self.reapproach_pending_approach = False
+                    target_name = getattr(self, 'last_floor_target_name', 'black_cube') or 'black_cube'
+                    self.log_info(f"🎯 [시각 재접근 가동] 안전 후진 완료! Astra 카메라로 '{target_name}' 포착 및 25cm 정밀 재접근을 가동합니다...")
+                    dock_task = {
+                        "action": "DOCK",
+                        "target_structure": "floor_object",
+                        "target_name": target_name
+                    }
+                    self.current_task = dock_task
+                    self._execute_dock_task(dock_task)
+                    return
+
                 task_name = self.current_task.get("action", "TASK") if self.current_task else "TASK"
-                is_arm_nudge = (self.is_arm_interacting or self.paused_navigation_goal or (task_name == "NAVIGATE_RELATIVE" and self.last_arm_heartbeat_time is not None))
+                is_arm_nudge = bool(
+                    self.current_task and self.current_task.get("is_arm_inching", False)
+                ) or (self.is_arm_interacting and self.paused_navigation_goal is not None)
                 if is_arm_nudge:
                     self._transition_to(TaskState.WAITING_ARM_PICK, reason="Relative Inching Done. Waiting for Arm.")
                     self.log_success_box(task_name, elapsed)
@@ -1308,6 +1387,7 @@ class TaskManagerNode(Node):
         wp_name = self.current_task.get("waypoint_name", "목표 지점") if self.current_task else "목표 지점"
         action = self.current_task.get("action", "") if self.current_task else ""
         if status == GoalStatus.STATUS_SUCCEEDED:
+            self._clear_rviz_path_and_markers()
             if action == "DOCK":
                 self.log_info(f"Nav2 staging goal reached successfully!")
                 self._report_task_info(f"[대기점 도착] 도킹 대기점에 성공적으로 도착했습니다. 3D 정밀 도킹으로 전환합니다.")
@@ -1401,6 +1481,7 @@ class TaskManagerNode(Node):
             self.obj_standoff_pub.publish(String(data=f"{clearance_m:.2f}"))
             t_query = resolved_task.get("target_name")
             if t_query:
+                self.last_floor_target_name = str(t_query)
                 self.obj_query_pub.publish(String(data=str(t_query)))
             self.log_info(f"🎯 [Floor Object Approach] 바닥 물체 접근 제어기로 제어권을 위임합니다 (목표: {clearance_m*100:.0f}cm, 대상: '{t_query or 'default'}').")
             self._obj_service_called = False
@@ -1527,17 +1608,25 @@ class TaskManagerNode(Node):
             import re
             m_dist = re.search(r"dist=([0-9\.]+)m", self.docker_status_str)
             m_yaw = re.search(r"yaw_err=([+-]?[0-9\.]+)deg", self.docker_status_str)
+            m_dual = re.search(r"dual=([01])", self.docker_status_str)
             if m_dist:
                 d_val = float(m_dist.group(1))
                 if d_val > 0.05:
                     y_val = float(m_yaw.group(1)) if m_yaw else 0.0
+                    is_dual = (m_dual.group(1) == "1") if m_dual else True
+                    
+                    # 마커/스테이션 도킹인 경우 마커 2개가 모두 보여야만 도킹 진입 허용
+                    is_marker_dock = (target_structure in ("marker", "aruco", "box") or "workplace" in target_structure or "station" in target_structure)
+                    if is_marker_dock and not is_dual:
+                        return False, "마커가 1개만 감지됨 (듀얼 마커 2개 모두 검출 필수)", d_val, y_val
+
                     if d_val < 0.15:
                         return False, f"마커 거리가 너무 가깝습니다 ({d_val:.2f}m < 0.15m)", d_val, y_val
                     if d_val > 1.50:
                         return False, f"마커 거리가 너무 멉니다 ({d_val:.2f}m > 1.50m)", d_val, y_val
                     if abs(y_val) > 35.0:
                         return False, f"마커 진입각 편차가 너무 큽니다 ({y_val:+.1f}°)", d_val, y_val
-                    return True, "정상 인식 (마커 텔레메트리 확인)", d_val, y_val
+                    return True, "정상 인식 (듀얼 마커 확인 완료)", d_val, y_val
 
         return False, "카메라 시야에 대상/마커가 감지되지 않음", 0.0, 0.0
 
@@ -1683,17 +1772,21 @@ class TaskManagerNode(Node):
                     done_text += f", id={self.current_cmd_id}"
                 self.task_status_pub.publish(String(data=done_text))
                 
-                # Send /task/ack for robotic arm
-                ack_payload = json.dumps({
-                    "id": self.current_cmd_id or "relative_nav",
-                    "state": "done",
-                    "status": "MOVE_DONE",
-                    "dx_cm": round(dx_local * 100, 1),
-                    "dyaw_deg": round(math.degrees(dyaw_local), 1)
-                }, ensure_ascii=False)
-                self.task_ack_pub.publish(String(data=ack_payload))
-                
-                self.log_info(f"🎯 [Relative Nav Done] Traveled {dx_local*100:.1f}cm (target: {self.rel_target_dist*100:.1f}cm) -> Sent ACK: {ack_payload}")
+                # If this was part of re-approach preparation, skip MOVE_DONE ACK (final ACK will be APPROACH_DONE)
+                if not getattr(self, 'reapproach_pending_approach', False):
+                    # Send /task/ack for robotic arm
+                    ack_payload = json.dumps({
+                        "id": self.current_cmd_id or "relative_nav",
+                        "state": "done",
+                        "status": "MOVE_DONE",
+                        "dx_cm": round(dx_local * 100, 1),
+                        "dyaw_deg": round(math.degrees(dyaw_local), 1)
+                    }, ensure_ascii=False)
+                    self.task_ack_pub.publish(String(data=ack_payload))
+                    self.log_info(f"🎯 [Relative Nav Done] Traveled {dx_local*100:.1f}cm (target: {self.rel_target_dist*100:.1f}cm) -> Sent ACK: {ack_payload}")
+                else:
+                    self.log_info(f"🔄 [재접근 후진 완료] Traveled {dx_local*100:.1f}cm. 시각 재접근 단계로 인계합니다.")
+
                 self._transition_to(TaskState.VERIFYING, reason="Relative Nav Reached via Odom")
                 return
 
@@ -1792,6 +1885,25 @@ class TaskManagerNode(Node):
         ma.markers.append(text)
 
         self.rviz_goal_pub.publish(ma)
+
+    def _clear_rviz_path_and_markers(self):
+        """Erases active Nav2 path lines (/plan, /local_plan) and goal markers from RViz viewport."""
+        try:
+            # 1. Erase Nav2 planned path lines in RViz (/plan, /local_plan)
+            empty_path = Path()
+            empty_path.header.stamp = self.get_clock().now().to_msg()
+            empty_path.header.frame_id = "map"
+            empty_path.poses = []
+            if hasattr(self, 'rviz_plan_pub'):
+                self.rviz_plan_pub.publish(empty_path)
+            if hasattr(self, 'rviz_local_plan_pub'):
+                self.rviz_local_plan_pub.publish(empty_path)
+
+            # 2. Erase goal marker/arrow/text in RViz
+            self._clear_rviz_goal_marker()
+            self.log_info("🧹 [RViz 클리어] RViz 주행 경로선(/plan) 및 목표 마커를 깨끗이 삭제했습니다.")
+        except Exception as e:
+            self.log_warn(f"Failed to clear RViz path and markers: {e}")
 
     def _clear_rviz_goal_marker(self):
         ma = MarkerArray()

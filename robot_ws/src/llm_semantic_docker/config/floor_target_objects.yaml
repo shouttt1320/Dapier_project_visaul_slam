@@ -30,6 +30,7 @@ targets:
     arm_reach_range_m: [0.18, 0.28]  # 로봇팔 작업 유효 거리 (18cm ~ 28cm)
     expected_width_m: 0.045          # 물체 실제 폭 (4.5cm)
     approach_speed_m_s: 0.065        # 순항 접근 속도 (m/s)
+    post_approach_yaw_deg: 10.0      # 접근 완료 후 편향 회전각 (+10.0=좌회전 10도, -10.0=우회전 10도, 0.0=회전안함)
 
   blue_ball:
     canonical_id: "blue_ball"
@@ -49,40 +50,27 @@ targets:
     arm_reach_range_m: [0.18, 0.28]
     expected_width_m: 0.055
     approach_speed_m_s: 0.065
+    post_approach_yaw_deg: -30.0     # 접근 완료 후 편향 회전각 (+10.0=좌회전 10도, -10.0=우회전 10도, 0.0=회전안함)
 
-  black_cube:
-    canonical_id: "black_cube"
-    display_name: "검은 큐브"
+  white_tissue:
+    canonical_id: "white_tissue"
+    display_name: "흰색 휴지"
     aliases:
-      - "black_cube"
-      - "black cube"
-      - "검은 큐브"
-      - "검은큐브"
-      - "검은 큐브로"
-      - "검은 큐브 앞으로"
-      - "검정큐브"
-      - "검정 큐브"
-    standoff_m: 0.25
+      - "white_tissue"
+      - "white tissue"
+      - "tissue"
+      - "휴지"
+      - "흰색 휴지"
+      - "휴지뭉치"
+      - "휴지 뭉치"
+      - "화장지"
+      - "휴지로"
+      - "휴지 앞으로"
+    standoff_m: 0.17
     arm_reach_range_m: [0.18, 0.28]
-    expected_width_m: 0.055
+    expected_width_m: 0.060          # 구겨진 휴지 뭉치 약 6cm 기준
     approach_speed_m_s: 0.065
-  
-  black_rod:
-    canonical_id: "black_rod"
-    display_name: "검은 막대"
-    aliases:
-      - "black_rod"
-      - "black rod"
-      - "검은 막대"
-      - "검은막대"
-      - "검은 막대로"
-      - "검은 막대 앞으로"
-      - "검정막대"
-      - "검정 막대"
-    standoff_m: 0.25
-    arm_reach_range_m: [0.18, 0.28]
-    expected_width_m: 0.055
-    approach_speed_m_s: 0.065
+    post_approach_yaw_deg: 10.0
 
 # 기본 폴백 설정 (YAML에 등록되지 않은 신규 물체 접근 시 적용)
 default_profile:

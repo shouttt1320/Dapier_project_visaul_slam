@@ -52,6 +52,11 @@ if [ ! -f "$CLOUD_PLY" ] || [ "$MAP_DB" -nt "$CLOUD_PLY" ]; then
     echo -e "${GREEN}✔ 3D Point Cloud synchronized: ${CLOUD_PLY}${NC}"
 fi
 
+# Clean up any lingering zombie instances of teacher node or RViz teaching
+pkill -f "interactive_docking_teacher_node" 2>/dev/null || true
+pkill -f "rviz2_teaching" 2>/dev/null || true
+sleep 0.5
+
 # Source ROS 2 Environment
 source /opt/ros/jazzy/setup.bash
 source "${ROBOT_WS}/install/setup.bash"

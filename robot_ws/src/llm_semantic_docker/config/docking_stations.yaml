@@ -3,39 +3,19 @@ stations:
     description: Taught station workplace1 via RViz Gizmo
     frame: map
     standoff:
-      x: 0.7492
-      y: 0.2657
-      yaw_deg: 358.05
+      x: 0.6297
+      y: -0.0139
+      yaw_deg: 354.37
     target_face:
       center:
-      - 1.5287
-      - 0.2391
-      - 0.0864
+      - 1.4259
+      - -0.0924
+      - 0.2034
       size:
-      - 0.215
-      - 0.36
-      - 0.225
+      - 0.35
+      - 0.4
+      - 0.25
       normal:
-      - -0.9994
-      - 0.034
-      - 0.0
-  workplace2:
-    description: Taught station workplace2 via RViz Gizmo
-    frame: map
-    standoff:
-      x: 0.3869
-      y: -0.7108
-      yaw_deg: 269.89
-    target_face:
-      center:
-      - 0.3854
-      - -1.4908
-      - 0.0864
-      size:
-      - 0.215
-      - 0.36
-      - 0.225
-      normal:
-      - 0.0019
-      - 1.0
+      - -0.9952
+      - 0.0981
       - 0.0

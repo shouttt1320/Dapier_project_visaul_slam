@@ -1,22 +1,33 @@
 waypoints:
-  wp1:
-    description: Taught waypoint wp1 via RViz Gizmo
-    x: -0.3859
-    y: 1.8601
-    z: 0.0864
-    yaw_deg: -88.26
+  workplace1:
+    description: Taught station workplace1 standoff waypoint via RViz Gizmo
+    x: 0.6297
+    y: -0.0139
+    z: 0.2034
+    yaw_deg: 354.37
     aliases:
-    - wp1
+    - workplace1
+  waypoint1:
+    description: Taught waypoint waypoint1 via RViz Gizmo
+    x: -0.0213
+    y: -0.1349
+    z: 0.2034
+    yaw_deg: 23.6
+    aliases:
     - waypoint1
-    - 웨이포인트1
-  wp2:
-    description: Taught waypoint wp2 via RViz Gizmo
-    x: 0.0718
-    y: 0.2953
-    z: 0.0864
-    yaw_deg: 0.87
+  거실:
+    description: Taught waypoint 거실 via RViz Gizmo
+    x: -0.4166
+    y: -1.2053
+    z: 0.2133
+    yaw_deg: 62.02
     aliases:
-    - wp2
-    - waypoint2
-    - 웨이포인트2
-
+    - 거실
+  작은방:
+    description: Taught waypoint 작은방 via RViz Gizmo
+    x: 0.244
+    y: -1.086
+    z: 0.2133
+    yaw_deg: 135.74
+    aliases:
+    - 작은방

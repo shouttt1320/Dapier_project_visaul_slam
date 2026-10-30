@@ -27,6 +27,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from geometry_msgs.msg import Twist, TwistStamped, PoseStamped
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Image, CompressedImage, CameraInfo
 from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
@@ -41,7 +42,7 @@ except ImportError:
 
 
 APPROACH_ACTIVE_STATES = (
-    'SEARCH_ALIGN', 'APPROACH_OBJECT', 'FINAL_SETTLE'
+    'SEARCH_ALIGN', 'APPROACH_OBJECT', 'FINAL_SETTLE', 'POST_APPROACH_YAW'
 )
 
 CUSTOM_WEIGHTS_PATH = "/home/jjj/Documents/Dapier/Project/custom_floor_detector_best.pt"
@@ -97,6 +98,10 @@ class ObjectApproachingControllerNode(Node):
         self.crawl_linear_speed = float(self.get_parameter('crawl_linear_speed').value)
         self.max_angular_speed = float(self.get_parameter('max_angular_speed').value)
         self.approach_timeout_sec = float(self.get_parameter('approach_timeout_sec').value)
+
+        # Post-approach grasp orientation bias (+10.0 deg = 10 degrees to the left)
+        self.declare_parameter('post_approach_yaw_deg', 10.0)
+        self.post_approach_yaw_deg = float(self.get_parameter('post_approach_yaw_deg').value)
 
         # Camera Intrinsics (Defaults tailored for Astra S 320x240 resolution)
         self.fx = 285.17
@@ -162,6 +167,13 @@ class ObjectApproachingControllerNode(Node):
         self.target_lock_count: int = 0        # 연속 감지 신뢰도 카운터 (최소 3프레임 락온)
         self.align_stable_count: int = 0       # 조향 정렬 안정화 카운터 (최소 2프레임 확인)
 
+        # Odometry heading & Post-approach bias rotation state
+        self.current_odom_yaw: float = 0.0
+        self.odom_received: bool = False
+        self.post_yaw_start: float = 0.0
+        self.post_yaw_target_delta: float = 0.0
+        self.post_yaw_stable_count: int = 0
+
         # Stats
         self.fps: float = 0.0
         self.yolo_latency_ms: float = 0.0
@@ -207,6 +219,8 @@ class ObjectApproachingControllerNode(Node):
 
         self.create_subscription(String, '/object_approach/target_query', self._on_target_query_cfg, 10)
         self.create_subscription(String, '/object_approach/target_standoff', self._on_standoff_cfg, 10)
+        self.create_subscription(String, '/object_approach/post_yaw_deg', self._on_post_yaw_cfg, 10)
+        self.create_subscription(Odometry, '/odom', self._on_odom, 10)
         self.create_subscription(Bool, self.bumper_topic, self._on_bumper, 10)
         self.create_subscription(Bool, '/safety/software_stop', self._on_software_stop, 10)
 
@@ -304,6 +318,9 @@ class ObjectApproachingControllerNode(Node):
             self._apply_target_profile(q)
 
     def _apply_target_profile(self, query: str):
+        # Dynamically reload YAML so changes take effect without node restart
+        self._load_target_profiles()
+
         # Resolve aliases from YAML
         matched_id = query
         for tgt_id, info in self.target_profiles.items():
@@ -313,8 +330,41 @@ class ObjectApproachingControllerNode(Node):
                 standoff = info.get("standoff_m")
                 if standoff:
                     self.target_standoff_m = float(standoff)
+                yaw_deg = info.get("post_approach_yaw_deg")
+                if yaw_deg is not None:
+                    self.post_approach_yaw_deg = float(yaw_deg)
                 break
-        self.get_logger().info(f"🎯 Target set to '{matched_id}' (Query: '{query}', Standoff: {self.target_standoff_m*100:.1f}cm)")
+        self.get_logger().info(f"🎯 Target set to '{matched_id}' (Query: '{query}', Standoff: {self.target_standoff_m*100:.1f}cm, Post-Yaw: {self.post_approach_yaw_deg:+.1f}°)")
+
+    def _on_odom(self, msg: Odometry):
+        qz = msg.pose.pose.orientation.z
+        qw = msg.pose.pose.orientation.w
+        self.current_odom_yaw = 2.0 * math.atan2(qz, qw)
+        self.odom_received = True
+
+    def _on_post_yaw_cfg(self, msg: String):
+        try:
+            val = float(msg.data.strip())
+            if -45.0 <= val <= 45.0:
+                self.post_approach_yaw_deg = val
+                self.get_logger().info(f"📐 Updated post_approach_yaw_deg to {self.post_approach_yaw_deg:+.1f}°")
+        except Exception:
+            pass
+
+    def _get_current_yaw(self) -> float:
+        if self.odom_received:
+            return self.current_odom_yaw
+        try:
+            t = self.tf_buffer.lookup_transform(
+                'odom', 'base_footprint',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.02)
+            )
+            qz = t.transform.rotation.z
+            qw = t.transform.rotation.w
+            return 2.0 * math.atan2(qz, qw)
+        except Exception:
+            return self.current_odom_yaw
 
     def _on_standoff_cfg(self, msg: String):
         try:
@@ -421,9 +471,9 @@ class ObjectApproachingControllerNode(Node):
         t0 = time.time()
 
         # Decide whether to use Custom YOLO or YOLO-World
-        # During IDLE (patrol/standby): use Custom YOLO to detect ANY trained floor object!
+        # During standby/patrol (not in active approach): use Custom YOLO to detect ANY trained floor object!
         target_norm = self.target_query.lower().strip().replace(" ", "_")
-        if self.state == "IDLE":
+        if self.state not in APPROACH_ACTIVE_STATES:
             use_custom = (self.custom_model is not None)
         else:
             use_custom = False
@@ -467,11 +517,19 @@ class ObjectApproachingControllerNode(Node):
         if not dets:
             return None
 
+        # Exclude black objects to prevent shadow/floor false positives
+        EXCLUDED_TARGETS = {"black_cube", "black_rod", "black cube", "black rod", "black_box", "black box", "stick", "black stick"}
+        dets = [d for d in dets if d[0].lower().replace(" ", "_") not in EXCLUDED_TARGETS and d[0].lower() not in EXCLUDED_TARGETS]
+        if not dets:
+            return None
+
         # Filter candidates:
-        # During IDLE: ALL classes in custom_classes and target_profiles are valid candidates for patrol discovery!
-        if self.state == "IDLE":
-            valid_target_names = {c.lower() for c in self.custom_classes}
+        # During standby/patrol: ALL classes in custom_classes and target_profiles are valid candidates for patrol discovery!
+        if self.state not in APPROACH_ACTIVE_STATES:
+            valid_target_names = {c.lower() for c in self.custom_classes if c.lower() not in EXCLUDED_TARGETS}
             for t_k, p_info in self.target_profiles.items():
+                if t_k.lower() in EXCLUDED_TARGETS:
+                    continue
                 valid_target_names.add(t_k.lower())
                 valid_target_names.add(p_info.get("canonical_id", "").lower())
                 for al in p_info.get("aliases", []):
@@ -483,6 +541,7 @@ class ObjectApproachingControllerNode(Node):
                 valid_target_names.add(p_info.get("canonical_id", "").lower())
                 for al in p_info.get("aliases", []):
                     valid_target_names.add(al.lower())
+            valid_target_names = {vt for vt in valid_target_names if vt not in EXCLUDED_TARGETS}
 
         matched = []
         for d in dets:
@@ -675,8 +734,8 @@ class ObjectApproachingControllerNode(Node):
             pose_msg.pose.position.z = 0.0
             self.target_pose_pub.publish(pose_msg)
 
-            # Check for patrol detection interrupt event (Valid range: 0.45m ~ 1.20m, conf >= 0.65)
-            if self.lens_distance is not None and 0.45 <= self.lens_distance <= 1.20 and self.detected_conf >= 0.65:
+            # Check for patrol detection interrupt event (Valid range: 0.40m ~ 1.20m, conf >= 0.65)
+            if self.lens_distance is not None and 0.40 <= self.lens_distance <= 1.20 and self.detected_conf >= 0.65:
                 self._consecutive_detect_count += 1
                 if self._consecutive_detect_count >= 3 and (now_sec - self._last_event_pub_time) > 2.5:
                     self._last_event_pub_time = now_sec
@@ -842,11 +901,50 @@ class ObjectApproachingControllerNode(Node):
                 self.settle_stable_count += 1
                 if self.settle_stable_count >= 5:
                     final_dist_cm = (self.lens_distance * 100.0) if self.lens_distance is not None else (self.target_standoff_m * 100.0)
+                    if abs(self.post_approach_yaw_deg) >= 0.5:
+                        self.post_yaw_start = self._get_current_yaw()
+                        self.post_yaw_target_delta = math.radians(self.post_approach_yaw_deg)
+                        self.post_yaw_stable_count = 0
+                        direction_str = "좌회전" if self.post_approach_yaw_deg > 0 else "우회전"
+                        self._report_gui(
+                            f"🔄 [각도 보정] 전방 {final_dist_cm:.1f}cm 안착 완료. 파지 최적화를 위해 차체를 {direction_str} {abs(self.post_approach_yaw_deg):.1f}° 편향 회전합니다..."
+                        )
+                        self.transition_to('POST_APPROACH_YAW')
+                        return
+                    else:
+                        self._report_gui(
+                            f"🎉 [접근 완료] {self.detected_class_name} 렌즈 전방 {final_dist_cm:.1f}cm 정지 완료! (로봇팔 작업 준비 완료)"
+                        )
+                        self.transition_to('APPROACHED')
+                        return
+
+        # FSM: POST_APPROACH_YAW (Odometry-based relative yaw bias for robotic arm grasp)
+        elif self.state == 'POST_APPROACH_YAW':
+            twist.linear.x = 0.0
+            cur_yaw = self._get_current_yaw()
+            yaw_traversed = math.atan2(
+                math.sin(cur_yaw - self.post_yaw_start),
+                math.cos(cur_yaw - self.post_yaw_start)
+            )
+            yaw_err = self.post_yaw_target_delta - yaw_traversed
+
+            # Check if rotation is within tolerance (0.85 degrees = 0.0148 rad) or timeout
+            if abs(yaw_err) <= math.radians(0.85) or elapsed > 6.0:
+                self.stop_robot()
+                self.post_yaw_stable_count += 1
+                if self.post_yaw_stable_count >= 3 or elapsed > 6.0:
+                    final_dist_cm = (self.lens_distance * 100.0) if self.lens_distance is not None else (self.target_standoff_m * 100.0)
+                    direction_str = "좌회전" if self.post_approach_yaw_deg > 0 else "우회전"
                     self._report_gui(
-                        f"🎉 [접근 완료] {self.detected_class_name} 렌즈 전방 {final_dist_cm:.1f}cm 정지 완료! (로봇팔 작업 준비 완료)"
+                        f"🎉 [접근 완료] {self.detected_class_name} 전방 {final_dist_cm:.1f}cm 정지 및 {direction_str} {abs(self.post_approach_yaw_deg):.1f}° 정렬 완료! (로봇팔 작업 준비 완료)"
                     )
                     self.transition_to('APPROACHED')
                     return
+            else:
+                self.post_yaw_stable_count = 0
+                w_target = np.clip(1.2 * yaw_err, -0.18, 0.18)
+                min_w = 0.045
+                twist.angular.z = float(math.copysign(max(min_w, abs(w_target)), yaw_err))
 
         # Send command velocity
         self._send_cmd_vel(twist.linear.x, twist.angular.z)
@@ -875,6 +973,7 @@ class ObjectApproachingControllerNode(Node):
             self.cmd_vel_pub.publish(t)
 
     def _srv_start(self, request, response):
+        self._apply_target_profile(self.target_query)
         self.tracked_bbox = None
         self.odom_target_latched = False
         self.odom_target_pos = None
