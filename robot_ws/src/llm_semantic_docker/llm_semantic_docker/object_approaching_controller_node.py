@@ -169,10 +169,18 @@ class ObjectApproachingControllerNode(Node):
 
         # Odometry heading & Post-approach bias rotation state
         self.current_odom_yaw: float = 0.0
+        self.current_odom_x: Optional[float] = None
+        self.current_odom_y: Optional[float] = None
+        self.last_step_odom_x: Optional[float] = None
+        self.last_step_odom_y: Optional[float] = None
         self.odom_received: bool = False
         self.post_yaw_start: float = 0.0
         self.post_yaw_target_delta: float = 0.0
         self.post_yaw_stable_count: int = 0
+
+        # Close-range spike guard & speed ceiling latch
+        self.last_filtered_dist: Optional[float] = None
+        self.is_close_zone_latched: bool = False
 
         # Stats
         self.fps: float = 0.0
@@ -337,10 +345,26 @@ class ObjectApproachingControllerNode(Node):
         self.get_logger().info(f"🎯 Target set to '{matched_id}' (Query: '{query}', Standoff: {self.target_standoff_m*100:.1f}cm, Post-Yaw: {self.post_approach_yaw_deg:+.1f}°)")
 
     def _on_odom(self, msg: Odometry):
+        self.current_odom_x = float(msg.pose.pose.position.x)
+        self.current_odom_y = float(msg.pose.pose.position.y)
         qz = msg.pose.pose.orientation.z
         qw = msg.pose.pose.orientation.w
         self.current_odom_yaw = 2.0 * math.atan2(qz, qw)
         self.odom_received = True
+
+    def _get_odom_step_delta(self) -> float:
+        """Returns forward travel distance since previous control step (m)."""
+        if not self.odom_received or self.current_odom_x is None:
+            return 0.0
+        if self.last_step_odom_x is None or self.last_step_odom_y is None:
+            self.last_step_odom_x = self.current_odom_x
+            self.last_step_odom_y = self.current_odom_y
+            return 0.0
+        step = math.hypot(self.current_odom_x - self.last_step_odom_x,
+                          self.current_odom_y - self.last_step_odom_y)
+        self.last_step_odom_x = self.current_odom_x
+        self.last_step_odom_y = self.current_odom_y
+        return float(step)
 
     def _on_post_yaw_cfg(self, msg: String):
         try:
@@ -717,10 +741,35 @@ class ObjectApproachingControllerNode(Node):
             self.detected_class_name = detection["cls_name"]
             self.detected_conf = detection["conf"]
             self.tracked_bbox = detection["bbox"]
-            self.lens_distance = detection["dist_z"]
+            raw_dist = float(detection["dist_z"])
+
+            # Distance Spike Guard & Proximity Latch
+            odom_step = self._get_odom_step_delta()
+
+            # Latch close proximity zone (< 0.35m)
+            if (raw_dist <= 0.35) or (self.last_filtered_dist is not None and self.last_filtered_dist <= 0.35):
+                self.is_close_zone_latched = True
+
+            if self.last_filtered_dist is not None and self.state in ('APPROACH_OBJECT', 'FINAL_SETTLE'):
+                dist_jump = raw_dist - self.last_filtered_dist
+                # When in close zone or approaching: reject sudden distance inflation (background leak / dead-zone jump)
+                jump_thresh = 0.035 if self.is_close_zone_latched else 0.12
+                if dist_jump > jump_thresh:
+                    # SPIKE REJECTED: use odom forward step subtraction to guarantee smooth advance
+                    self.lens_distance = max(0.0, self.last_filtered_dist - odom_step)
+                    self.depth_source_mode = "[SPIKE-GUARD]"
+                else:
+                    # Smooth tracking filter
+                    alpha = 0.70
+                    self.lens_distance = alpha * raw_dist + (1.0 - alpha) * max(0.0, self.last_filtered_dist - odom_step)
+                    self.depth_source_mode = "[GEOM]" if detection["is_pinhole"] else "[IR 3D]"
+            else:
+                self.lens_distance = raw_dist
+                self.depth_source_mode = "[GEOM]" if detection["is_pinhole"] else "[IR 3D]"
+
+            self.last_filtered_dist = self.lens_distance
             self.lateral_error = detection["y_base"]
             self.heading_error = detection["heading_err"]
-            self.depth_source_mode = "[GEOM]" if detection["is_pinhole"] else "[IR 3D]"
 
             # Update spatial memory in odom
             self._update_odom_memory(detection["x_base"], detection["y_base"])
@@ -752,10 +801,11 @@ class ObjectApproachingControllerNode(Node):
                 self._consecutive_detect_count = max(0, self._consecutive_detect_count - 1)
         else:
             self._consecutive_detect_count = 0
+            odom_step = self._get_odom_step_delta()
             # Spatial memory fallback:
             # If the object was recently close (< 0.40m), it has entered the camera floor blind zone.
-            # Allow extended dead-reckoning (up to 8.0s) to finish the crawl to 25cm standoff!
-            is_close_blind_zone = (self.lens_distance is not None and self.lens_distance < 0.40)
+            # Allow extended dead-reckoning (up to 8.0s) to finish the crawl to target standoff!
+            is_close_blind_zone = (self.lens_distance is not None and self.lens_distance < 0.40) or self.is_close_zone_latched
             mem_timeout = 8.0 if is_close_blind_zone else 3.0
 
             if (now_sec - self.obj_last_seen) < mem_timeout and self.odom_target_latched:
@@ -763,7 +813,12 @@ class ObjectApproachingControllerNode(Node):
                 if odom_res is not None:
                     d_z, bx, by = odom_res
                     self.obj_detected = True
-                    self.lens_distance = d_z
+                    # Bound dead-reckoning distance by last_filtered_dist - odom_step
+                    if self.last_filtered_dist is not None:
+                        self.lens_distance = min(d_z, max(0.0, self.last_filtered_dist - odom_step))
+                    else:
+                        self.lens_distance = d_z
+                    self.last_filtered_dist = self.lens_distance
                     self.lateral_error = by
                     self.heading_error = math.atan2(by, max(0.05, bx))
                     self.depth_source_mode = "[DEAD-RECKONING]" if is_close_blind_zone else "[ODOM MEM]"
@@ -873,9 +928,13 @@ class ObjectApproachingControllerNode(Node):
             yaw_corr = math.atan2(ey, max(0.15, curr_dist + self.astra_x_base))
 
             # 2-Stage Velocity: Cruise (>0.8m) -> Crawl (<0.8m)
-            # In Dead-Reckoning blind zone, lock to crawl speed with minimal angular correction
-            if self.depth_source_mode == "[DEAD-RECKONING]":
+            # In Dead-Reckoning blind zone or close zone, lock to crawl speed with minimal angular correction
+            if self.is_close_zone_latched or self.depth_source_mode in ("[DEAD-RECKONING]", "[SPIKE-GUARD]"):
+                # Close-proximity speed ceiling lock: NEVER exceed crawl speed!
                 v_target = self.crawl_linear_speed
+                # Fine progressive deceleration as we approach final standoff (e.g. final 5cm)
+                if dist_err < 0.05:
+                    v_target = np.clip(0.40 * dist_err + 0.015, 0.020, self.crawl_linear_speed)
                 w_target = np.clip(0.60 * yaw_corr, -0.08, 0.08)  # Minimal yaw perturbations
             elif dist_err > 0.55:
                 v_target = np.clip(0.50 * dist_err, self.crawl_linear_speed, self.max_linear_speed)
@@ -979,6 +1038,10 @@ class ObjectApproachingControllerNode(Node):
         self.odom_target_pos = None
         self.target_lock_count = 0
         self.align_stable_count = 0
+        self.last_filtered_dist = None
+        self.is_close_zone_latched = False
+        self.last_step_odom_x = None
+        self.last_step_odom_y = None
         self.routine_start_time = time.time()
         self.transition_to('SEARCH_ALIGN')
         self._report_gui(f"🚀 [YOLO 접근 가동] 대상: '{self.target_query}' (목표 거리: {self.target_standoff_m*100:.0f}cm)")

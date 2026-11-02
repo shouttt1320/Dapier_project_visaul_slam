@@ -18,21 +18,21 @@ flowchart TD
     end
 
     subgraph PERCEPTION ["실시간 20Hz 비전 인식 (object_approaching_controller_node)"]
-        YOLO["YOLOv8 Fine-Tuned (CUSTOM Engine)<br/>red_cube, blue_ball, black_cube, black_rod"]
+        YOLO["YOLOv8 Fine-Tuned (CUSTOM Engine)<br/>red_cube, blue_ball, white_tissue"]
         YOLO_WORLD["YOLO-World v2 (Open-Vocabulary Fallback)"]
-        HYBRID_DEPTH["하이브리드 3D 뎁스 융합<br/>• Pinhole Ground Geometry (>1.2m)<br/>• Astra S IR 3D Depth (<1.0m)<br/>• Dead-Reckoning Blind Zone (<0.4m)"]
+        HYBRID_DEPTH["하이브리드 3D 뎁스 융합<br/>• Pinhole Ground Geometry (>1.2m)<br/>• Astra S IR 3D Depth (0.4m~1.2m)<br/>• Dead-Reckoning & Spike-Guard (<0.35m)"]
     end
 
     subgraph MISSION ["임무 제어 FSM (task_manager & llm_agent_node)"]
         PATROL["Nav2 웨이포인트 자율 순찰"]
-        INTERRUPT{"바닥 물체 감지?<br/>(0.45m~2.2m, 3프레임 연속)"}
+        INTERRUPT{"바닥 물체 감지?<br/>(0.40m~1.20m, 3프레임 연속)"}
         POPUP["GUI 픽업 승인 대화상자<br/>(PickConfirmationDialog)"]
         RESUME["수거 완료 후 Nav2 복귀"]
     end
 
     subgraph CONTROLLER ["20Hz 닫힌 루프 제어기"]
-        FSM["Approach FSM<br/>SEARCHING ➔ ALIGNING ➔ APPROACHING ➔ SETTLING"]
-        PID["적응형 감속 제어 (P-Deceleration)<br/>Vx = clamp(Kp * error, Vmin, Vmax)<br/>Wz = K_heading * angle + K_lat * Ey"]
+        FSM["Approach FSM<br/>SEARCH_ALIGN ➔ APPROACH_OBJECT ➔ FINAL_SETTLE ➔ POST_YAW"]
+        PID["적응형 감속 제어 (P-Deceleration & Close-Zone Latch)<br/>Vx = clamp(Kp * error, Vmin, Vmax)<br/>Wz = K_heading * angle + K_lat * Ey"]
         CMD_VEL["/cmd_vel (TwistStamped)"]
     end
 
@@ -56,18 +56,18 @@ flowchart TD
 
 ---
 
-## 🔍 2. 하이브리드 3D 거리 측정 알고리즘 (Hybrid Depth Perception)
+## 🔍 2. 하이브리드 3D 거리 측정 및 급발진 방지 알고리즘 (Hybrid Depth & Spike-Guard)
 
-Astra S 카메라의 물리적 특성(IR 뎁스 유효 거리 0.6m~3.0m, 지면 반사 노이즈, 근접 사각지대)을 극복하기 위해 **3단계 하이브리드 기하학 융합**을 사용합니다.
+Astra S 카메라의 물리적 특성(IR 뎁스 유효 거리 0.6m~3.0m, 지면 반사 노이즈, 근접 사각지대)을 극복하고 초근접 거리에서 안전하게 정지하기 위해 **3단계 하이브리드 기하학 융합 + 스파이크 가드**를 적용합니다.
 
 ```text
  ┌─────────────────┬─────────────────┬──────────────────────┐
- │  ~ 0.40m 이하   │  0.40m ~ 1.20m  │     1.20m 이상       │
- │   사각지대 영역 │    안정적 영역  │     원거리 영역      │
+ │  ~ 0.35m 이하   │  0.40m ~ 1.20m  │     1.20m 이상       │
+ │ 근접/사각지대   │   안정적 영역   │     원거리 영역      │
  ├─────────────────┼─────────────────┼──────────────────────┤
- │ 오도메트리 기반 │ Astra S IR 뎁스 │ 단안 지면 핀홀 투영  │
- │ 공간 기억 추정  │ + 지면 기하 융합│ (Pinhole Ground Proj)│
- │ [DEAD-RECKONING]│    [IR 3D]      │       [GEOM]         │
+ │ 스파이크 가드 & │ Astra S IR 뎁스 │ 단안 지면 핀홀 투영  │
+ │ 공간 기억 래칭  │ + 지면 기하 융합│ (Pinhole Ground Proj)│
+ │  [SPIKE-GUARD]  │    [IR 3D]      │       [GEOM]         │
  └─────────────────┴─────────────────┴──────────────────────┘
 ```
 
@@ -80,10 +80,14 @@ $$d_z = \frac{h_{\text{lens}}}{\tan(\alpha + \theta_{\text{pitch}})}$$
 ### 2) 중근거리: Astra S Structured Light 3D 뎁스 (`[IR 3D]`)
 물체가 0.4m ~ 1.2m 구간에 있을 때는 물체 바운딩 박스 중앙 $7\times 7$ 픽셀의 깊이 유효값(IQR 필터링)을 추출하여 1cm 단위의 정확한 거리를 획득합니다.
 
-### 3) 극근거리 블라인드 존: 오도메트리 공간 기억 데드레코닝 (`[DEAD-RECKONING]`)
-로봇이 목표 정지 거리(25cm)까지 접근하면, 카메라 화각 아래(후드 밑)로 물체가 사라지게 됩니다. 
-* 물체 거리가 40cm 이하가 되는 순간 로봇의 마지막 유효 $(X_{\text{odom}}, Y_{\text{odom}})$ 위치를 래칭(Latch)합니다.
-* 영상에서 물체를 놓치더라도 휠 엔코더 적분치를 통해 남은 15cm 거리를 안정적으로 저속(3.5cm/s) 직진 주행하여 목표 거리에서 정확히 멈춥니다.
+### 3) 초근접 사각지대 & 스파이크 가드 (`[SPIKE-GUARD]` & `[DEAD-RECKONING]`)
+로봇이 타겟 정지 거리(`white_tissue`: 13cm, `red_cube`/`blue_ball`: 25cm)까지 접근하면, Astra S의 적외선 프로젝터 사각지대(<0.35m)로 인해 바닥이나 뒷배경 벽면의 먼 깊이 값(0.8m~1.2m)이 물체 영역으로 누출되는 현상이 발생할 수 있습니다. 이를 방어하기 위해 2단계 안전 가드를 탑재했습니다:
+* **`[SPIKE-GUARD]` (거리 점프 기각 및 휠 오도메트리 전진 차감)**:
+  - 근접 구간에서 이전 필터링 거리 대비 거리가 갑자기 증가(양의 점프 > +3.5cm)하는 스파이크 노이즈가 감지되면, 이를 허위 측정으로 즉시 기각합니다.
+  - 대신 실제 로봇 차동 바퀴가 전진한 휠 오도메트리 변위($\Delta d_{\text{odom}}$)를 직전 거리에서 차감(`last_dist - odom_step`)하여 물리적으로 일관된 거리를 보장합니다.
+* **`is_close_zone_latched` (근접 최고속도 락 & 5cm 정밀 점진 감속)**:
+  - 물체와의 거리가 0.35m 이하로 한 번이라도 떨어지면 래치를 걸어, 어떠한 측정값 변동에도 최고 선속도를 크롤 속도($v_{\text{crawl}} = 0.040\,\text{m/s}$) 이하로 강제 제한합니다.
+  - 목표 스탠드오프 도달 5cm 전부터는 최저 $0.020\,\text{m/s}$까지 점진 감속하여 충돌 없이 완벽한 미세 정지를 수행합니다.
 
 ---
 
@@ -94,13 +98,13 @@ $$d_z = \frac{h_{\text{lens}}}{\tan(\alpha + \theta_{\text{pitch}})}$$
 1. **지속적 백그라운드 스캔**:
    - 로봇이 주행 중일 때 `object_approaching_controller_node`가 20Hz로 카메라 영상을 감시합니다.
 2. **신뢰도 연속 검증**:
-   - 일시적인 노이즈나 잘못된 검출을 방지하기 위해 **거리 $0.45\text{m} \sim 2.20\text{m}$**, **신뢰도 $0.65$ 이상**으로 **최소 3프레임 연속 감지**되었을 때만 이벤트를 발생시킵니다.
+   - 일시적인 노이즈나 잘못된 검출을 방지하기 위해 **거리 $0.40\text{m} \sim 1.20\text{m}$**, **신뢰도 $0.65$ 이상**으로 **최소 3프레임 연속 감지**되었을 때만 이벤트를 발생시킵니다.
 3. **Nav2 주행 즉각 취소 & 모터 정지**:
    - 조건 충족 시 `/floor_object/detected_event` 토픽이 발행됩니다.
    - `task_manager`가 현재 Nav2 자율주행 목표(Goal)를 일시정지하고 로봇을 제자리에 멈춥니다.
 4. **GUI 사용자 승인 대화상자**:
    - `PickConfirmationDialog` 창이 뜨며 발견된 물체 이름, 거리, 사진과 함께 승인 대기 카운트다운(15초)을 시작합니다.
-   - **승인(Approve)**: 물체 정밀 접근 서보잉을 시작하여 25cm 앞까지 이동.
+   - **승인(Approve)**: 물체 정밀 접근 서보잉을 시작하여 타겟별 목표 정지 거리(`white_tissue`: 13cm, `red_cube`/`blue_ball`: 25cm) 앞까지 이동.
    - **건너뛰기(Skip)**: 물체를 무시하고 원래 목적지로 Nav2 주행 복귀.
 
 ---
@@ -110,25 +114,30 @@ $$d_z = \frac{h_{\text{lens}}}{\tan(\alpha + \theta_{\text{pitch}})}$$
 ```mermaid
 stateDiagram-v2
     [*] --> IDLE
-    IDLE --> SEARCHING: 접근 명령 수신
-    SEARCHING --> ALIGNING: 타겟 3프레임 락온
-    ALIGNING --> APPROACHING: 조향 오차 < ±2°
-    APPROACHING --> SETTLING: 목표 거리 (25cm) 도달
-    SETTLING --> SUCCESS: 속도 0 & 안정 정지 확인
-    SUCCESS --> [*]: 로봇팔 수거 대기
+    IDLE --> SEARCH_ALIGN: 접근 명령 수신
+    SEARCH_ALIGN --> APPROACH_OBJECT: 타겟 3프레임 락온 & 조향 정렬
+    APPROACH_OBJECT --> FINAL_SETTLE: 목표 거리 (13cm or 25cm) 도달
+    FINAL_SETTLE --> POST_YAW: 속도 0 안정 확인 후 파지 각도 편향 회전
+    POST_YAW --> SUCCESS: 각도 편향 회전 완료 (+10° / -30°)
+    SUCCESS --> [*]: 로봇팔 수거 대기 (/task/ack 발행)
 
-    SEARCHING --> ABORTED: 4초간 미발견
-    APPROACHING --> ABORTED: E-STOP / 범퍼 충돌
+    SEARCH_ALIGN --> ABORTED: 타임아웃 / 미발견
+    APPROACH_OBJECT --> ABORTED: E-STOP / 범퍼 충돌
 ```
 
-* **`ALIGNING`**: 전진하지 않고 제자리에서 회전하여 타겟이 카메라 정중앙($|E_y| < 2\text{cm}$)에 오도록 각도를 정렬합니다.
-* **`APPROACHING`**:
-  - 부드러운 P-감속 제어를 적용합니다:
-    $$v_x = \text{clamp}(K_p \cdot (d_z - d_{\text{target}}), 0.035, 0.065)\quad [\text{m/s}]$$
-    $$\omega_z = K_{\text{heading}} \cdot \theta_{\text{err}} + K_{\text{lat}} \cdot E_y\quad [\text{rad/s}]$$
-  - 거리가 좁혀질수록 자연스럽게 감속하여 급정거로 인한 차체 흔들림을 원천 차단합니다.
-* **`SETTLING`**: 25cm에 도달하면 속도를 0으로 유지하고 0.5초간 대기하며 완전히 정지했는지 확인합니다.
-* **`SUCCESS`**: GUI에 수거 알림을 띄우고, 로봇팔 수거 완료 신호(`PICK_COMPLETED`)를 기다립니다.
+* **`SEARCH_ALIGN`**: 제자리 회전하여 타겟이 카메라 정중앙($|E_y| < 2\text{cm}$)에 오도록 각도를 정렬합니다.
+* **`APPROACH_OBJECT`**:
+  - 적응형 P-감속 및 근접 구역 속도 캡을 적용합니다:
+    - 원거리($d_{\text{err}} > 0.55\text{m}$): $v_x = \text{clamp}(0.50 \cdot d_{\text{err}}, 0.040, 0.065)\,\text{m/s}$
+    - 근접 래칭 구역($d \le 0.35\text{m}$): $v_{\text{max}} = 0.040\,\text{m/s}$, 종단 5cm에서 $v_x = \text{clamp}(0.40 \cdot d_{\text{err}} + 0.015, 0.020, 0.040)\,\text{m/s}$
+    - $\omega_z = K_{\text{heading}} \cdot \theta_{\text{err}} + K_{\text{lat}} \cdot E_y$
+* **`FINAL_SETTLE`**: 목표 거리 도달 시 속도를 0으로 유지하고 5프레임 이상 정적 안정을 확인합니다.
+* **`POST_YAW` (파지 최적화 편향 회전)**:
+  - 안착 완료 후 로봇팔 그리퍼의 기구적 파지 방향 정렬을 위해 타겟 프로파일(`floor_target_objects.yaml`)에 지정된 편향 각도로 자동 제자리 회전합니다:
+    - `white_tissue`: **좌회전 +10.0°**
+    - `red_cube`: **좌회전 +10.0°**
+    - `blue_ball`: **우회전 -30.0°**
+* **`SUCCESS`**: 회전 완료 후 로봇팔 제어기로 `/task/ack` `{"status": "APPROACH_DONE"}` 신호를 발행하고 팔의 수거 완료(`PICK_DONE`)를 대기합니다.
 
 ---
 

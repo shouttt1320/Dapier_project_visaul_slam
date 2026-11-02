@@ -31,7 +31,7 @@
 | **비전 센서** | **Orbbec Astra S** (RGB-D Depth Camera) | 3D 포인트클라우드 Visual SLAM, ArUco 도킹, 바닥 물체 실시간 검출 |
 | **카메라 기하학** | 높이: **14.7cm** (`0.147m`), 피치각: **+4.2°** | 캘리브레이션된 단안 핀홀 기하학 및 지면 투영 거리 추정 |
 | **접촉 센서** | **전면 마이크로스위치 범퍼 센서** (GPIO 연동) | 최종 도킹 접촉 감지 및 전진 긴급 차단 안전장치 |
-| **도킹 마커** | **Dual ArUco Markers** (`DICT_4X4_50`) | ID: Left #7, Right #19 (마커 변 50mm, 간격 150mm) |
+| **도킹 마커** | **Dual ArUco Markers** (`DICT_4X4_50`) | ID: Left #0, Right #1 (마커 변 60mm, 간격 150mm) |
 | **제어 워크스테이션** | **Ubuntu 24.04 LTS (x86_64)** PC (RTX 5050 GPU) | RTAB-Map SLAM, Nav2, Qwen2.5-VL VLM, YOLOv8 20Hz 추론, 미션 GUI |
 | **통신 환경** | **Wi-Fi 무선 네트워크 (`ROS_DOMAIN_ID=101`)** | ROS 2 DDS 분산 통신 (시간 동기화 오차 5ms 이내 관리) |
 
@@ -76,7 +76,7 @@ Project/
 ├── remote_start_robot.sh           # [유틸] 라즈베리파이 로봇 노드 SSH 원격 기동 (모터/카메라/압축)
 ├── remote_stop_robot.sh            # [유틸] 라즈베리파이 구동 프로세스 원격 긴급 정지
 ├── run_teleop.py / run_teleop.sh   # [제어] TwistStamped 호환 키보드 수동 주행 툴
-├── custom_floor_detector_best.pt   # [AI 모델] 바닥 물체 검출용 fine-tuned YOLOv8 가중치 (4개 클래스)
+├── custom_floor_detector_best.pt   # [AI 모델] 바닥 물체 검출용 fine-tuned YOLOv8 가중치 (3개 클래스: red_cube, blue_ball, white_tissue)
 ├── my_office_3d.db                 # [데이터] RTAB-Map 3D 공간 데이터베이스 지도
 ├── my_office_map.pgm / .yaml       # [데이터] 2D Occupancy Grid 격자 지도
 │
@@ -191,8 +191,8 @@ RViz 상에서 대화형 3D 기즈모(큐브)를 마우스로 조작하여 도�
   8. 미션 컨트롤 다크테마 콕핏 GUI (`qwen_semantic_gui_node`)
 * **GUI 주요 기능**:
   - **카메라 뷰포트**: 20Hz 실시간 스트림, 타겟 Bounding Box, 거리(Z), 좌우 편차(Ey), FPS 표시.
-  - **자연어 명령 입력창**: `"workplace1으로 가줘"`, `"빨간 큐브 앞으로 가"`, `"검은 막대 접근"`, `"우회전 30도"` 등 입력 시 LLM 자동 해석 및 실행.
-  - **퀵 액션 프리셋**: `[🔴 빨간 큐브]`, `[🔵 파란 공]`, `[⬛ 검은 큐브]`, `[🥢 검은 막대]`, `[🎯 마커 도킹]` 원클릭 버튼.
+  - **자연어 명령 입력창**: `"workplace1으로 가줘"`, `"빨간 큐브 앞으로 가"`, `"흰색 휴지 접근"`, `"40cm 전진하고, waypoint1 갔다가, workplace1 도킹해"` 등 단일 및 다중 복합 시퀀스 LLM 자동 해석 및 순차 실행.
+  - **퀵 액션 프리셋**: `[🔴 빨간 큐브]`, `[🔵 파란 공]`, `[🧻 흰색 휴지]`, `[🎯 마커 도킹]` 원클릭 버튼.
   - **기즈모 도킹 선택기**: 티칭된 스테이션 목록 드롭다운 선택 후 즉시 자율주행 $\to$ 정밀 도킹 연계.
 
 ---
@@ -207,15 +207,17 @@ GUI나 지능 도킹 없이 순수 Nav2 3D 주행 기능만 단독으로 테스�
 
 ## 5. 바닥 타겟 물체 접근 시스템 (Floor Object Approach Architecture)
 
-바닥에 놓인 작은 물체(큐브, 공, 막대 등)를 발견하고 25cm 앞까지 cm 단위로 정밀하게 감속 접근하는 시스템입니다.
+바닥에 놓인 작은 물체(큐브, 공, 휴지 등)를 발견하고 목표 거리(`white_tissue`: 13cm, `red_cube`/`blue_ball`: 25cm) 앞까지 cm 단위로 정밀 감속 접근 후 파지 각도로 편향 회전하는 시스템입니다.
 
 * **자율주행 순찰 중 자동 발견 인터럽트 (Patrol Intercept)**:
-  - 로봇이 웨이포인트 주행 중 전방 $0.45\text{m} \sim 2.20\text{m}$에서 신뢰도 $0.65$ 이상으로 물체를 3프레임 연속 감지하면 Nav2 주행을 즉시 멈추고 팝업 확인창(`PickConfirmationDialog`)을 띄웁니다.
+  - 로봇이 웨이포인트 주행 중 전방 $0.40\text{m} \sim 1.20\text{m}$에서 신뢰도 $0.65$ 이상으로 물체를 3프레임 연속 감지하면 Nav2 주행을 즉시 멈추고 팝업 확인창(`PickConfirmationDialog`)을 띄웁니다.
   - 사용자 승인 시 정밀 접근 모드로 전환, 건너뛰기 시 원래 주행 목적지로 복귀합니다.
-* **하이브리드 3D 거리 측정 (Hybrid Depth Perception)**:
+* **하이브리드 3D 거리 측정 & 스파이크 가드 (Hybrid Depth & Spike-Guard)**:
   - **> 1.2m (원거리)**: 단안 지면 핀홀 기하학(Pinhole Ground-Contact Geometry) 및 카메라 물리 피치각(+4.2°) 역투영 계산.
   - **0.4m ~ 1.2m (중근거리)**: Astra S 적외선 Structured Light 3D 뎁스 센서 융합.
-  - **< 0.4m (블라인드존)**: 카메라 후드 아래로 물체가 사라져도 오도메트리 공간 기억(Dead-Reckoning)을 활용해 25cm 스탠드오프 지점까지 오차 없이 부드럽게 감속 접근.
+  - **< 0.35m (근접/사각지대)**: IR 사각지대의 배경 깊이 누출로 인한 급발진을 막는 **`[SPIKE-GUARD]`**(거리 점프 기각 및 휠 오도메트리 전진 차감 적분)와 **`is_close_zone_latched`**(최고속도 0.040 m/s 락 및 종단 5cm 점진 감속)를 통해 안전 정지.
+* **접근 완료 후 파지 최적화 편향 회전**:
+  - 타겟별 그리퍼 파지 각도(`white_tissue`: +10°, `red_cube`: +10°, `blue_ball`: -30°)에 맞춰 자동 제자리 회전 완료 후 로봇팔로 수거 개시(`/task/ack`) 신호 전송.
 
 > 📖 상세 수학 모델과 FSM 구조는 [docs/floor_object_approach_system.md](file:///home/jjj/Documents/Dapier/Project/docs/floor_object_approach_system.md)를 참고하세요.
 
@@ -249,14 +251,16 @@ python3 tools/yolo_training/test_floor_object_detector.py
 ## 7. 주요 노드 및 기술 사양 (Core Architecture)
 
 * **`object_approaching_controller_node.py`**:
-  - 20Hz 닫힌 루프(Closed-loop) 제어로 차체 중심과 타겟 간의 횡방향 편차($E_y$)를 보정하고 P-감속 곡선을 통해 25cm 목표 거리에 정확히 안착.
+  - 20Hz 닫힌 루프(Closed-loop) 제어로 차체 중심과 타겟 간의 횡방향 편차($E_y$) 보정, `[SPIKE-GUARD]` 급발진 차단, 근접 락(0.040 m/s) 및 목표 거리 정밀 안착 후 파지 편향 회전.
   - ROS 2 Jazzy 사양 `geometry_msgs/msg/TwistStamped` 발행 (`frame_id='base_footprint'`).
 * **`task_manager.py`**:
-  - `NAVIGATING`, `AWAITING_PICK_CONFIRMATION`, `OBJECT_APPROACHING`, `DOCKING`, `PICK_COMPLETED` 등 8단계 FSM 총괄.
+  - `NAVIGATING`, `AWAITING_PICK_CONFIRMATION`, `WAITING_ARM_PICK`, `APPROACHING`, `DOCKING` 등 FSM 총괄.
+  - **다중 명령 큐 (`task_queue`)**: 복합 자연어 명령을 FIFO 대기열에 적재하여 선행 작업 완료 시 후속 작업을 연속 자동 디스패치.
+  - **로봇팔 와치독 스코프 가드**: 로봇팔 하트비트 감시를 로봇팔 작업/미세이동 중에만 한정하여 일반 주행의 안전성 보장.
 * **`llm_agent_node.py`**:
-  - 로컬 Ollama (`qwen2.5:3b`)와 연동하여 사용자 자연어 명령을 Pydantic v2 안전 스키마로 파싱.
+  - 로컬 Ollama (`qwen2.5:3b`)와 연동하여 사용자 자연어 명령을 단일 작업 또는 `tasks` 복합 시퀀스 배열로 실시간 파싱.
 * **`precision_docking_controller_node.py`**:
-  - Dual ArUco 마커(#7, #19)를 동시에 추적하여 $\pm 1^\circ$, $\pm 1\text{cm}$ 오차로 초정밀 도킹 및 하드웨어 마이크로스위치 범퍼 물리 접촉 감지.
+  - Dual ArUco 마커(ID 0, ID 1 페어, 60mm) 동시 추적, 도킹 진입 타당성(Feasibility) 듀얼 마커 검증, 3.0cm/s 정밀 크롤 및 마이크로스위치 범퍼 물리 접촉 감지.
 
 ---
 

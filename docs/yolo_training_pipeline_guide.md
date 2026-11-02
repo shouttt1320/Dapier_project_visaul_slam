@@ -25,17 +25,17 @@ Astra S 카메라의 실시간 영상 스트림을 보면서 다양한 각도, �
 ### 실행 방법
 ```bash
 # 기본 실행 (Project 루트에서 실행 권장)
-python3 tools/yolo_training/collect_yolo_dataset.py --label black_cube
+python3 tools/yolo_training/collect_yolo_dataset.py --label white_tissue
 
-# 또는 특정 출력 폴더 지정
-python3 tools/yolo_training/collect_yolo_dataset.py --output dataset_capture --label black_rod
+# 또는 특정 출력 폴더 지정 및 비디오 슬라이싱 시 블러 필터링 스킵
+python3 tools/yolo_training/collect_yolo_dataset.py --output dataset_capture --label white_tissue --blur-thresh 0.0
 ```
 
 ### 주요 기능 및 단축키
 * **`[SPACE]` (수동 캡처)**: 현재 프레임을 즉시 캡처하여 저장합니다.
 * **`[A]` (인터벌 자동 캡처 ON/OFF)**: 0.8초 간격으로 로봇 또는 물체를 조금씩 움직이며 자동으로 연속 캡처합니다.
-* **`[V]` (동영상 녹화 ON/OFF)**: 실시간 동영상(`.mp4`)으로 녹화합니다. 녹화 종료 시 블러(흐림) 필터링이 자동 적용되어 선명한 프레임만 이미지로 추출됩니다.
-* **`[TAB]` (라벨 순환 변경)**: `red_cube` $\to$ `blue_ball` $\to$ `black_cube` $\to$ `black_rod` 등 등록된 클래스를 실시간 전환합니다.
+* **`[V]` (동영상 녹화 ON/OFF)**: 실시간 동영상(`.mp4`)으로 녹화합니다. 녹화 종료 시 블러(흐림) 필터링이 자동 적용되어 선명한 프레임만 이미지로 추출됩니다. (실내 저조도 시 `--blur-thresh 0.0`을 주어 전체 프레임을 보존할 수 있습니다.)
+* **`[TAB]` (라벨 순환 변경)**: `red_cube` $\to$ `blue_ball` $\to$ `white_tissue` 등 등록된 클래스를 실시간 전환합니다.
 * **`[C]` (새 클래스 이름 입력)**: 터미널에서 새로운 라벨 이름을 즉시 입력하여 추가합니다.
 * **`[Q]` 또는 `[ESC]`**: 수집기를 종료합니다.
 
@@ -66,7 +66,7 @@ python3 tools/yolo_training/auto_label_dataset.py \
 * **우클릭 즉시 삭제**: 잘못 그려진 박스 위에서 마우스 우클릭 시 해당 박스만 즉시 삭제됩니다.
 * **단축키**:
   - `[SPACE]` 또는 `[ENTER]`: 현재 라벨 승인 및 다음 이미지 이동.
-  - `[0], [1], [2], [3]`: 활성 클래스 전환 (0: red_cube, 1: blue_ball, 2: black_cube, 3: black_rod).
+  - `[0], [1], [2]`: 활성 클래스 전환 (0: red_cube, 1: blue_ball, 2: white_tissue).
   - `[Z]`: 마지막 작업 실행 취소 (Undo).
   - `[D]`: 현재 이미지의 모든 박스 전체 삭제.
   - `[B]`: 이전 이미지로 되돌아가기.
@@ -122,23 +122,26 @@ python3 tools/yolo_training/test_floor_object_detector.py
 ### 등록 예시
 ```yaml
 targets:
-  black_cube:
-    canonical_id: "black_cube"
-    display_name: "검은 큐브"
+  white_tissue:
+    canonical_id: "white_tissue"
+    display_name: "흰색 휴지"
     aliases:
-      - "black_cube"
-      - "black cube"
-      - "검은 큐브"
-      - "검은큐브"
-      - "검정 큐브"
-      - "검은 상자"
-    standoff_m: 0.25                # 목표 최종 접근 정지 거리 (25cm)
+      - "white_tissue"
+      - "white tissue"
+      - "tissue"
+      - "휴지"
+      - "흰색 휴지"
+      - "휴지뭉치"
+      - "화장지"
+      - "휴지로"
+    standoff_m: 0.13                # 목표 최종 접근 정지 거리 (휴지 파지 최적화 13cm)
     arm_reach_range_m: [0.18, 0.28]  # 로봇팔 작업 유효 거리 (18~28cm)
-    expected_width_m: 0.055          # 실제 물리적 폭 (5.5cm)
+    expected_width_m: 0.060          # 실제 물리적 폭 (약 6cm)
     approach_speed_m_s: 0.065        # 접근 순항 선속도 (m/s)
+    post_approach_yaw_deg: 10.0      # 접근 완료 후 편향 회전각 (+10.0=좌회전 10도)
 ```
 
 등록 후 `colcon build --packages-select llm_semantic_docker`를 1회 실행해주시면 `./3_start_nav_docker.sh`에서 다음 기능이 즉시 활성화됩니다:
-1. **자연어 명령 인식**: `"검은 큐브 앞으로 가줘"`, `"black_cube 접근"` 등 음성/채팅 명령 지원.
-2. **자율주행 중 자동 발견**: Nav2 순찰 주행 중 전방 2m 이내에 발견 시 주행을 멈추고 픽업 여부 승인 창 팝업.
-3. **정밀 비주얼 서보잉**: 25cm 스탠드오프 지점까지 오차 $\pm 2\text{cm}$ 이내로 자동 정밀 감속 접근.
+1. **자연어 명령 인식**: `"휴지 앞으로 가줘"`, `"white_tissue 접근"` 등 음성/채팅 명령 지원.
+2. **자율주행 중 자동 발견**: Nav2 순찰 주행 중 전방 0.40m~1.20m 이내에 발견 시 주행을 멈추고 픽업 여부 승인 창 팝업.
+3. **정밀 비주얼 서보잉**: 타겟별 지정 거리(13cm 또는 25cm) 지점까지 스파이크 가드가 적용되어 충돌 없이 자동 정밀 감속 접근 및 편향 회전 수행.

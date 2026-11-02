@@ -66,7 +66,7 @@ targets:
       - "화장지"
       - "휴지로"
       - "휴지 앞으로"
-    standoff_m: 0.17
+    standoff_m: 0.13
     arm_reach_range_m: [0.18, 0.28]
     expected_width_m: 0.060          # 구겨진 휴지 뭉치 약 6cm 기준
     approach_speed_m_s: 0.065

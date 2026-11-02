@@ -399,6 +399,8 @@ class TaskManagerNode(Node):
             elif status in ("PICK_DONE", "PICK_COMPLETED", "SUCCESS", "ACTION_DONE", "DOCK_TASK_DONE", "TASK_DONE", "DONE"):
                 self.log_info(f"🤖 [/sweepick/ready] 로봇팔 작업 완료({status})! 자율주행/다음 작업을 재개합니다.")
                 self.is_arm_interacting = False
+                self.is_arm_inching = False
+                self.last_arm_heartbeat_time = None
                 self.reapproach_count = 0
                 self._resume_paused_navigation()
             elif status in ("REAPPROACH", "RETRY_APPROACH", "RE_APPROACH"):
@@ -413,6 +415,8 @@ class TaskManagerNode(Node):
             elif status in ("NOT_REACHABLE", "NO_OBJECT", "LIMIT"):
                 self.log_warn(f"⚠️ [/sweepick/ready] 로봇팔 불가 상태({status}) 수신! 작업을 건너뛰고 주행 재개합니다.")
                 self.is_arm_interacting = False
+                self.is_arm_inching = False
+                self.last_arm_heartbeat_time = None
                 self._reject_pick_and_resume_navigation(reason=f"Arm reported {status}")
         except Exception as e:
             self.log_warn(f"Failed to parse /sweepick/ready: {e}")
@@ -1092,12 +1096,12 @@ class TaskManagerNode(Node):
         status_msg.data = f"STATE={self.state.value}, task={task_name}, target={target_name}, bumper={self.bumper_contact}"
         self.task_status_pub.publish(status_msg)
 
-        # Check external arm heartbeat watchdog if active
-        if self.last_arm_heartbeat_time is not None:
+        # Check external arm heartbeat watchdog only during active arm interaction / arm-directed inching
+        if self.last_arm_heartbeat_time is not None and getattr(self, 'is_arm_interacting', False):
             if time.time() - self.last_arm_heartbeat_time > self.arm_heartbeat_timeout_sec:
-                if self.active_relative_nav or self.state in (TaskState.NAVIGATING, TaskState.APPROACHING):
-                    self.log_error(f"🚨 [WATCHDOG] Arm heartbeat lost (> {self.arm_heartbeat_timeout_sec:.1f}s)! Triggering E-STOP.")
-                    self.trigger_software_stop(reason="Arm heartbeat timeout")
+                if self.active_relative_nav and getattr(self, 'is_arm_inching', False):
+                    self.log_error(f"🚨 [WATCHDOG] Arm heartbeat lost (> {self.arm_heartbeat_timeout_sec:.1f}s) during arm inching! Triggering E-STOP.")
+                    self.trigger_software_stop(reason="Arm heartbeat timeout during arm inching")
                 self.last_arm_heartbeat_time = None
 
         if self.state == TaskState.IDLE:

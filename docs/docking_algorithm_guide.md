@@ -44,8 +44,8 @@
 * **현상**: 작업대 $30\text{cm}$ 이내로 진입하면 카메라 화각(FOV)에서 마커가 잘리거나 깊이 측정이 불가능해져 시각 정보만으로는 5cm 이내 밀착 불가.
 * **해결 (38cm Standoff + 접촉 센서 직진 크롤)**:
   * 마커 시각 정보가 가장 정밀한 **38cm(Standoff)** 지점에서 로봇을 완전히 멈추고 최종 오차를 정적 검증.
-  * 검증 통과 시 카메라를 끄고, **IMU 자이로 헤딩 락($w_z \to 0$)** 상태에서 **마이크로스위치 접촉 센서(Bumper)**를 켜고 미속($4.5\text{cm/s}$)으로 직진.
-  * 범퍼가 작업대에 닿는 순간 즉시 하드 브레이크를 작동시켜 **작업대 앞 5cm 이내 밀착 완료**.
+  * 검증 통과 시 카메라를 끄고, **IMU 자이로 헤딩 락($w_z \to 0$)** 상태에서 **마이크로스위치 접촉 센서(Bumper)**를 켜고 미속($3.0\text{cm/s}$, `crawl_speed: 0.030`)으로 직진.
+  * 범퍼가 작업대에 닿는 순간 즉시 하드 브레이크를 작동시켜 **작업대 앞 5cm 이내(최종 클리어런스 4cm) 밀착 완료**.
 
 ---
 
@@ -72,7 +72,14 @@
 ### [Issue 6] 전방 유도점 추종 시 전진 속도 프로파일 최적화
 * **현상**: 전방 유도점을 향해 직선 전진할 때 초기 속도가 너무 느리거나 도착 지점에서 급격한 감속으로 관성 충격 발생.
 * **해결 (Smoothstep 거리 비례 감속 제어)**:
-  * 초기 $5.0\text{cm/s}$ 순항 속도에서 유도점에 가까워질수록 $2.5\text{cm/s}$로 부드럽게 감속하는 S-커브 스무스스텝 프로파일 구현.
+  * 초기 $5.0\text{cm/s}$ 순항 속도에서 유도점에 가까워질수록 $3.0\text{cm/s}$로 부드럽게 감속하는 S-커브 스무스스텝 프로파일 구현.
+
+---
+
+### [Issue 7] 단일 마커 오인식 방지 및 듀얼 마커(ID 0 & 1) 동시 검출 필수 가드
+* **현상**: 작업대 도킹 스테이션 진입 시 마커 1개만 검출된 상태에서 포즈를 추정하면 횡방향 거리 및 수직각 왜곡으로 인해 진입 궤적이 크게 흔들릴 위험 존재.
+* **해결 (Task Manager 도킹 사전 타당성 Feasibility 검증)**:
+  * `task_manager`의 도킹 진입 평가 시, `/docking/status` 텔레메트리의 `dual` 플래그를 검사하여 **듀얼 마커(ID 0, ID 1 페어) 2개가 모두 시야에 확보(`dual=1`)되었을 때만** 정밀 도킹 FSM 진입을 최종 승인. 마커가 1개만 보일 경우 안전을 위해 진입을 거부하고 제자리에서 대기.
 
 ---
 
@@ -91,7 +98,7 @@ flowchart TD
     
     CARROT -->|"거리 ≤ 38cm 도착"| SETTLE2["<b>STANDOFF_SETTLE</b><br/>0.3초 정지 안정화<br/>최종 허용 오차 검증"]
     
-    SETTLE2 -->|"ey ≤ 2.5cm & yaw ≤ 3.5° 통과"| CRAWL["<b>CRAWL_CONTACT</b><br/>자이로 락 직진 크롤<br/>(4.5 cm/s)"]
+    SETTLE2 -->|"ey ≤ 2.5cm & yaw ≤ 3.5° 통과"| CRAWL["<b>CRAWL_CONTACT</b><br/>자이로 락 직진 크롤<br/>(3.0 cm/s)"]
     SETTLE2 -->|"허용 오차 초과 (2.0초 경과 시)"| BACKUP
     
     subgraph REVERSE_SEQUENCE ["가상 후진 유도점 3단계 제어 (시각 차단 / IMU + Odom)"]
@@ -111,16 +118,16 @@ flowchart TD
 
 | 단계 (State) | 진입 조건 (Entry) | 로봇 제어 행동 (Action) | 사용 센서 | 완료 및 전환 조건 (Transition) |
 |:---:|---|---|:---:|---|
-| **`NAV2_READY`** | 시스템 기동 또는 복귀 완료 | 속도 0 정지 대기 ($v=0, w=0$) | TF, 마커 탐색 | $d \le 1.00\text{m}$ 및 마커 검출 시 $\to$ `CHECK_STAGING` |
+| **`NAV2_READY`** | 시스템 기동 또는 복귀 완료 | 속도 0 정지 대기 ($v=0, w=0$) | TF, 마커 탐색 | $d \le 1.00\text{m}$ 및 **듀얼 마커(ID 0 & 1) 동시 검출** 시 $\to$ `CHECK_STAGING` |
 | **`CHECK_STAGING`** | 1.0m 이내 안정적 진입 | 거리 및 카메라 화각 적절성 평가 | Depth / RGB | • $d < 35\text{cm}$ 시 $\to$ `BACKUP_STANDOFF`<br>• 정상 범위 시 $\to$ `STAGING_SETTLE` |
 | **`STAGING_SETTLE`** | Staging 진입 또는 후진 완료 | 차체 진동 소멸 대기 (**$0.3\text{초}$ 초고속 정지**)<br>정적 $e_y$ 측정 및 **전방 가상 유도점 래칭** | Depth / RGB | $0.3\text{초}$ 경과 후 목표 각도 산출 완료 시 $\to$ `STAGING_AIM` |
 | **`STAGING_AIM`** | `STAGING_SETTLE` 완료 | 제자리 회전 ($v_x=0.0$)<br>$w_z = \text{clamp}(0.70 \times e_{\text{aim}}, -0.18, +0.18)$ | **IMU 자이로**<br>(시각 차단) | 목표 각도 오차 $\le 2.0^\circ$ 도달 시 $\to$ `CARROT_ALIGN` |
-| **`CARROT_ALIGN`** | 전진 조향 정렬 완료 | Pure Pursuit 가상 유도점 추종 전진<br>• 거리 기반 Smoothstep 감속 ($5.0 \to 2.5\text{cm/s}$) | Depth/RGB/Odom | $d \le 0.38\text{m}$ (38cm Standoff) 도달 시 $\to$ `STANDOFF_SETTLE` |
+| **`CARROT_ALIGN`** | 전진 조향 정렬 완료 | Pure Pursuit 가상 유도점 추종 전진<br>• 거리 기반 Smoothstep 감속 ($5.0 \to 3.0\text{cm/s}$) | Depth/RGB/Odom | $d \le 0.38\text{m}$ (38cm Standoff) 도달 시 $\to$ `STANDOFF_SETTLE` |
 | **`STANDOFF_SETTLE`** | 38cm 대기 구역 도착 | 완전 정지 (**$0.3\text{초}$ 진동 소멸 대기**)<br>최종 정밀 허용 오차 정적 평가 | Depth / RGB | • $\|e_y\| \le 2.5\text{cm}$ & $\|e_\theta\| \le 3.5^\circ$ (3회 연속) $\to$ `CRAWL_CONTACT`<br>• **2.0초 불만족 시 즉시** $\to$ `BACKUP_STANDOFF` |
 | **`BACKUP_STANDOFF`<br>(Phase 1: BACK_AIM)** | Standoff 오차 초과 판정 | 제자리 회전 ($v_x=0.0$)<br>가상 후진 유도점을 향해 $\Delta\theta_{\text{rev}}$ 회전 | **IMU 자이로**<br>(시각 차단) | 후진 조향 오차 $\le 2.0^\circ$ 시 $\to$ `BACK_REVERSE` |
 | **`BACKUP_STANDOFF`<br>(Phase 2: BACK_REVERSE)** | 후진 조향 완료 | 조향각 고정 순수 직선 후진 ($w_z=0.0$)<br>$v_x = -0.065\text{ m/s}$ (-6.5cm/s) | **휠 오도메트리**<br>(시각 차단) | 후진 이동 거리 $\ge 14\text{cm}$ 시 $\to$ `BACK_REALIGN` |
 | **`BACKUP_STANDOFF`<br>(Phase 3: BACK_REALIGN)** | 14cm 직선 후진 완료 | 제자리 회전 ($v_x=0.0$)<br>원래 마커 정면 기준각으로 복귀 | **IMU 자이로**<br>(시각 차단) | 정면 복귀 각도 오차 $\le 2.0^\circ$ 시 $\to$ `STAGING_SETTLE` |
-| **`CRAWL_CONTACT`** | Standoff 최종 검증 통과 | 자이로 헤딩 락 기반 초저속 직진 크롤<br>$v_x = 4.5\text{cm/s}$, $w_z = \text{Heading Lock}$ | IMU 자이로 +<br>**접촉 센서(범퍼)** | 마이크로스위치 물리 접촉 클릭 시 $\to$ `DOCKED` |
+| **`CRAWL_CONTACT`** | Standoff 최종 검증 통과 | 자이로 헤딩 락 기반 초저속 직진 크롤<br>$v_x = 3.0\text{cm/s}$, $w_z = \text{Heading Lock}$ | IMU 자이로 +<br>**접촉 센서(범퍼)** | 마이크로스위치 물리 접촉 클릭 시 $\to$ `DOCKED` |
 | **`DOCKED`** | 범퍼 접촉 신호 감지 | 즉시 하드 브레이크 (모터 토크 유지 및 정지)<br>도킹 완료 플래그 래치 | 범퍼 래치 | 양팔 로봇 작업 준비 완료 |
 
 ---
@@ -137,7 +144,7 @@ $$\Delta\theta_{\text{rev}} = \text{clamp}\Big(-\text{atan2}(e_y, \; \Delta d_{\
 유도점 거리 $d_{\text{guidance}}$에 따라 급격한 덜컹거림 없이 감속:
 $$\text{ratio} = \text{clip}\left(\frac{d_{\text{guidance}} - 0.15}{0.40 - 0.15}, \; 0.0, \; 1.0\right)$$
 $$S = \text{ratio}^2 \times (3 - 2 \times \text{ratio})$$
-$$v_x = v_{\text{final}} + (v_{\text{init}} - v_{\text{final}}) \times S \quad (v_{\text{init}}=0.050\text{m/s}, \; v_{\text{final}}=0.025\text{m/s})$$
+$$v_x = v_{\text{final}} + (v_{\text{init}} - v_{\text{final}}) \times S \quad (v_{\text{init}}=0.050\text{m/s}, \; v_{\text{final}}=0.030\text{m/s})$$
 
 ### 5.3 Depth / RGB 핸드오버 및 기구 오프셋 보정
 $$Z_{\text{est}} = \begin{cases} 

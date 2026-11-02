@@ -16,7 +16,7 @@ sequenceDiagram
     participant Arm as 🦾 로봇팔 제어기 (Manipulator)
 
     Note over Base,Arm: [시나리오 1: 바닥 물체 발견 및 수거 (Pick)]
-    Base->>Base: 물체 전방 25cm 정렬 및 좌측 10도(+10°) 편향 회전
+    Base->>Base: 물체 전방 정렬(25cm / 휴지 13cm) 및 타겟별 편향 각도 회전(예: +10°)
     Base->>Bridge: /task/ack {"status": "APPROACH_DONE"}
     Base->>Base: 모터 잠금 (WAITING_ARM_PICK)
     
@@ -78,7 +78,7 @@ sequenceDiagram
 
 로봇팔 노드는 `status`와 `id` 필드를 통해 수신된 신호의 종류를 식별(De-mux)합니다.
 
-#### A. 바닥 물체 앞 25cm 정렬 완료 (발행 위치: `task_manager.py:L356`)
+#### A. 바닥 물체 앞 정렬 및 편향 회전 완료 (발행 위치: `task_manager.py:L356`)
 ```json
 {
   "id": "approach",
@@ -87,6 +87,7 @@ sequenceDiagram
   "timestamp": 1793181615.123
 }
 ```
+*(※ 타겟별 설정에 따라 `white_tissue`는 전방 13cm, `red_cube`/`blue_ball`은 전방 25cm에 정렬되며, 지정된 편향 회전 완료 후 신호가 전송됩니다.)*
 
 #### B. workplace1 정밀 도킹 안착 완료 (발행 위치: `task_manager.py:L313`)
 ```json
@@ -151,8 +152,8 @@ sequenceDiagram
   ```
   *(※ `{"action": "RETRY_APPROACH", "id": "retry_01"}` 또는 `/sweepick/ready`의 `{"status": "REAPPROACH", "id": "retry_01"}`도 호환 지원)*
 * **모바일 로봇 동작 흐름**:
-  1. 베이스가 **22cm 안전 후진** 및 **-10° 회전(각도 원복)**을 수행하여 물체를 Astra 카메라 황금 화각(약 45~50cm) 정중앙에 재배치합니다.
-  2. 바닥 시각 제어기(`object_approaching_controller`)가 자동으로 재가동되어 **전방 25cm 정밀 재접근 + 좌측 10도 재정렬**을 수행합니다.
+  1. 베이스가 **22cm 안전 후진** 및 기구적 편향 각도에 대한 **원복 역회전**을 수행하여 물체를 Astra 카메라 최적 화각(약 45~50cm) 정중앙에 재배치합니다.
+  2. 바닥 시각 제어기(`object_approaching_controller`)가 자동으로 재가동되어 **목표 거리(25cm/13cm) 정밀 재접근 + 편향 각도 재정렬**을 수행합니다.
   3. 완료 시 로봇팔로 다시 `/task/ack` `{"id": "retry_01", "state": "done", "status": "APPROACH_DONE"}` 신호를 반환합니다.
 
 ---
@@ -198,13 +199,15 @@ sequenceDiagram
 ## 🛡️ 4. 안전 정책 및 예외 처리 (Safety & Failsafe)
 
 1. **상호 침범 방지 모터 잠금 (Zero-Velocity Lock)**:
-   * 물체 앞 25cm 도착 또는 도킹 안착 시, 모바일 로봇은 FSM을 `WAITING_ARM_PICK`으로 전환하고 모터 출력(`cmd_vel`)을 `0.0`으로 연속 강제하여 로봇팔 작업 중 차체가 밀리는 현상을 원천 차단합니다.
+   * 물체 앞 도착 또는 도킹 안착 시, 모바일 로봇은 FSM을 `WAITING_ARM_PICK`으로 전환하고 모터 출력(`cmd_vel`)을 `0.0`으로 연속 강제하여 로봇팔 작업 중 차체가 밀리는 현상을 원천 차단합니다.
 2. **미세 이동 안전 리미터**:
    * 로봇팔이 네트워크 오류나 계산 착오로 큰 값을 보내더라도, 모바일 로봇 내부 가드에서 **1회 이동당 최대 10cm(0.10m), 최대 회전 30도(30.0°)**로 강제 클램핑(Clamping)하여 실내 충돌을 방지합니다.
 3. **독립 단독 테스트 지원 (Arm-Offline Bypass)**:
    * 로봇팔 노드가 켜져 있지 않은 상태(하트비트 미수신)에서 모바일 로봇을 단독 테스트할 경우, 도킹 안착 후 무한 대기에 빠지지 않고 2초 후 자동 `SUCCESS` 처리되어 단독 주행 테스트가 가능합니다.
-4. **오동작 방지 주행 중 신호 필터링**:
-   * 모바일 로봇이 고속 주행(`NAVIGATING`) 중일 때 로봇팔에서 예기치 않게 `READY` 신호가 들어오더라도, 주행을 중단하지 않고 정상 경로를 계속 유지하도록 보호 가드가 적용되어 있습니다.
+4. **로봇팔 하트비트 와치독(Watchdog) 동작 범위 한정 (Scoping Guard)**:
+   * 로봇팔 하트비트 두절(>1.0초)에 따른 E-STOP 비상 정지는 **로봇팔 상호작용 및 팔 유도 미세 이동 중(`is_arm_interacting and is_arm_inching`)에만 국한**되어 작동합니다.
+   * 모바일 로봇의 일반 Nav2 자율주행(`NAVIGATING`) 중에는 로봇팔 하트비트 단절이 주행 경로를 방해하거나 취소시키지 않습니다.
+   * `PICK_DONE` 수신 즉시 하트비트 타임스탬프를 `None`으로 초기화하여, 이후 작업에서 과거 잔여 타임아웃으로 인한 주행 취소가 발생하는 현상을 원천 방지합니다.
 
 ---
 
